@@ -606,13 +606,25 @@ def handle_message(event):
         info = parse_script_info_with_ai(user_msg)
         if info and info.get("名稱"):
             entry = pending_image.pop(event.source.user_id, None)
-            img_bytes = entry[0] if entry and (time.time() - entry[1]) < 1800 else None
+            print(f"[DEBUG] pending_image entry: {type(entry)}, keys: {list(pending_image.keys())}")
+            if entry:
+                age = time.time() - entry[1]
+                print(f"[DEBUG] image age: {age:.0f}s, bytes type: {type(entry[0])}, len: {len(entry[0]) if entry[0] else 0}")
+                img_bytes = entry[0] if age < 1800 else None
+                if age >= 1800:
+                    extra_info.append("[封面]: 圖片已超過30分鐘，請重新傳一次。")
+            else:
+                img_bytes = None
+                extra_info.append("[封面]: 沒有找到封面圖，若需要封面請先傳圖再上架。")
             cover_url = None
             if img_bytes:
                 try:
                     safe_name = re.sub(r'[\\/*?:"<>|]', '_', info["名稱"])
+                    print(f"[DEBUG] uploading to GitHub: {safe_name}.jpg")
                     cover_url = upload_image_to_github(img_bytes, f"{safe_name}.jpg")
+                    print(f"[DEBUG] upload success: {cover_url}")
                 except Exception as e:
+                    print(f"[DEBUG] upload error: {e}")
                     extra_info.append(f"[封面上傳失敗]: {e}")
             ok, result = create_notion_script(info, cover_url)
             if ok:
