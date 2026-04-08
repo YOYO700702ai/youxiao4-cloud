@@ -427,6 +427,18 @@ def parse_script_info_with_ai(msg):
     except:
         return None
 
+def _is_cover_intent(msg):
+    """用 AI 判斷使用者是否想傳劇本封面圖片。"""
+    try:
+        result = gemini_client.models.generate_content(
+            model=GEMMA_MODEL,
+            contents=f"這句話是否表示使用者想要傳送劇本封面圖片？只回答 yes 或 no。\n「{msg}」",
+            config=types.GenerateContentConfig(system_instruction="你是意圖分類器，只回答yes或no，不加任何其他文字。")
+        ).text.strip().lower()
+        return result.startswith('y')
+    except:
+        return False
+
 def detect_script_upload(msg):
     return bool(re.search(r'上架劇本|新增劇本|幫我上架|劇本上架', msg))
 
@@ -600,7 +612,7 @@ def handle_message(event):
         extra_info.append(f"[網頁 {url}]:\n{fetch_url(url)}")
 
     # 封面意圖
-    if re.match(r'^(這是劇本封面|這是封面圖|這張是封面|封面圖$|傳封面)', user_msg.strip()):
+    if _is_cover_intent(user_msg):
         cover_intent[event.source.user_id] = True
         reply = "好，請傳封面圖片給我。"
         with ApiClient(configuration) as api_client:
