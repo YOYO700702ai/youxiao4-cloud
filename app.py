@@ -239,25 +239,27 @@ def list_calendar_events(days=7):
     except Exception as e:
         return f"查詢失敗：{e}"
 
-def parse_event_with_ai(msg):
-    """用 AI 從訊息解析事件標題、開始/結束時間"""
+def parse_events_with_ai(msg):
+    """用 AI 從訊息解析一或多筆事件，回傳 list of {title, start, end}"""
     now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
     prompt = (
         f"現在是 {now.strftime('%Y-%m-%d %H:%M')}（台灣時間）。\n"
-        f"從以下訊息解析行事曆事件，只回覆 JSON 不要其他文字：\n"
+        f"注意：日期若是民國年（如115年），請換算成西元年（115+1911=2026）。\n"
+        f"日期範圍如 04/25-26 代表 04/25 開始、04/26 結束。\n"
+        f"從以下訊息解析所有行事曆事件，只回覆 JSON 陣列，不要其他文字：\n"
         f"訊息：{msg}\n\n"
-        f"格式：{{\"title\": \"事件名稱\", \"start\": \"YYYY-MM-DDTHH:MM:00\", \"end\": \"YYYY-MM-DDTHH:MM:00\"}}\n"
-        f"沒有結束時間就預設開始後1小時。"
+        f"格式：[{{\"title\": \"事件名稱\", \"start\": \"YYYY-MM-DDTHH:MM:00\", \"end\": \"YYYY-MM-DDTHH:MM:00\"}}]\n"
+        f"沒有指定時間就用全天 09:00 開始，結束時間預設為開始後2小時。\n"
+        f"只回覆 JSON 陣列。"
     )
     try:
         resp = gemini_client.models.generate_content(model=GEMMA_MODEL, contents=prompt)
-        m = re.search(r'\{.*\}', resp.text.strip(), re.DOTALL)
+        m = re.search(r'\[.*\]', resp.text.strip(), re.DOTALL)
         if m:
-            data = json.loads(m.group())
-            return data.get('title'), data.get('start'), data.get('end')
+            return json.loads(m.group())
     except Exception as e:
-        print(f"parse_event_with_ai 失敗：{e}")
-    return None, None, None
+        print(f"parse_events_with_ai 失敗：{e}")
+    return []
 
 def detect_calendar_action(msg):
     if re.search(r'記行程|記錄行程|新增行程|加行程|加入行事曆|記在日曆|記到日曆|google日曆|行程.*記|記.*行程', msg, re.IGNORECASE):
@@ -401,9 +403,10 @@ def handle_message(event):
     # Google Calendar
     cal_action, cal_data = detect_calendar_action(user_msg)
     if cal_action == 'add':
-        title, start, end = parse_event_with_ai(cal_data)
-        if title and start and end:
-            extra_info.append(f"[行事曆]: {add_calendar_event(title, start, end)}")
+        events = parse_events_with_ai(cal_data)
+        if events:
+            results = [add_calendar_event(e['title'], e['start'], e['end']) for e in events]
+            extra_info.append(f"[行事曆]: " + '\n'.join(results))
         else:
             extra_info.append("[行事曆]: 請告訴我行程名稱和時間，例如：幫我記行程 明天下午3點 開會")
     elif cal_action == 'list':
