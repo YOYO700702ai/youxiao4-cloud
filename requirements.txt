@@ -1,0 +1,8 @@
+flask
+line-bot-sdk
+google-genai
+gspread
+google-auth
+requests
+beautifulsoup4
+apscheduler
