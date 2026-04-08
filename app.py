@@ -162,7 +162,7 @@ def delete_note(idx):
         return f"刪除失敗：{e}"
 
 def detect_note_action(msg):
-    if re.search(r'幫我記|記下來', msg):
+    if re.search(r'幫我記|記下來', msg) and not re.search(r'行程|行事曆|日曆|calendar', msg, re.IGNORECASE):
         return 'add', re.sub(r'幫我記|記下來|：|:', '', msg).strip()
     if re.search(r'看筆記|我的筆記', msg):
         return 'list', None
@@ -260,7 +260,7 @@ def parse_event_with_ai(msg):
     return None, None, None
 
 def detect_calendar_action(msg):
-    if re.search(r'幫我記行程|新增行程|加行程|記行程|加入行事曆', msg):
+    if re.search(r'記行程|記錄行程|新增行程|加行程|加入行事曆|記在日曆|記到日曆|google日曆|行程.*記|記.*行程', msg, re.IGNORECASE):
         return 'add', msg
     if re.search(r'查行程|看行程|我的行程|今天行程|明天行程|本週行程|有什麼行程', msg):
         return 'list', msg
@@ -291,7 +291,11 @@ SYSTEM_PROMPT = (
     "- 爬網頁整理摘要\n"
     "- 筆記（幫我記/看筆記/刪掉第N條）\n"
     "- 定時提醒（X點提醒我XX）\n"
-    "- 記憶（記住XX／你記得什麼）\n\n"
+    "- 記憶（記住XX／你記得什麼）\n"
+    "- Google 行事曆：你已連接悠悠姐姐的 Google 日曆，可以直接新增和查詢行程。\n"
+    "  新增：「幫我記行程 XXX」或「記行程 日期 事件」\n"
+    "  查詢：「查行程」或「我的行程」\n"
+    "  系統會自動處理，結果會附在 [行事曆] 標籤裡，你直接告知悠悠姐姐結果就好。\n\n"
     "用繁體中文回覆，語氣自然。"
 )
 
