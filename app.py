@@ -27,6 +27,10 @@ _creds_raw           = os.environ.get('GOOGLE_CREDENTIALS_JSON', '')
 _creds_dict          = json.loads(_creds_raw) if _creds_raw else {}
 SHEETS_ENABLED       = bool(GOOGLE_SHEET_ID and _creds_dict)
 GOOGLE_CALENDAR_ID   = os.environ.get('GOOGLE_CALENDAR_ID', 'hankvictor1023@gmail.com')
+NOTION_TOKEN         = os.environ.get('NOTION_TOKEN', '')
+NOTION_DB_ID         = os.environ.get('NOTION_DATABASE_ID', '')
+GITHUB_TOKEN         = os.environ.get('GITHUB_TOKEN', '')
+GITHUB_REPO          = os.environ.get('GITHUB_REPO', 'YOYO700702ai/BGLARPA5')
 
 # ── Google Sheets ─────────────────────────────────────────
 SCOPES = [
@@ -357,6 +361,74 @@ def push_message(text):
             PushMessageRequest(to=MY_USER_ID, messages=[TextMessage(text=text)])
         )
 
+# ── 劇本上架（Notion + GitHub）────────────────────────────
+import base64
+
+pending_image = {}  # {user_id: bytes}
+
+def upload_image_to_github(image_bytes, filename):
+    path = f"scraped_covers/{filename}"
+    url  = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json"
+    }
+    r = requests.get(url, headers=headers)
+    sha = r.json().get('sha') if r.status_code == 200 else None
+    payload = {"message": f"上架封面：{filename}", "content": base64.b64encode(image_bytes).decode()}
+    if sha:
+        payload["sha"] = sha
+    r = requests.put(url, headers=headers, json=payload)
+    if r.status_code in (200, 201):
+        return f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{path}"
+    raise Exception(f"GitHub 上傳失敗：{r.status_code} {r.text[:200]}")
+
+def create_notion_script(info, cover_url=None):
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Content-Type": "application/json",
+        "Notion-Version": "2022-06-28"
+    }
+    props = {"劇本名稱": {"title": [{"text": {"content": info.get("名稱", "")}}]}}
+    for field in ["劇情簡介", "類型標籤", "角色", "時長"]:
+        key = {"劇情簡介": "簡介"}.get(field, field)
+        if info.get(key):
+            props[field] = {"rich_text": [{"text": {"content": str(info[key])}}]}
+    if info.get("價格") is not None:
+        try: props["價格"] = {"number": int(info["價格"])}
+        except: pass
+    for field, key in [("類型", "類型"), ("人數", "人數")]:
+        if info.get(key):
+            items = [x.strip() for x in re.split(r'[/、,，]', str(info[key])) if x.strip()]
+            props[field] = {"multi_select": [{"name": x} for x in items]}
+    body = {"parent": {"database_id": NOTION_DB_ID}, "properties": props}
+    if cover_url:
+        body["cover"] = {"type": "external", "external": {"url": cover_url}}
+    r = requests.post("https://api.notion.com/v1/pages", headers=headers, json=body)
+    if r.status_code == 200:
+        return True, r.json().get("url", "")
+    return False, r.text[:300]
+
+def parse_script_info_with_ai(msg):
+    prompt = (
+        "從以下訊息提取劇本資料，只回傳 JSON，沒有的欄位留空字串或 null：\n"
+        '{"名稱":"","類型":"（從：恐怖/微恐/驚悚/沉浸/情感/演繹/推理/還原/機制/陣營/歡樂/撕逼/硬核/燒腦 多選用/分隔）",'
+        '"類型標籤":"","人數":"（從：5人/6人/7人/8人/9人/10人/11人/浮動人 多選用/分隔）",'
+        '"時長":"","價格":null,"角色":"","簡介":""}\n\n訊息：' + msg
+    )
+    try:
+        result = gemini_client.models.generate_content(
+            model=GEMMA_MODEL, contents=prompt,
+            config=types.GenerateContentConfig(system_instruction="你是資料提取助手，只回傳JSON。")
+        ).text.strip()
+        result = re.sub(r'^```json\s*|^```\s*|\s*```$', '', result, flags=re.MULTILINE)
+        return json.loads(result)
+    except:
+        return None
+
+def detect_script_upload(msg):
+    return bool(re.search(r'上架劇本|新增劇本|幫我上架|劇本上架', msg))
+
 # ── APScheduler ───────────────────────────────────────────
 scheduler = BackgroundScheduler(timezone='Asia/Taipei')
 def morning_greeting():
@@ -429,12 +501,14 @@ def handle_image(event):
         return
     with ApiClient(configuration) as api_client:
         image_data = MessagingApiBlob(api_client).get_message_content(event.message.id)
+    # 存圖片供劇本上架使用
+    pending_image[event.source.user_id] = image_data
     try:
         reply = gemini_client.models.generate_content(
             model=GEMMA_MODEL,
             contents=[
                 types.Part.from_bytes(data=image_data, mime_type='image/jpeg'),
-                types.Part(text="悠悠姐姐傳了這張圖，請描述。")
+                types.Part(text="悠悠姐姐傳了這張圖，請描述。如果看起來像劇本封面海報，請在描述最後加上一行：「如果這是劇本封面，告訴我劇本資料我就幫你上架！」")
             ],
             config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
         ).text.strip()
@@ -481,6 +555,26 @@ def handle_message(event):
     # 爬網頁
     for url in extract_urls(user_msg)[:2]:
         extra_info.append(f"[網頁 {url}]:\n{fetch_url(url)}")
+
+    # 劇本上架
+    if detect_script_upload(user_msg) and NOTION_TOKEN and GITHUB_TOKEN:
+        info = parse_script_info_with_ai(user_msg)
+        if info and info.get("名稱"):
+            img_bytes = pending_image.pop(event.source.user_id, None)
+            cover_url = None
+            if img_bytes:
+                try:
+                    safe_name = re.sub(r'[\\/*?:"<>|]', '_', info["名稱"])
+                    cover_url = upload_image_to_github(img_bytes, f"{safe_name}.jpg")
+                except Exception as e:
+                    extra_info.append(f"[封面上傳失敗]: {e}")
+            ok, result = create_notion_script(info, cover_url)
+            if ok:
+                extra_info.append(f"[劇本上架成功]: 《{info['名稱']}》已新增到 Notion{'，封面也上傳好了' if cover_url else '（未附封面圖）'}。")
+            else:
+                extra_info.append(f"[劇本上架失敗]: {result}")
+        else:
+            extra_info.append("[劇本上架]: 請提供劇本名稱和資料，例如：幫我上架劇本 名稱《XXX》類型 推理 人數 5人 時長 3小時 價格 800")
 
     # 筆記
     na, nd = detect_note_action(user_msg)
