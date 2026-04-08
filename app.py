@@ -553,7 +553,7 @@ def handle_image(event):
             model=GEMMA_MODEL,
             contents=[
                 types.Part.from_bytes(data=image_data, mime_type='image/jpeg'),
-                types.Part(text="悠悠姐姐傳了這張圖，請描述。")
+                types.Part(text="悠悠傳了這張圖，請描述。")
             ],
             config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
         ).text.strip()
