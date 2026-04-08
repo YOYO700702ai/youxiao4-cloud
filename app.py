@@ -364,7 +364,8 @@ def push_message(text):
 # ── 劇本上架（Notion + GitHub）────────────────────────────
 import base64
 
-pending_image = {}  # {user_id: bytes}
+pending_image  = {}  # {user_id: bytes} 已確認的封面
+cover_intent   = {}  # {user_id: True} 等待傳封面圖
 
 def upload_image_to_github(image_bytes, filename):
     path = f"scraped_covers/{filename}"
@@ -501,19 +502,24 @@ def handle_image(event):
         return
     with ApiClient(configuration) as api_client:
         image_data = MessagingApiBlob(api_client).get_message_content(event.message.id)
-    # 存圖片供劇本上架使用
-    pending_image[event.source.user_id] = image_data
-    try:
-        reply = gemini_client.models.generate_content(
-            model=GEMMA_MODEL,
-            contents=[
-                types.Part.from_bytes(data=image_data, mime_type='image/jpeg'),
-                types.Part(text="悠悠姐姐傳了這張圖，請描述。如果看起來像劇本封面海報，請在描述最後加上一行：「如果這是劇本封面，告訴我劇本資料我就幫你上架！」")
-            ],
-            config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
-        ).text.strip()
-    except Exception as e:
-        reply = f"圖片收到，但無法分析：{e}"
+    uid = event.source.user_id
+    if cover_intent.pop(uid, False):
+        # 使用者說過「這是劇本封面」，存起來
+        pending_image[uid] = image_data
+        reply = "封面收到！現在告訴我劇本資料，我就幫你上架。\n（格式：幫我上架劇本 名稱《XXX》類型 推理 人數 5人 時長 3小時 價格 800 簡介 ...）"
+    else:
+        # 一般圖片，正常描述
+        try:
+            reply = gemini_client.models.generate_content(
+                model=GEMMA_MODEL,
+                contents=[
+                    types.Part.from_bytes(data=image_data, mime_type='image/jpeg'),
+                    types.Part(text="悠悠姐姐傳了這張圖，請描述。")
+                ],
+                config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
+            ).text.strip()
+        except Exception as e:
+            reply = f"圖片收到，但無法分析：{e}"
     with ApiClient(configuration) as api_client:
         MessagingApi(api_client).reply_message_with_http_info(
             ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply)])
@@ -555,6 +561,16 @@ def handle_message(event):
     # 爬網頁
     for url in extract_urls(user_msg)[:2]:
         extra_info.append(f"[網頁 {url}]:\n{fetch_url(url)}")
+
+    # 封面意圖
+    if re.search(r'這是劇本封面|劇本封面', user_msg):
+        cover_intent[event.source.user_id] = True
+        reply = "好，請傳封面圖片給我。"
+        with ApiClient(configuration) as api_client:
+            MessagingApi(api_client).reply_message_with_http_info(
+                ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply)])
+            )
+        return
 
     # 劇本上架
     if detect_script_upload(user_msg) and NOTION_TOKEN and GITHUB_TOKEN:
