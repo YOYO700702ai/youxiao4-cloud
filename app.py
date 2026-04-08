@@ -371,8 +371,7 @@ def push_message(text):
 # ── 劇本上架（Notion + GitHub）────────────────────────────
 import base64
 
-pending_image  = {}  # {user_id: bytes} 已確認的封面
-cover_intent   = {}  # {user_id: True} 等待傳封面圖
+pending_image  = {}  # {user_id: (bytes, timestamp)}
 
 def upload_image_to_github(image_bytes, filename):
     path = f"scraped_covers/{filename}"
@@ -433,18 +432,6 @@ def parse_script_info_with_ai(msg):
         return json.loads(result)
     except:
         return None
-
-def _is_cover_intent(msg):
-    """用 AI 判斷使用者是否想傳劇本封面圖片。"""
-    try:
-        result = gemini_client.models.generate_content(
-            model=GEMMA_MODEL,
-            contents=f"這句話是否表示使用者想要傳送劇本封面圖片？只回答 yes 或 no。\n「{msg}」",
-            config=types.GenerateContentConfig(system_instruction="你是意圖分類器，只回答yes或no，不加任何其他文字。")
-        ).text.strip().lower()
-        return result.startswith('y')
-    except:
-        return False
 
 def detect_script_upload(msg):
     return bool(re.search(r'上架劇本|新增劇本|幫我上架|劇本上架', msg))
@@ -559,23 +546,19 @@ def handle_image(event):
     with ApiClient(configuration) as api_client:
         image_data = MessagingApiBlob(api_client).get_message_content(event.message.id)
     uid = event.source.user_id
-    if cover_intent.pop(uid, False):
-        # 使用者說過「這是劇本封面」，存起來
-        pending_image[uid] = image_data
-        reply = "封面收到！現在告訴我劇本資料，我就幫你上架。\n（格式：幫我上架劇本 名稱《XXX》類型 推理 人數 5人 時長 3小時 價格 800 簡介 ...）"
-    else:
-        # 一般圖片，正常描述
-        try:
-            reply = gemini_client.models.generate_content(
-                model=GEMMA_MODEL,
-                contents=[
-                    types.Part.from_bytes(data=image_data, mime_type='image/jpeg'),
-                    types.Part(text="悠悠姐姐傳了這張圖，請描述。")
-                ],
-                config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
-            ).text.strip()
-        except Exception as e:
-            reply = f"圖片收到，但無法分析：{e}"
+    # 永遠存起來，附時間戳記（30分鐘內有效）
+    pending_image[uid] = (image_data, time.time())
+    try:
+        reply = gemini_client.models.generate_content(
+            model=GEMMA_MODEL,
+            contents=[
+                types.Part.from_bytes(data=image_data, mime_type='image/jpeg'),
+                types.Part(text="悠悠姐姐傳了這張圖，請描述。")
+            ],
+            config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
+        ).text.strip()
+    except Exception as e:
+        reply = f"圖片收到，但無法分析：{e}"
     with ApiClient(configuration) as api_client:
         MessagingApi(api_client).reply_message_with_http_info(
             ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply)])
@@ -618,21 +601,12 @@ def handle_message(event):
     for url in extract_urls(user_msg)[:2]:
         extra_info.append(f"[網頁 {url}]:\n{fetch_url(url)}")
 
-    # 封面意圖
-    if _is_cover_intent(user_msg):
-        cover_intent[event.source.user_id] = True
-        reply = "好，請傳封面圖片給我。"
-        with ApiClient(configuration) as api_client:
-            MessagingApi(api_client).reply_message_with_http_info(
-                ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply)])
-            )
-        return
-
     # 劇本上架
     if detect_script_upload(user_msg) and NOTION_TOKEN and GITHUB_TOKEN:
         info = parse_script_info_with_ai(user_msg)
         if info and info.get("名稱"):
-            img_bytes = pending_image.pop(event.source.user_id, None)
+            entry = pending_image.pop(event.source.user_id, None)
+            img_bytes = entry[0] if entry and (time.time() - entry[1]) < 1800 else None
             cover_url = None
             if img_bytes:
                 try:
