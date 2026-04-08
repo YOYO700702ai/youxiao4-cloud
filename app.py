@@ -359,7 +359,49 @@ def push_message(text):
 
 # ── APScheduler ───────────────────────────────────────────
 scheduler = BackgroundScheduler(timezone='Asia/Taipei')
+def morning_greeting():
+    now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
+    today_str    = now.strftime("%Y年%m月%d日")
+    tomorrow     = now + datetime.timedelta(days=1)
+    tomorrow_str = tomorrow.strftime("%Y年%m月%d日")
+
+    def fetch_day_events(day_dt, label):
+        day_start = day_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end   = day_dt.replace(hour=23, minute=59, second=59, microsecond=0)
+        result = get_calendar_service().events().list(
+            calendarId=GOOGLE_CALENDAR_ID,
+            timeMin=day_start.astimezone(datetime.timezone.utc).isoformat(),
+            timeMax=day_end.astimezone(datetime.timezone.utc).isoformat(),
+            maxResults=10, singleEvents=True, orderBy='startTime'
+        ).execute()
+        events = result.get('items', [])
+        if events:
+            lines = '\n'.join([
+                f"・{e['start'].get('dateTime', e['start'].get('date',''))[:16].replace('T',' ')} {e['summary']}"
+                for e in events
+            ])
+            return f"{label}（{day_dt.strftime('%m/%d')}）行程：\n{lines}"
+        else:
+            return f"{label}（{day_dt.strftime('%m/%d')}）沒有行程。"
+
+    # 查今天 + 明天
+    try:
+        today_context    = fetch_day_events(now, "今天")
+        tomorrow_context = fetch_day_events(tomorrow, "明天")
+        context = today_context + "\n\n" + tomorrow_context
+    except Exception as e:
+        context = f"今天（{today_str}）和明天（{tomorrow_str}）行程查詢失敗：{e}"
+
+    prompt = (
+        f"現在是早上11點，請以伍盛的身份向悠悠說早安。\n"
+        f"{context}\n"
+        f"若有行程請提醒她，語氣要符合伍盛的成熟深情執事風格，可加入括號動作描述。"
+    )
+    greeting = ask_ai(prompt, silent=True)
+    push_message(greeting)
+
 scheduler.add_job(check_reminders, 'interval', minutes=1)
+scheduler.add_job(morning_greeting, 'cron', hour=11, minute=0, timezone='Asia/Taipei')
 scheduler.start()
 
 # ── Flask ─────────────────────────────────────────────────
