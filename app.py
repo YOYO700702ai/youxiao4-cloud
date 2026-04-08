@@ -430,6 +430,43 @@ def parse_script_info_with_ai(msg):
 def detect_script_upload(msg):
     return bool(re.search(r'上架劇本|新增劇本|幫我上架|劇本上架', msg))
 
+def detect_script_remove(msg):
+    m = re.search(r'下架.{0,5}[《「](.+?)[》」]', msg)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r'下架劇本\s*(.+)', msg)
+    if m:
+        return m.group(1).strip()
+    return None
+
+def archive_notion_script(name):
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Content-Type": "application/json",
+        "Notion-Version": "2022-06-28"
+    }
+    # 搜尋符合名稱的頁面
+    r = requests.post(
+        f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query",
+        headers=headers,
+        json={"filter": {"property": "劇本名稱", "title": {"equals": name}}}
+    )
+    if r.status_code != 200:
+        return False, f"搜尋失敗：{r.text[:200]}"
+    results = r.json().get("results", [])
+    if not results:
+        return False, f"找不到《{name}》，請確認名稱是否正確。"
+    page_id = results[0]["id"]
+    # 封存
+    r2 = requests.patch(
+        f"https://api.notion.com/v1/pages/{page_id}",
+        headers=headers,
+        json={"archived": True}
+    )
+    if r2.status_code == 200:
+        return True, f"《{name}》已下架（封存）。"
+    return False, f"下架失敗：{r2.text[:200]}"
+
 # ── APScheduler ───────────────────────────────────────────
 scheduler = BackgroundScheduler(timezone='Asia/Taipei')
 def morning_greeting():
@@ -591,6 +628,12 @@ def handle_message(event):
                 extra_info.append(f"[劇本上架失敗]: {result}")
         else:
             extra_info.append("[劇本上架]: 請提供劇本名稱和資料，例如：幫我上架劇本 名稱《XXX》類型 推理 人數 5人 時長 3小時 價格 800")
+
+    # 劇本下架
+    script_remove_name = detect_script_remove(user_msg)
+    if script_remove_name and NOTION_TOKEN:
+        ok, result = archive_notion_script(script_remove_name)
+        extra_info.append(f"[劇本下架]: {result}")
 
     # 筆記
     na, nd = detect_note_action(user_msg)
