@@ -40,7 +40,7 @@ def get_sheet(name):
         return sh.add_worksheet(title=name, rows=1000, cols=20)
 
 # ── 記憶系統 ──────────────────────────────────────────────
-MAX_FACTS      = 20
+MAX_FACTS      = 30
 COMPRESS_EVERY = 5
 
 def load_memory():
