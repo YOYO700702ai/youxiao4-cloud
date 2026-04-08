@@ -600,7 +600,7 @@ def handle_message(event):
         extra_info.append(f"[網頁 {url}]:\n{fetch_url(url)}")
 
     # 封面意圖
-    if re.search(r'這是劇本封面|劇本封面', user_msg):
+    if re.search(r'這是劇本封面|劇本封面|這是封面|封面圖|這張是封面', user_msg):
         cover_intent[event.source.user_id] = True
         reply = "好，請傳封面圖片給我。"
         with ApiClient(configuration) as api_client:
