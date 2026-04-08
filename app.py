@@ -73,6 +73,15 @@ def add_memory_fact(fact):
     save_memory(mem)
     return f"記住了：{fact}"
 
+def archive_old_facts(old_facts, old_summary):
+    try:
+        ws = get_sheet('memory_archive')
+        t = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        for f in old_facts:
+            ws.append_row([t, f, old_summary])
+    except Exception as e:
+        print(f"歸檔失敗：{e}")
+
 def compress_memory(mem):
     log = mem.get("recent_log", [])
     if not log:
@@ -90,7 +99,10 @@ def compress_memory(mem):
         m = re.search(r'\[摘要\]\n(.+)', text, re.DOTALL)
         mem["summary"] = m.group(1).strip() if m else mem.get("summary", "")
         merged = list(dict.fromkeys(mem.get("facts", []) + new_facts))
-        mem["facts"] = merged[-MAX_FACTS:]
+        if len(merged) > MAX_FACTS:
+            archive_old_facts(merged[:-MAX_FACTS], mem.get("summary", ""))
+            merged = merged[-MAX_FACTS:]
+        mem["facts"] = merged
         mem["recent_log"] = []
     except Exception as e:
         print(f"記憶壓縮失敗：{e}")
