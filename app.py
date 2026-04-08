@@ -21,8 +21,10 @@ CHANNEL_SECRET       = os.environ['LINE_CHANNEL_SECRET']
 MY_USER_ID           = os.environ['LINE_MY_USER_ID']
 GEMINI_API_KEY       = os.environ['GEMINI_API_KEY']
 GEMMA_MODEL          = os.environ.get('GEMMA_MODEL', 'gemma-4-31b-it')
-GOOGLE_SHEET_ID      = os.environ['GOOGLE_SHEET_ID']
-_creds_dict          = json.loads(os.environ['GOOGLE_CREDENTIALS_JSON'])
+GOOGLE_SHEET_ID      = os.environ.get('GOOGLE_SHEET_ID', '')
+_creds_raw           = os.environ.get('GOOGLE_CREDENTIALS_JSON', '')
+_creds_dict          = json.loads(_creds_raw) if _creds_raw else {}
+SHEETS_ENABLED       = bool(GOOGLE_SHEET_ID and _creds_dict)
 
 # ── Google Sheets ─────────────────────────────────────────
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets',
