@@ -4,6 +4,7 @@ line-bot-sdk
 google-genai
 gspread
 google-auth
+google-api-python-client
 requests
 beautifulsoup4
 apscheduler

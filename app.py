@@ -14,6 +14,7 @@ from google import genai
 from google.genai import types
 import gspread
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
 
 # ── 設定（Railway 環境變數）────────────────────────────────
 CHANNEL_ACCESS_TOKEN = os.environ['LINE_CHANNEL_ACCESS_TOKEN']
@@ -25,10 +26,14 @@ GOOGLE_SHEET_ID      = os.environ.get('GOOGLE_SHEET_ID', '')
 _creds_raw           = os.environ.get('GOOGLE_CREDENTIALS_JSON', '')
 _creds_dict          = json.loads(_creds_raw) if _creds_raw else {}
 SHEETS_ENABLED       = bool(GOOGLE_SHEET_ID and _creds_dict)
+GOOGLE_CALENDAR_ID   = os.environ.get('GOOGLE_CALENDAR_ID', 'hankvictor1023@gmail.com')
 
 # ── Google Sheets ─────────────────────────────────────────
-SCOPES = ['https://www.googleapis.com/auth/spreadsheets',
-          'https://www.googleapis.com/auth/drive']
+SCOPES = [
+    'https://www.googleapis.com/auth/spreadsheets',
+    'https://www.googleapis.com/auth/drive',
+    'https://www.googleapis.com/auth/calendar',
+]
 
 def get_sheet(name):
     creds = Credentials.from_service_account_info(_creds_dict, scopes=SCOPES)
@@ -195,6 +200,72 @@ def detect_reminder(msg):
         return f"{h:02d}:{mi:02d}", m.group(3).strip()
     return None, None
 
+# ── Google Calendar ───────────────────────────────────────
+def get_calendar_service():
+    creds = Credentials.from_service_account_info(_creds_dict, scopes=SCOPES)
+    return build('calendar', 'v3', credentials=creds)
+
+def add_calendar_event(title, start_str, end_str, description=''):
+    try:
+        service = get_calendar_service()
+        event = {
+            'summary': title,
+            'description': description,
+            'start': {'dateTime': start_str, 'timeZone': 'Asia/Taipei'},
+            'end':   {'dateTime': end_str,   'timeZone': 'Asia/Taipei'},
+        }
+        service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
+        return f"已新增行程：{title}（{start_str[:16].replace('T', ' ')}）"
+    except Exception as e:
+        return f"新增失敗：{e}"
+
+def list_calendar_events(days=7):
+    try:
+        service = get_calendar_service()
+        now = datetime.datetime.utcnow().isoformat() + 'Z'
+        end = (datetime.datetime.utcnow() + datetime.timedelta(days=days)).isoformat() + 'Z'
+        result = service.events().list(
+            calendarId=GOOGLE_CALENDAR_ID, timeMin=now, timeMax=end,
+            maxResults=10, singleEvents=True, orderBy='startTime'
+        ).execute()
+        events = result.get('items', [])
+        if not events:
+            return f"未來 {days} 天沒有行程"
+        lines = []
+        for e in events:
+            start = e['start'].get('dateTime', e['start'].get('date', ''))[:16].replace('T', ' ')
+            lines.append(f"• {start} {e['summary']}")
+        return '\n'.join(lines)
+    except Exception as e:
+        return f"查詢失敗：{e}"
+
+def parse_event_with_ai(msg):
+    """用 AI 從訊息解析事件標題、開始/結束時間"""
+    now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
+    prompt = (
+        f"現在是 {now.strftime('%Y-%m-%d %H:%M')}（台灣時間）。\n"
+        f"從以下訊息解析行事曆事件，只回覆 JSON 不要其他文字：\n"
+        f"訊息：{msg}\n\n"
+        f"格式：{{\"title\": \"事件名稱\", \"start\": \"YYYY-MM-DDTHH:MM:00\", \"end\": \"YYYY-MM-DDTHH:MM:00\"}}\n"
+        f"沒有結束時間就預設開始後1小時。"
+    )
+    try:
+        resp = gemini_client.models.generate_content(model=GEMMA_MODEL, contents=prompt)
+        m = re.search(r'\{.*\}', resp.text.strip(), re.DOTALL)
+        if m:
+            data = json.loads(m.group())
+            return data.get('title'), data.get('start'), data.get('end')
+    except Exception as e:
+        print(f"parse_event_with_ai 失敗：{e}")
+    return None, None, None
+
+def detect_calendar_action(msg):
+    if re.search(r'幫我記行程|新增行程|加行程|記行程|加入行事曆', msg):
+        return 'add', msg
+    if re.search(r'查行程|看行程|我的行程|今天行程|明天行程|本週行程|有什麼行程', msg):
+        return 'list', msg
+    return None, None
+
 # ── 爬網頁 ────────────────────────────────────────────────
 def fetch_url(url):
     try:
@@ -322,6 +393,17 @@ def handle_message(event):
     rt, rm = detect_reminder(user_msg)
     if rt and rm:
         extra_info.append(f"[提醒]: {save_reminder(rt, rm)}")
+
+    # Google Calendar
+    cal_action, cal_data = detect_calendar_action(user_msg)
+    if cal_action == 'add':
+        title, start, end = parse_event_with_ai(cal_data)
+        if title and start and end:
+            extra_info.append(f"[行事曆]: {add_calendar_event(title, start, end)}")
+        else:
+            extra_info.append("[行事曆]: 請告訴我行程名稱和時間，例如：幫我記行程 明天下午3點 開會")
+    elif cal_action == 'list':
+        extra_info.append(f"[行事曆]: {list_calendar_events()}")
 
     # 爬網頁
     for url in extract_urls(user_msg)[:2]:
