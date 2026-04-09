@@ -694,10 +694,20 @@ def handle_message(event):
     if fb_page and fb_content:
         entry = pending_image.get(event.source.user_id)
         img = entry[0] if entry and (time.time() - entry[1]) < 1800 else None
-        result = post_to_fb(fb_page, fb_content, img)
+        # 讓 AI 根據指令生成正式貼文內容
+        post_prompt = (
+            f"請根據以下指令，為「{fb_page}」粉絲專頁撰寫一篇正式的 Facebook 貼文。\n"
+            f"指令：{fb_content}\n\n"
+            f"只回傳貼文內容本身，不要加任何說明或前言。"
+        )
+        generated_content = gemini_client.models.generate_content(
+            model=GEMMA_MODEL, contents=post_prompt,
+            config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
+        ).text.strip()
+        result = post_to_fb(fb_page, generated_content, img)
         if img:
             pending_image.pop(event.source.user_id, None)
-        extra_info.append(f"[FB發文]: {result}")
+        extra_info.append(f"[FB發文]: {result}\n\n發出的內容：\n{generated_content}")
 
     # 劇本上架
     if detect_script_upload(user_msg) and NOTION_TOKEN and GITHUB_TOKEN:
