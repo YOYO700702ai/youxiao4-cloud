@@ -344,18 +344,17 @@ def update_calendar_event(keyword, new_title=None, new_start=None, new_end=None)
         return f"更新失敗：{e}"
 
 def detect_calendar_action(msg):
-    # 刪除
-    if re.search(r'刪除行程|取消行程|移除行程|刪掉行程|刪除行事曆|取消行事曆|刪掉行事曆', msg):
-        return 'delete', msg
-    # 修改
-    if re.search(r'修改行程|更改行程|改行程|把.*行程.*改|修改行事曆|更改行事曆|改行事曆', msg):
-        return 'update', msg
-    # 查詢
-    if re.search(r'查行程|看行程|我的行程|今天行程|明天行程|本週行程|有什麼行程|行程查詢', msg):
-        return 'list', msg
-    # 有日期時間就自動記行事曆
-    if _DATE_PATTERN.search(msg):
-        return 'add', msg
+    has_delete = bool(re.search(r'刪除行程|取消行程|移除行程|刪掉行程|刪除行事曆|取消行事曆|刪掉行事曆', msg))
+    has_update = bool(re.search(r'修改行程|更改行程|改行程|把.*行程.*改|修改行事曆|更改行事曆|改行事曆', msg))
+    has_list   = bool(re.search(r'查行程|看行程|我的行程|今天行程|明天行程|本週行程|有什麼行程|行程查詢', msg))
+    has_add    = bool(_DATE_PATTERN.search(msg))
+
+    actions = [a for a, v in [('delete',has_delete),('update',has_update),('list',has_list),('add',has_add)] if v]
+
+    if len(actions) > 1:
+        return 'conflict', actions
+    if actions:
+        return actions[0], msg
     return None, None
 
 # ── 爬網頁 ────────────────────────────────────────────────
@@ -732,7 +731,11 @@ def handle_message(event):
 
     # Google Calendar
     cal_action, cal_data = detect_calendar_action(user_msg)
-    if cal_action == 'add':
+    if cal_action == 'conflict':
+        action_names = {'add':'新增','delete':'刪除','update':'修改','list':'查詢'}
+        names = '、'.join([action_names.get(a,a) for a in cal_data])
+        extra_info.append(f"[行事曆]: 偵測到多個動作（{names}），一次只能處理一個，請分開傳送。")
+    elif cal_action == 'add':
         events = parse_events_with_ai(cal_data)
         if events:
             results = [add_calendar_event(e['title'], e['start'], e['end']) for e in events]
