@@ -345,10 +345,10 @@ def update_calendar_event(keyword, new_title=None, new_start=None, new_end=None)
 
 def detect_calendar_action(msg):
     # 刪除
-    if re.search(r'刪除行程|取消行程|移除行程|刪掉行程', msg):
+    if re.search(r'刪除行程|取消行程|移除行程|刪掉行程|刪除行事曆|取消行事曆|刪掉行事曆', msg):
         return 'delete', msg
     # 修改
-    if re.search(r'修改行程|更改行程|改行程|把.*行程.*改', msg):
+    if re.search(r'修改行程|更改行程|改行程|把.*行程.*改|修改行事曆|更改行事曆|改行事曆', msg):
         return 'update', msg
     # 查詢
     if re.search(r'查行程|看行程|我的行程|今天行程|明天行程|本週行程|有什麼行程|行程查詢', msg):
