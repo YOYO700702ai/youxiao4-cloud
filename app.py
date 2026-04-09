@@ -403,7 +403,9 @@ def push_message(text):
 # ── Facebook 發文 ─────────────────────────────────────────
 def detect_fb_post(msg):
     """回傳 (粉專key, 文字內容) 或 (None, None)"""
+    print(f"[DEBUG FB] msg: {repr(msg[:100])}")
     m = re.search(r'(幫我在|發文到|發到|po到|po文到|發布到)?\s*(草咩|一百分|BG)\s*(發文|po文|po一下|發布|貼文)?\s*[：:「]?\s*(.+)', msg, re.DOTALL)
+    print(f"[DEBUG FB] match: {m}")
     if m:
         page_key = m.group(2)
         content = m.group(4).strip().strip('」').strip()
