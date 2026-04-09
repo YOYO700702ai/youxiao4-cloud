@@ -731,14 +731,17 @@ def handle_message(event):
 
     # Google Calendar
     cal_action, cal_data = detect_calendar_action(user_msg)
+    print(f"[DEBUG CAL] action={cal_action}")
     if cal_action == 'conflict':
         action_names = {'add':'新增','delete':'刪除','update':'修改','list':'查詢'}
         names = '、'.join([action_names.get(a,a) for a in cal_data])
         extra_info.append(f"[行事曆]: 悠悠同時說了{names}，我一次只能處理一件事，麻煩分開告訴我。")
     elif cal_action == 'add':
         events = parse_events_with_ai(cal_data)
+        print(f"[DEBUG CAL] parsed events={events}")
         if events:
             results = [add_calendar_event(e['title'], e['start'], e['end']) for e in events]
+            print(f"[DEBUG CAL] add results={results}")
             extra_info.append(f"[行事曆]: " + '\n'.join(results))
         else:
             extra_info.append("[行事曆]: 請告訴我行程名稱和時間，例如：幫我記行程 明天下午3點 開會")
