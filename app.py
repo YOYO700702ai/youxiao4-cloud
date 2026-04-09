@@ -415,24 +415,24 @@ def detect_fb_post(msg):
 
 def post_to_fb(page_key, message, image_bytes=None):
     page = FB_PAGES.get(page_key)
+    print(f"[DEBUG POST] page_key={page_key}, token exists={bool(page and page['token'])}")
     if not page or not page['token']:
         return f"找不到「{page_key}」的粉專設定。"
     page_id = page['id']
     token = page['token']
     try:
         if image_bytes:
-            # 發圖文
             r = requests.post(
                 f"https://graph.facebook.com/v25.0/{page_id}/photos",
                 data={'message': message, 'access_token': token},
                 files={'source': ('image.jpg', image_bytes, 'image/jpeg')}
             )
         else:
-            # 純文字
             r = requests.post(
                 f"https://graph.facebook.com/v25.0/{page_id}/feed",
                 data={'message': message, 'access_token': token}
             )
+        print(f"[DEBUG POST] status={r.status_code}, response={r.text[:300]}")
         if r.status_code == 200:
             return f"已發布到「{page_key}」粉專。"
         return f"發文失敗：{r.text[:200]}"
