@@ -734,7 +734,7 @@ def handle_message(event):
     if cal_action == 'conflict':
         action_names = {'add':'新增','delete':'刪除','update':'修改','list':'查詢'}
         names = '、'.join([action_names.get(a,a) for a in cal_data])
-        extra_info.append(f"[行事曆]: 偵測到多個動作（{names}），一次只能處理一個，請分開傳送。")
+        extra_info.append(f"[行事曆]: 悠悠同時說了{names}，我一次只能處理一件事，麻煩分開告訴我。")
     elif cal_action == 'add':
         events = parse_events_with_ai(cal_data)
         if events:
