@@ -593,8 +593,17 @@ def morning_greeting():
     greeting = ask_ai(prompt, silent=True)
     push_message(greeting)
 
+FB_TOKEN_EXPIRY = datetime.datetime(2026, 6, 8, tzinfo=datetime.timezone(datetime.timedelta(hours=8)))
+
+def check_fb_token_expiry():
+    now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
+    days_left = (FB_TOKEN_EXPIRY - now).days
+    if 0 <= days_left <= 5:
+        push_message(f"⚠️ 提醒悠悠：FB 粉專 Token 還有 {days_left} 天就過期了！\n請去 Facebook Developer → Graph API Explorer 重新拿三個粉專的 Token，更新到 Railway 環境變數。\n（草咩、BG、一百分各一個）")
+
 scheduler.add_job(check_reminders, 'interval', minutes=1)
 scheduler.add_job(morning_greeting, 'cron', hour=11, minute=0, timezone='Asia/Taipei')
+scheduler.add_job(check_fb_token_expiry, 'cron', hour=10, minute=0, timezone='Asia/Taipei')
 scheduler.start()
 
 # ── Flask ─────────────────────────────────────────────────
