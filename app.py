@@ -141,14 +141,6 @@ def update_memory_log(user_msg, ai_reply):
         mem = compress_memory(mem)
     save_memory(mem)
 
-def detect_memory_cmd(msg):
-    m = re.search(r'(記住|幫我記住)[：:\s]*(.+)', msg)
-    if m:
-        return 'add', m.group(2).strip()
-    if re.search(r'你記得|你的記憶|你記了什麼', msg):
-        return 'show', None
-    return None, None
-
 # ── 筆記系統 ──────────────────────────────────────────────
 def save_note(content):
     try:
@@ -181,16 +173,6 @@ def delete_note(idx):
     except Exception as e:
         return f"刪除失敗：{e}"
 
-def detect_note_action(msg):
-    if re.search(r'幫我記|記下來', msg) and not re.search(r'行程|行事曆|日曆|calendar', msg, re.IGNORECASE):
-        return 'add', re.sub(r'幫我記|記下來|：|:', '', msg).strip()
-    if re.search(r'看筆記|我的筆記', msg):
-        return 'list', None
-    m = re.search(r'刪.*(第(\d+)|#(\d+)).*筆記|筆記.*(第(\d+)|#(\d+)).*刪', msg)
-    if m:
-        return 'delete', int(next(x for x in m.groups() if x and x.isdigit()))
-    return None, None
-
 # ── 定時提醒 ──────────────────────────────────────────────
 def save_reminder(t, msg):
     try:
@@ -212,13 +194,6 @@ def check_reminders():
                 ws.update_cell(i + 1, 4, 'True')
     except Exception as e:
         print(f"check_reminders 錯誤：{e}")
-
-def detect_reminder(msg):
-    m = re.search(r'(\d{1,2})[點:：](\d{0,2})\s*提醒我?\s*(.+)', msg)
-    if m:
-        h, mi = int(m.group(1)), int(m.group(2)) if m.group(2) else 0
-        return f"{h:02d}:{mi:02d}", m.group(3).strip()
-    return None, None
 
 # ── Google Calendar ───────────────────────────────────────
 def get_calendar_service():
@@ -258,40 +233,6 @@ def list_calendar_events(days=7):
         return '\n'.join(lines)
     except Exception as e:
         return f"查詢失敗：{e}"
-
-def parse_events_with_ai(msg):
-    """用 AI 從訊息解析一或多筆事件，回傳 list of {title, start, end}"""
-    now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
-    prompt = (
-        f"現在是 {now.strftime('%Y-%m-%d %H:%M')}（台灣時間）。\n"
-        f"注意：日期若是民國年（如115年），請換算成西元年（115+1911=2026）。\n"
-        f"日期範圍如 04/25-26 代表 04/25 開始、04/26 結束。\n"
-        f"從以下訊息解析所有行事曆事件，只回覆 JSON 陣列，不要其他文字：\n"
-        f"訊息：{msg}\n\n"
-        f"格式：[{{\"title\": \"事件名稱\", \"start\": \"YYYY-MM-DDTHH:MM:00\", \"end\": \"YYYY-MM-DDTHH:MM:00\"}}]\n"
-        f"沒有指定時間就用全天 09:00 開始，結束時間預設為開始後2小時。\n"
-        f"只回覆 JSON 陣列。"
-    )
-    try:
-        resp = gemini_client.models.generate_content(model=GEMMA_MODEL, contents=prompt)
-        m = re.search(r'\[.*\]', resp.text.strip(), re.DOTALL)
-        if m:
-            return json.loads(m.group())
-    except Exception as e:
-        print(f"parse_events_with_ai 失敗：{e}")
-    return []
-
-_DATE_PATTERN = re.compile(
-    r'\d{1,3}月\d{1,2}[日號]'       # 4月10日、115年4月10日
-    r'|\d{1,2}/\d{1,2}'              # 4/10
-    r'|明天|後天|大後天'
-    r'|下週[一二三四五六日]'
-    r'|這週[一二三四五六日]'
-    r'|週[一二三四五六日]'
-    r'|[上下]午\d{1,2}點'
-    r'|早上\d{1,2}點|晚上\d{1,2}點'
-    r'|\d{1,2}點(半|\d{0,2}分)?'
-)
 
 def delete_calendar_event(keyword):
     try:
@@ -343,20 +284,6 @@ def update_calendar_event(keyword, new_title=None, new_start=None, new_end=None)
     except Exception as e:
         return f"更新失敗：{e}"
 
-def detect_calendar_action(msg):
-    has_delete = bool(re.search(r'刪除行程|取消行程|移除行程|刪掉行程|刪除行事曆|取消行事曆|刪掉行事曆', msg))
-    has_update = bool(re.search(r'修改行程|更改行程|改行程|把.*行程.*改|修改行事曆|更改行事曆|改行事曆', msg))
-    has_list   = bool(re.search(r'查行程|看行程|我的行程|今天行程|明天行程|本週行程|有什麼行程|行程查詢', msg))
-    has_add    = bool(_DATE_PATTERN.search(msg))
-
-    actions = [a for a, v in [('delete',has_delete),('update',has_update),('list',has_list),('add',has_add)] if v]
-
-    if len(actions) > 1:
-        return 'conflict', actions
-    if actions:
-        return actions[0], msg
-    return None, None
-
 # ── 爬網頁 ────────────────────────────────────────────────
 def fetch_url(url):
     try:
@@ -370,10 +297,7 @@ def fetch_url(url):
     except Exception as e:
         return f"抓取失敗：{e}"
 
-def extract_urls(text):
-    return re.findall(r'https?://[^\s）\)]+', text)
-
-# ── 系統提示（暫定，等取名後再調整）─────────────────────────
+# ── 系統提示 ───────────────────────────────────────────────
 SYSTEM_PROMPT = (
     "【你的身份】\n"
     "你叫伍盛，35歲，悠悠私下稱你「小5」。\n"
@@ -405,49 +329,188 @@ SYSTEM_PROMPT = (
     "  （微微一笑）（眼神閃過一絲黯淡，但隨即溫柔地看向妳）（替妳披上外套）\n\n"
 
     "【你的能力】\n"
-    "- 爬網頁整理摘要\n"
-    "- 筆記（幫我記/看筆記/刪掉第N條）\n"
-    "- 定時提醒（X點提醒我XX）\n"
-    "- 記憶（記住XX／你記得什麼）\n"
-    "- Google 行事曆：已連接悠悠的 Google 日曆，可直接新增和查詢行程\n"
-    "  系統結果會附在 [行事曆] 標籤裡，你直接以執事口吻告知悠悠結果\n"
-    "- 劇本上架／下架：系統會附上 [劇本上架成功] 或 [劇本下架] 標籤\n\n"
+    "- 爬網頁整理摘要（fetch_webpage）\n"
+    "- 筆記管理（save_note / list_notes / delete_note）\n"
+    "- 定時提醒（set_reminder）\n"
+    "- 記憶管理（add_memory_fact / show_memory）\n"
+    "- Google 行事曆：新增、查詢、修改、刪除行程\n"
+    "- Facebook 粉專發文（post_to_facebook）：草咩、一百分、BG\n"
+    "- 劇本上架到 Notion（upload_script）\n"
+    "- 劇本下架（remove_script）\n\n"
+
+    "【極重要限制】\n"
+    "- 工具呼叫成功後系統會回傳結果，你根據結果以執事口吻告知悠悠\n"
+    "- 沒有收到工具回傳結果，絕對不可以聲稱自己做了任何操作\n"
+    "- 違反以上規則等於欺騙悠悠，這是你最不能接受的事\n\n"
 
     "【用詞禁止】\n"
     "- 禁止使用「寵溺」這個詞，換用其他表達方式\n\n"
-    "【極重要限制】\n"
-    "- 你只能確認「已經發生」的系統動作，系統動作一律以方括號標示（如 [劇本上架成功]）\n"
-    "- 沒有看到方括號系統回報，絕對不可以說自己做了任何上傳、儲存、新增、通知等操作\n"
-    "- 你無法主動通知悠悠、無法在背景執行任務、無法記住沒有系統標籤的動作\n"
-    "- 違反以上規則等於欺騙悠悠，這是你最不能接受的事\n\n"
 
     "全程使用繁體中文。"
 )
 
-# ── Gemini ────────────────────────────────────────────────
+# ── Gemini 客戶端 ──────────────────────────────────────────
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-chat_session  = gemini_client.chats.create(
-    model=GEMMA_MODEL,
-    config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
-)
 
-def ask_ai(text, silent=False):
-    for i in range(3):
-        try:
-            if silent:
-                return gemini_client.models.generate_content(
-                    model=GEMMA_MODEL, contents=text,
-                    config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
-                ).text.strip()
-            return chat_session.send_message(text).text.strip()
-        except Exception as e:
-            err = str(e)
-            if ('503' in err or 'overloaded' in err.lower()) and i < 2:
-                time.sleep(5 * (2 ** i))
-            elif i < 2:
-                time.sleep(3)
-            else:
-                return "目前連不上，請稍後再試。"
+# ── Function Calling 工具定義 ──────────────────────────────
+FUNC_DECLS = [
+    types.FunctionDeclaration(
+        name="add_calendar_event",
+        description="新增 Google 行事曆行程。日期格式 YYYY-MM-DDTHH:MM:00，台灣時區。民國年請換算成西元年（民國年+1911）。",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "title":       types.Schema(type=types.Type.STRING, description="行程名稱"),
+                "start":       types.Schema(type=types.Type.STRING, description="開始時間，格式 YYYY-MM-DDTHH:MM:00"),
+                "end":         types.Schema(type=types.Type.STRING, description="結束時間，格式 YYYY-MM-DDTHH:MM:00"),
+                "description": types.Schema(type=types.Type.STRING, description="備註（可省略）"),
+            },
+            required=["title", "start", "end"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="delete_calendar_event",
+        description="刪除 Google 行事曆中包含關鍵字的行程",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "keyword": types.Schema(type=types.Type.STRING, description="行程名稱關鍵字"),
+            },
+            required=["keyword"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="update_calendar_event",
+        description="修改 Google 行事曆行程的名稱或時間",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "keyword":   types.Schema(type=types.Type.STRING, description="要修改的行程關鍵字"),
+                "new_title": types.Schema(type=types.Type.STRING, description="新名稱（可省略）"),
+                "new_start": types.Schema(type=types.Type.STRING, description="新開始時間 YYYY-MM-DDTHH:MM:00（可省略）"),
+                "new_end":   types.Schema(type=types.Type.STRING, description="新結束時間 YYYY-MM-DDTHH:MM:00（可省略）"),
+            },
+            required=["keyword"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="list_calendar_events",
+        description="查詢未來 N 天的 Google 行事曆行程",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "days": types.Schema(type=types.Type.INTEGER, description="查幾天，預設 7"),
+            },
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="add_memory_fact",
+        description="記住一個關於悠悠的重要事實，永久儲存",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "fact": types.Schema(type=types.Type.STRING, description="要記住的事實，30字以內"),
+            },
+            required=["fact"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="show_memory",
+        description="查看目前記得的所有關於悠悠的記憶",
+        parameters=types.Schema(type=types.Type.OBJECT, properties={}),
+    ),
+    types.FunctionDeclaration(
+        name="save_note",
+        description="儲存一則筆記",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "content": types.Schema(type=types.Type.STRING, description="筆記內容"),
+            },
+            required=["content"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="list_notes",
+        description="列出最近的筆記（最多10筆）",
+        parameters=types.Schema(type=types.Type.OBJECT, properties={}),
+    ),
+    types.FunctionDeclaration(
+        name="delete_note",
+        description="刪除指定編號的筆記",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "idx": types.Schema(type=types.Type.INTEGER, description="筆記編號"),
+            },
+            required=["idx"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="set_reminder",
+        description="設定定時提醒，到時間會自動推送訊息給悠悠",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "time":    types.Schema(type=types.Type.STRING, description="提醒時間，格式 HH:MM"),
+                "message": types.Schema(type=types.Type.STRING, description="提醒內容"),
+            },
+            required=["time", "message"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="fetch_webpage",
+        description="抓取網頁內容並回傳摘要文字",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "url": types.Schema(type=types.Type.STRING, description="要抓取的網頁 URL"),
+            },
+            required=["url"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="post_to_facebook",
+        description="發文到指定 Facebook 粉絲專頁。page 只能是：草咩、一百分、BG。",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "page":    types.Schema(type=types.Type.STRING, description="粉專名稱：草咩、一百分 或 BG"),
+                "content": types.Schema(type=types.Type.STRING, description="發文指令或內容，AI 會生成正式貼文後發出"),
+            },
+            required=["page", "content"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="upload_script",
+        description="上架劇本到 Notion 資料庫，若之前有傳圖片會自動作為封面",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "data": types.Schema(type=types.Type.STRING, description="劇本完整資料，包含名稱、類型、人數、時長、價格、角色、簡介等"),
+            },
+            required=["data"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="remove_script",
+        description="下架（封存）Notion 中指定名稱的劇本",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "name": types.Schema(type=types.Type.STRING, description="劇本名稱"),
+            },
+            required=["name"],
+        ),
+    ),
+]
+
+TOOLS = [types.Tool(function_declarations=FUNC_DECLS)]
+
+tool_chat_session = gemini_client.chats.create(
+    model=GEMMA_MODEL,
+    config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, tools=TOOLS),
+)
 
 # ── LINE Push ─────────────────────────────────────────────
 def push_message(text):
@@ -457,21 +520,8 @@ def push_message(text):
         )
 
 # ── Facebook 發文 ─────────────────────────────────────────
-def detect_fb_post(msg):
-    """回傳 (粉專key, 文字內容) 或 (None, None)"""
-    print(f"[DEBUG FB] msg: {repr(msg[:100])}")
-    m = re.search(r'(幫我在|發文到|發到|po到|po文到|發布到)?\s*(草咩|一百分|BG)\s*(發文|po文|po一下|發布|貼文)?\s*[：:「]?\s*(.+)', msg, re.DOTALL)
-    print(f"[DEBUG FB] match: {m}")
-    if m:
-        page_key = m.group(2)
-        content = m.group(4).strip().strip('」').strip()
-        if page_key in FB_PAGES:
-            return page_key, content
-    return None, None
-
 def post_to_fb(page_key, message, image_bytes=None):
     page = FB_PAGES.get(page_key)
-    print(f"[DEBUG POST] page_key={page_key}, token exists={bool(page and page['token'])}")
     if not page or not page['token']:
         return f"找不到「{page_key}」的粉專設定。"
     page_id = page['id']
@@ -488,7 +538,6 @@ def post_to_fb(page_key, message, image_bytes=None):
                 f"https://graph.facebook.com/v25.0/{page_id}/feed",
                 data={'message': message, 'access_token': token}
             )
-        print(f"[DEBUG POST] status={r.status_code}, response={r.text[:300]}")
         if r.status_code == 200:
             return f"已發布到「{page_key}」粉專。"
         return f"發文失敗：{r.text[:200]}"
@@ -498,7 +547,7 @@ def post_to_fb(page_key, message, image_bytes=None):
 # ── 劇本上架（Notion + GitHub）────────────────────────────
 import base64
 
-pending_image  = {}  # {user_id: (bytes, timestamp)}
+pending_image = {}  # {user_id: (bytes, timestamp)}
 
 def upload_image_to_github(image_bytes, filename):
     path = f"scraped_covers/{filename}"
@@ -568,25 +617,12 @@ def parse_script_info_with_ai(msg):
     except:
         return None
 
-def detect_script_upload(msg):
-    return bool(re.search(r'上架劇本|新增劇本|幫我上架|劇本上架', msg))
-
-def detect_script_remove(msg):
-    m = re.search(r'下架.{0,5}[《「](.+?)[》」]', msg)
-    if m:
-        return m.group(1).strip()
-    m = re.search(r'下架劇本\s*(.+)', msg)
-    if m:
-        return m.group(1).strip()
-    return None
-
 def archive_notion_script(name):
     headers = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
         "Content-Type": "application/json",
         "Notion-Version": "2022-06-28"
     }
-    # 搜尋符合名稱的頁面
     r = requests.post(
         f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query",
         headers=headers,
@@ -598,7 +634,6 @@ def archive_notion_script(name):
     if not results:
         return False, f"找不到《{name}》，請確認名稱是否正確。"
     page_id = results[0]["id"]
-    # 封存
     r2 = requests.patch(
         f"https://api.notion.com/v1/pages/{page_id}",
         headers=headers,
@@ -608,13 +643,122 @@ def archive_notion_script(name):
         return True, f"《{name}》已下架（封存）。"
     return False, f"下架失敗：{r2.text[:200]}"
 
+# ── Function 執行器 ────────────────────────────────────────
+def execute_function(name, args, uid=None):
+    if name == "add_calendar_event":
+        return add_calendar_event(args["title"], args["start"], args["end"], args.get("description", ""))
+    elif name == "delete_calendar_event":
+        return delete_calendar_event(args["keyword"])
+    elif name == "update_calendar_event":
+        return update_calendar_event(args["keyword"], args.get("new_title"), args.get("new_start"), args.get("new_end"))
+    elif name == "list_calendar_events":
+        return list_calendar_events(int(args.get("days", 7)))
+    elif name == "add_memory_fact":
+        return add_memory_fact(args["fact"])
+    elif name == "show_memory":
+        ctx = build_memory_context(load_memory())
+        return ctx or "目前沒有記憶。"
+    elif name == "save_note":
+        return save_note(args["content"])
+    elif name == "list_notes":
+        return list_notes()
+    elif name == "delete_note":
+        return delete_note(int(args["idx"]))
+    elif name == "set_reminder":
+        return save_reminder(args["time"], args["message"])
+    elif name == "fetch_webpage":
+        return fetch_url(args["url"])
+    elif name == "post_to_facebook":
+        page = args["page"]
+        content = args["content"]
+        entry = pending_image.get(uid) if uid else None
+        img = entry[0] if entry and (time.time() - entry[1]) < 1800 else None
+        post_prompt = (
+            f"請根據以下指令，為「{page}」粉絲專頁撰寫一篇正式的 Facebook 貼文。\n"
+            f"指令：{content}\n\n"
+            f"只回傳貼文內容本身，不要加任何說明或前言。"
+        )
+        generated = gemini_client.models.generate_content(
+            model=GEMMA_MODEL, contents=post_prompt,
+            config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
+        ).text.strip()
+        result = post_to_fb(page, generated, img)
+        if img and uid:
+            pending_image.pop(uid, None)
+        return f"{result}\n\n發出的內容：\n{generated}"
+    elif name == "upload_script":
+        info = parse_script_info_with_ai(args["data"])
+        if not info or not info.get("名稱"):
+            return "請提供劇本名稱和資料，例如：名稱《XXX》類型 推理 人數 5人 時長 3小時 價格 800"
+        entry = pending_image.pop(uid, None) if uid else None
+        img_bytes = entry[0] if entry and (time.time() - entry[1]) < 1800 else None
+        cover_url = None
+        if img_bytes:
+            try:
+                safe_name = re.sub(r'[\\/*?:"<>|]', '_', info["名稱"])
+                cover_url = upload_image_to_github(img_bytes, f"{safe_name}.jpg")
+            except Exception as e:
+                return f"封面上傳失敗：{e}"
+        ok, result = create_notion_script(info, cover_url)
+        if ok:
+            return f"《{info['名稱']}》已新增到 Notion{'，封面也上傳好了' if cover_url else '（未附封面圖）'}。"
+        return f"上架失敗：{result}"
+    elif name == "remove_script":
+        _, result = archive_notion_script(args["name"])
+        return result
+    return f"未知工具：{name}"
+
+# ── AI 對話（含工具呼叫）──────────────────────────────────
+def ask_ai_with_tools(user_msg, uid=None):
+    now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
+    mem = load_memory()
+    ctx = build_memory_context(mem)
+    full_msg = (
+        f"現在是 {now.strftime('%Y年%m月%d日 %H:%M')}（台灣時間）。\n"
+        + (ctx + "\n\n---\n\n" if ctx else "")
+        + user_msg
+    )
+    try:
+        response = tool_chat_session.send_message(full_msg)
+    except Exception as e:
+        return "目前連不上，請稍後再試。"
+    for _ in range(5):
+        func_calls = [
+            p.function_call
+            for p in response.candidates[0].content.parts
+            if hasattr(p, 'function_call') and p.function_call and p.function_call.name
+        ]
+        if not func_calls:
+            return response.text.strip()
+        result_parts = [
+            types.Part.from_function_response(
+                name=fc.name,
+                response={"result": execute_function(fc.name, dict(fc.args), uid)}
+            )
+            for fc in func_calls
+        ]
+        try:
+            response = tool_chat_session.send_message(result_parts)
+        except Exception as e:
+            return "目前連不上，請稍後再試。"
+    return response.text.strip()
+
+def ask_ai_simple(text):
+    """用於定時任務，不帶工具"""
+    try:
+        return gemini_client.models.generate_content(
+            model=GEMMA_MODEL, contents=text,
+            config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
+        ).text.strip()
+    except Exception as e:
+        return f"連線失敗：{e}"
+
 # ── APScheduler ───────────────────────────────────────────
 scheduler = BackgroundScheduler(timezone='Asia/Taipei')
+
 def morning_greeting():
     now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
-    today_str    = now.strftime("%Y年%m月%d日")
-    tomorrow     = now + datetime.timedelta(days=1)
-    tomorrow_str = tomorrow.strftime("%Y年%m月%d日")
+    tomorrow = now + datetime.timedelta(days=1)
 
     def fetch_day_events(day_dt, label):
         day_start = day_dt.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -632,24 +776,19 @@ def morning_greeting():
                 for e in events
             ])
             return f"{label}（{day_dt.strftime('%m/%d')}）行程：\n{lines}"
-        else:
-            return f"{label}（{day_dt.strftime('%m/%d')}）沒有行程。"
+        return f"{label}（{day_dt.strftime('%m/%d')}）沒有行程。"
 
-    # 查今天 + 明天
     try:
-        today_context    = fetch_day_events(now, "今天")
-        tomorrow_context = fetch_day_events(tomorrow, "明天")
-        context = today_context + "\n\n" + tomorrow_context
+        context = fetch_day_events(now, "今天") + "\n\n" + fetch_day_events(tomorrow, "明天")
     except Exception as e:
-        context = f"今天（{today_str}）和明天（{tomorrow_str}）行程查詢失敗：{e}"
+        context = f"行程查詢失敗：{e}"
 
     prompt = (
         f"現在是早上11點，請以伍盛的身份向悠悠說早安。\n"
         f"{context}\n"
         f"若有行程請提醒她，語氣要符合伍盛的成熟深情執事風格，可加入括號動作描述。"
     )
-    greeting = ask_ai(prompt, silent=True)
-    push_message(greeting)
+    push_message(ask_ai_simple(prompt))
 
 FB_TOKEN_EXPIRY = datetime.datetime(2026, 6, 8, tzinfo=datetime.timezone(datetime.timedelta(hours=8)))
 
@@ -690,7 +829,6 @@ def handle_image(event):
     with ApiClient(configuration) as api_client:
         image_data = MessagingApiBlob(api_client).get_message_content(event.message.id)
     uid = event.source.user_id
-    # 永遠存起來，附時間戳記（30分鐘內有效）
     pending_image[uid] = (image_data, time.time())
     try:
         reply = gemini_client.models.generate_content(
@@ -712,142 +850,13 @@ def handle_image(event):
 def handle_message(event):
     if event.source.user_id != MY_USER_ID:
         return
-
-    user_msg   = event.message.text
-    extra_info = []
-
-    # 記憶指令
-    mem_cmd, mem_data = detect_memory_cmd(user_msg)
-    if mem_cmd == 'add' and mem_data:
-        extra_info.append(f"[記憶]: {add_memory_fact(mem_data)}")
-    elif mem_cmd == 'show':
-        ctx = build_memory_context(load_memory())
-        extra_info.append(f"[你目前記得]: {ctx or '還沒有記憶'}")
-
-    # 定時提醒
-    rt, rm = detect_reminder(user_msg)
-    if rt and rm:
-        extra_info.append(f"[提醒]: {save_reminder(rt, rm)}")
-
-    # Google Calendar
-    cal_action, cal_data = detect_calendar_action(user_msg)
-    print(f"[DEBUG CAL] action={cal_action}")
-    if cal_action == 'conflict':
-        action_names = {'add':'新增','delete':'刪除','update':'修改','list':'查詢'}
-        names = '、'.join([action_names.get(a,a) for a in cal_data])
-        extra_info.append(f"[行事曆]: 悠悠同時說了{names}，我一次只能處理一件事，麻煩分開告訴我。")
-    elif cal_action == 'add':
-        events = parse_events_with_ai(cal_data)
-        print(f"[DEBUG CAL] parsed events={events}")
-        if events:
-            results = [add_calendar_event(e['title'], e['start'], e['end']) for e in events]
-            print(f"[DEBUG CAL] add results={results}")
-            extra_info.append(f"[行事曆]: " + '\n'.join(results))
-        else:
-            extra_info.append("[行事曆]: 請告訴我行程名稱和時間，例如：幫我記行程 明天下午3點 開會")
-    elif cal_action == 'list':
-        extra_info.append(f"[行事曆]: {list_calendar_events()}")
-    elif cal_action == 'delete':
-        parsed = parse_events_with_ai(cal_data)
-        keyword = parsed[0]['title'] if parsed else ''
-        if keyword:
-            extra_info.append(f"[行事曆]: {delete_calendar_event(keyword)}")
-        else:
-            extra_info.append("[行事曆]: 請告訴我要刪除哪個行程的名稱。")
-    elif cal_action == 'update':
-        parsed = parse_events_with_ai(cal_data)
-        if parsed:
-            e = parsed[0]
-            extra_info.append(f"[行事曆]: {update_calendar_event(e['title'], new_start=e.get('start'), new_end=e.get('end'))}")
-        else:
-            extra_info.append("[行事曆]: 請告訴我要修改哪個行程，以及新的時間。")
-
-    # 爬網頁
-    for url in extract_urls(user_msg)[:2]:
-        extra_info.append(f"[網頁 {url}]:\n{fetch_url(url)}")
-
-    # FB 發文
-    fb_page, fb_content = detect_fb_post(user_msg)
-    if fb_page and fb_content:
-        entry = pending_image.get(event.source.user_id)
-        img = entry[0] if entry and (time.time() - entry[1]) < 1800 else None
-        # 讓 AI 根據指令生成正式貼文內容
-        post_prompt = (
-            f"請根據以下指令，為「{fb_page}」粉絲專頁撰寫一篇正式的 Facebook 貼文。\n"
-            f"指令：{fb_content}\n\n"
-            f"只回傳貼文內容本身，不要加任何說明或前言。"
-        )
-        generated_content = gemini_client.models.generate_content(
-            model=GEMMA_MODEL, contents=post_prompt,
-            config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
-        ).text.strip()
-        result = post_to_fb(fb_page, generated_content, img)
-        if img:
-            pending_image.pop(event.source.user_id, None)
-        extra_info.append(f"[FB發文]: {result}\n\n發出的內容：\n{generated_content}")
-
-    # 劇本上架
-    if detect_script_upload(user_msg) and NOTION_TOKEN and GITHUB_TOKEN:
-        info = parse_script_info_with_ai(user_msg)
-        if info and info.get("名稱"):
-            entry = pending_image.pop(event.source.user_id, None)
-            print(f"[DEBUG] pending_image entry: {type(entry)}, keys: {list(pending_image.keys())}")
-            if entry:
-                age = time.time() - entry[1]
-                print(f"[DEBUG] image age: {age:.0f}s, bytes type: {type(entry[0])}, len: {len(entry[0]) if entry[0] else 0}")
-                img_bytes = entry[0] if age < 1800 else None
-                if age >= 1800:
-                    extra_info.append("[封面]: 圖片已超過30分鐘，請重新傳一次。")
-            else:
-                img_bytes = None
-                extra_info.append("[封面]: 沒有找到封面圖，若需要封面請先傳圖再上架。")
-            cover_url = None
-            if img_bytes:
-                try:
-                    safe_name = re.sub(r'[\\/*?:"<>|]', '_', info["名稱"])
-                    print(f"[DEBUG] uploading to GitHub: {safe_name}.jpg")
-                    cover_url = upload_image_to_github(img_bytes, f"{safe_name}.jpg")
-                    print(f"[DEBUG] upload success: {cover_url}")
-                except Exception as e:
-                    print(f"[DEBUG] upload error: {e}")
-                    extra_info.append(f"[封面上傳失敗]: {e}")
-            ok, result = create_notion_script(info, cover_url)
-            if ok:
-                extra_info.append(f"[劇本上架成功]: 《{info['名稱']}》已新增到 Notion{'，封面也上傳好了' if cover_url else '（未附封面圖）'}。")
-            else:
-                extra_info.append(f"[劇本上架失敗]: {result}")
-        else:
-            extra_info.append("[劇本上架]: 請提供劇本名稱和資料，例如：幫我上架劇本 名稱《XXX》類型 推理 人數 5人 時長 3小時 價格 800")
-
-    # 劇本下架
-    script_remove_name = detect_script_remove(user_msg)
-    if script_remove_name and NOTION_TOKEN:
-        ok, result = archive_notion_script(script_remove_name)
-        extra_info.append(f"[劇本下架]: {result}")
-
-    # 筆記
-    na, nd = detect_note_action(user_msg)
-    if na == 'add' and nd:
-        extra_info.append(f"[筆記]: {save_note(nd)}")
-    elif na == 'list':
-        extra_info.append(f"[筆記]: {list_notes()}")
-    elif na == 'delete' and nd:
-        extra_info.append(f"[筆記]: {delete_note(nd)}")
-
-    # 組合 prompt
-    mem = load_memory()
-    ctx = build_memory_context(mem)
-    prompt = (ctx + '\n\n---\n\n' if ctx else '') + user_msg
-    if extra_info:
-        prompt += '\n\n' + '\n\n'.join(extra_info)
-
-    reply = ask_ai(prompt)
-
+    user_msg = event.message.text
+    uid = event.source.user_id
+    reply = ask_ai_with_tools(user_msg, uid)
     try:
         update_memory_log(user_msg, reply)
     except Exception as e:
         print(f"記憶更新失敗：{e}")
-
     with ApiClient(configuration) as api_client:
         MessagingApi(api_client).reply_message_with_http_info(
             ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply)])
