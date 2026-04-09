@@ -32,6 +32,22 @@ NOTION_DB_ID         = os.environ.get('NOTION_DATABASE_ID', '')
 GITHUB_TOKEN         = os.environ.get('GITHUB_TOKEN', '')
 GITHUB_REPO          = os.environ.get('GITHUB_REPO', 'YOYO700702ai/BGLARPA5')
 
+# ── Facebook 粉專 ─────────────────────────────────────────
+FB_PAGES = {
+    '草咩': {
+        'id': '106677739163657',
+        'token': os.environ.get('FB_TOKEN_CAOMIE', ''),
+    },
+    '一百分': {
+        'id': '2315283968746448',
+        'token': os.environ.get('FB_TOKEN_100', ''),
+    },
+    'BG': {
+        'id': '1551705368270004',
+        'token': os.environ.get('FB_TOKEN_BG', ''),
+    },
+}
+
 # ── Google Sheets ─────────────────────────────────────────
 SCOPES = [
     'https://www.googleapis.com/auth/spreadsheets',
@@ -384,6 +400,43 @@ def push_message(text):
             PushMessageRequest(to=MY_USER_ID, messages=[TextMessage(text=text)])
         )
 
+# ── Facebook 發文 ─────────────────────────────────────────
+def detect_fb_post(msg):
+    """回傳 (粉專key, 文字內容) 或 (None, None)"""
+    m = re.search(r'(幫我在|發文到|發到|po到|po文到|發布到)?\s*(草咩|一百分|BG)\s*(發文|po文|po一下|發布|貼文)?\s*[：:「]?\s*(.+)', msg, re.DOTALL)
+    if m:
+        page_key = m.group(2)
+        content = m.group(4).strip().strip('」').strip()
+        if page_key in FB_PAGES:
+            return page_key, content
+    return None, None
+
+def post_to_fb(page_key, message, image_bytes=None):
+    page = FB_PAGES.get(page_key)
+    if not page or not page['token']:
+        return f"找不到「{page_key}」的粉專設定。"
+    page_id = page['id']
+    token = page['token']
+    try:
+        if image_bytes:
+            # 發圖文
+            r = requests.post(
+                f"https://graph.facebook.com/v25.0/{page_id}/photos",
+                data={'message': message, 'access_token': token},
+                files={'source': ('image.jpg', image_bytes, 'image/jpeg')}
+            )
+        else:
+            # 純文字
+            r = requests.post(
+                f"https://graph.facebook.com/v25.0/{page_id}/feed",
+                data={'message': message, 'access_token': token}
+            )
+        if r.status_code == 200:
+            return f"已發布到「{page_key}」粉專。"
+        return f"發文失敗：{r.text[:200]}"
+    except Exception as e:
+        return f"發文失敗：{e}"
+
 # ── 劇本上架（Notion + GitHub）────────────────────────────
 import base64
 
@@ -624,6 +677,16 @@ def handle_message(event):
     # 爬網頁
     for url in extract_urls(user_msg)[:2]:
         extra_info.append(f"[網頁 {url}]:\n{fetch_url(url)}")
+
+    # FB 發文
+    fb_page, fb_content = detect_fb_post(user_msg)
+    if fb_page and fb_content:
+        entry = pending_image.get(event.source.user_id)
+        img = entry[0] if entry and (time.time() - entry[1]) < 1800 else None
+        result = post_to_fb(fb_page, fb_content, img)
+        if img:
+            pending_image.pop(event.source.user_id, None)
+        extra_info.append(f"[FB發文]: {result}")
 
     # 劇本上架
     if detect_script_upload(user_msg) and NOTION_TOKEN and GITHUB_TOKEN:
