@@ -293,8 +293,64 @@ _DATE_PATTERN = re.compile(
     r'|\d{1,2}點(半|\d{0,2}分)?'
 )
 
+def delete_calendar_event(keyword):
+    try:
+        service = get_calendar_service()
+        now = datetime.datetime.utcnow().isoformat() + 'Z'
+        future = (datetime.datetime.utcnow() + datetime.timedelta(days=90)).isoformat() + 'Z'
+        result = service.events().list(
+            calendarId=GOOGLE_CALENDAR_ID,
+            timeMin=now, timeMax=future,
+            maxResults=20, singleEvents=True, orderBy='startTime'
+        ).execute()
+        events = result.get('items', [])
+        matched = [e for e in events if keyword in e.get('summary', '')]
+        if not matched:
+            return f"找不到包含「{keyword}」的行程。"
+        if len(matched) > 1:
+            names = '\n'.join([f"・{e['start'].get('dateTime',e['start'].get('date',''))[:16]} {e['summary']}" for e in matched])
+            return f"找到多筆行程，請說更具體的名稱：\n{names}"
+        service.events().delete(calendarId=GOOGLE_CALENDAR_ID, eventId=matched[0]['id']).execute()
+        return f"已刪除行程：{matched[0]['summary']}"
+    except Exception as e:
+        return f"刪除失敗：{e}"
+
+def update_calendar_event(keyword, new_title=None, new_start=None, new_end=None):
+    try:
+        service = get_calendar_service()
+        now = datetime.datetime.utcnow().isoformat() + 'Z'
+        future = (datetime.datetime.utcnow() + datetime.timedelta(days=90)).isoformat() + 'Z'
+        result = service.events().list(
+            calendarId=GOOGLE_CALENDAR_ID,
+            timeMin=now, timeMax=future,
+            maxResults=20, singleEvents=True, orderBy='startTime'
+        ).execute()
+        events = result.get('items', [])
+        matched = [e for e in events if keyword in e.get('summary', '')]
+        if not matched:
+            return f"找不到包含「{keyword}」的行程。"
+        if len(matched) > 1:
+            names = '\n'.join([f"・{e['start'].get('dateTime',e['start'].get('date',''))[:16]} {e['summary']}" for e in matched])
+            return f"找到多筆行程，請說更具體的名稱：\n{names}"
+        event = matched[0]
+        if new_title:
+            event['summary'] = new_title
+        if new_start:
+            event['start'] = {'dateTime': new_start, 'timeZone': 'Asia/Taipei'}
+            event['end']   = {'dateTime': new_end or new_start, 'timeZone': 'Asia/Taipei'}
+        service.events().update(calendarId=GOOGLE_CALENDAR_ID, eventId=event['id'], body=event).execute()
+        return f"已更新行程：{event['summary']}"
+    except Exception as e:
+        return f"更新失敗：{e}"
+
 def detect_calendar_action(msg):
-    # 查詢行程
+    # 刪除
+    if re.search(r'刪除行程|取消行程|移除行程|刪掉行程', msg):
+        return 'delete', msg
+    # 修改
+    if re.search(r'修改行程|更改行程|改行程|把.*行程.*改', msg):
+        return 'update', msg
+    # 查詢
     if re.search(r'查行程|看行程|我的行程|今天行程|明天行程|本週行程|有什麼行程|行程查詢', msg):
         return 'list', msg
     # 有日期時間就自動記行事曆
@@ -685,6 +741,20 @@ def handle_message(event):
             extra_info.append("[行事曆]: 請告訴我行程名稱和時間，例如：幫我記行程 明天下午3點 開會")
     elif cal_action == 'list':
         extra_info.append(f"[行事曆]: {list_calendar_events()}")
+    elif cal_action == 'delete':
+        parsed = parse_events_with_ai(cal_data)
+        keyword = parsed[0]['title'] if parsed else ''
+        if keyword:
+            extra_info.append(f"[行事曆]: {delete_calendar_event(keyword)}")
+        else:
+            extra_info.append("[行事曆]: 請告訴我要刪除哪個行程的名稱。")
+    elif cal_action == 'update':
+        parsed = parse_events_with_ai(cal_data)
+        if parsed:
+            e = parsed[0]
+            extra_info.append(f"[行事曆]: {update_calendar_event(e['title'], new_start=e.get('start'), new_end=e.get('end'))}")
+        else:
+            extra_info.append("[行事曆]: 請告訴我要修改哪個行程，以及新的時間。")
 
     # 爬網頁
     for url in extract_urls(user_msg)[:2]:
