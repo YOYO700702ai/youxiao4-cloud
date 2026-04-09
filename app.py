@@ -297,6 +297,23 @@ def fetch_url(url):
     except Exception as e:
         return f"抓取失敗：{e}"
 
+def search_web(query, max_results=5):
+    try:
+        r = requests.get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": query},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10
+        )
+        soup = BeautifulSoup(r.text, 'html.parser')
+        results = []
+        for a in soup.select(".result__a")[:max_results]:
+            href = a.get('href', '')
+            results.append(f"- {a.get_text(strip=True)}: {href}")
+        return '\n'.join(results) if results else "沒有找到結果"
+    except Exception as e:
+        return f"搜尋失敗：{e}"
+
 # ── 系統提示 ───────────────────────────────────────────────
 SYSTEM_PROMPT = (
     "【你的身份】\n"
@@ -467,6 +484,18 @@ FUNC_DECLS = [
                 "url": types.Schema(type=types.Type.STRING, description="要抓取的網頁 URL"),
             },
             required=["url"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="search_web",
+        description="用 DuckDuckGo 搜尋網路，取得最新資訊或新聞的連結清單。需要新聞或最新資訊時先搜尋，再用 fetch_webpage 抓取內容。",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "query":       types.Schema(type=types.Type.STRING, description="搜尋關鍵字"),
+                "max_results": types.Schema(type=types.Type.INTEGER, description="回傳幾筆結果，預設 5"),
+            },
+            required=["query"],
         ),
     ),
     types.FunctionDeclaration(
@@ -668,6 +697,8 @@ def execute_function(name, args, uid=None):
         return save_reminder(args["time"], args["message"])
     elif name == "fetch_webpage":
         return fetch_url(args["url"])
+    elif name == "search_web":
+        return search_web(args["query"], int(args.get("max_results", 5)))
     elif name == "post_to_facebook":
         page = args["page"]
         content = args["content"]
