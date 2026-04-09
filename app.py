@@ -265,11 +265,25 @@ def parse_events_with_ai(msg):
         print(f"parse_events_with_ai 失敗：{e}")
     return []
 
+_DATE_PATTERN = re.compile(
+    r'\d{1,3}月\d{1,2}[日號]'       # 4月10日、115年4月10日
+    r'|\d{1,2}/\d{1,2}'              # 4/10
+    r'|明天|後天|大後天'
+    r'|下週[一二三四五六日]'
+    r'|這週[一二三四五六日]'
+    r'|週[一二三四五六日]'
+    r'|[上下]午\d{1,2}點'
+    r'|早上\d{1,2}點|晚上\d{1,2}點'
+    r'|\d{1,2}點(半|\d{0,2}分)?'
+)
+
 def detect_calendar_action(msg):
-    if re.search(r'記行程|記錄行程|新增行程|加行程|加入行事曆|記在日曆|記到日曆|google日曆|行程.*記|記.*行程', msg, re.IGNORECASE):
-        return 'add', msg
-    if re.search(r'查行程|看行程|我的行程|今天行程|明天行程|本週行程|有什麼行程', msg):
+    # 查詢行程
+    if re.search(r'查行程|看行程|我的行程|今天行程|明天行程|本週行程|有什麼行程|行程查詢', msg):
         return 'list', msg
+    # 有日期時間就自動記行事曆
+    if _DATE_PATTERN.search(msg):
+        return 'add', msg
     return None, None
 
 # ── 爬網頁 ────────────────────────────────────────────────
