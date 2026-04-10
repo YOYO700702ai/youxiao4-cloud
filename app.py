@@ -817,6 +817,19 @@ def morning_greeting():
     except Exception as e:
         context = f"行程查詢失敗：{e}"
 
+    # 抓今日台灣重要新聞
+    news_context = ""
+    try:
+        date_str = now.strftime("%Y/%m/%d")
+        search_results = search_web(f"{date_str} 台灣 重要新聞", max_results=3)
+        # 取第一個有效 URL
+        urls = re.findall(r'https?://[^\s）\)]+', search_results)
+        if urls:
+            news_text = fetch_url(urls[0])
+            news_context = f"\n\n今日新聞資料（請摘取最重要的一則，用一到兩句話告訴悠悠）：\n{news_text[:1500]}"
+    except Exception as e:
+        print(f"[morning] 新聞抓取失敗：{e}")
+
     weekday = ["一", "二", "三", "四", "五", "六", "日"][now.weekday()]
     prompt = (
         f"現在是 {now.strftime('%Y年%m月%d日')} 星期{weekday} 早上11點。\n"
@@ -828,8 +841,10 @@ def morning_greeting():
         f"- 關心悠悠今天的狀態\n"
         f"- 今天是星期{weekday}的特別感受\n\n"
         f"行程資訊如下，請整理後正式告知悠悠，行程前已有勾選符號，請照格式呈現：\n"
-        f"{context}\n\n"
-        f"語氣符合伍盛成熟深情執事風格，可加入括號動作描述。結尾留一句溫柔的叮嚀。"
+        f"{context}\n"
+        f"{news_context}\n\n"
+        f"語氣符合伍盛成熟深情執事風格，可加入括號動作描述。"
+        f"新聞部分請用【今日要聞】標題呈現，簡短一兩句即可。結尾留一句溫柔的叮嚀。"
     )
     push_message(ask_ai_simple(prompt))
 
