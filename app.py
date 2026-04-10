@@ -674,6 +674,7 @@ def archive_notion_script(name):
 
 # ── Function 執行器 ────────────────────────────────────────
 def execute_function(name, args, uid=None):
+    print(f"[TOOL CALLED] {name} | args={args}")
     if name == "add_calendar_event":
         return add_calendar_event(args["title"], args["start"], args["end"], args.get("description", ""))
     elif name == "delete_calendar_event":
