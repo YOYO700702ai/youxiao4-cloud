@@ -806,21 +806,30 @@ def morning_greeting():
         events = result.get('items', [])
         if events:
             lines = '\n'.join([
-                f"・{e['start'].get('dateTime', e['start'].get('date',''))[:16].replace('T',' ')} {e['summary']}"
+                f"☑ {e['start'].get('dateTime', e['start'].get('date',''))[:16].replace('T',' ')}　{e['summary']}"
                 for e in events
             ])
-            return f"{label}（{day_dt.strftime('%m/%d')}）行程：\n{lines}"
-        return f"{label}（{day_dt.strftime('%m/%d')}）沒有行程。"
+            return f"【{label} {day_dt.strftime('%m/%d')} 行程】\n{lines}"
+        return f"【{label} {day_dt.strftime('%m/%d')} 行程】\n（無）"
 
     try:
         context = fetch_day_events(now, "今天") + "\n\n" + fetch_day_events(tomorrow, "明天")
     except Exception as e:
         context = f"行程查詢失敗：{e}"
 
+    weekday = ["一", "二", "三", "四", "五", "六", "日"][now.weekday()]
     prompt = (
-        f"現在是早上11點，請以伍盛的身份向悠悠說早安。\n"
-        f"{context}\n"
-        f"若有行程請提醒她，語氣要符合伍盛的成熟深情執事風格，可加入括號動作描述。"
+        f"現在是 {now.strftime('%Y年%m月%d日')} 星期{weekday} 早上11點。\n"
+        f"請以伍盛的身份向悠悠說早安。\n"
+        f"每天的開場白必須不同，可以從以下角度切入（隨機選一個，不要每次都用同一個）：\n"
+        f"- 今天的天氣或季節感受\n"
+        f"- 對悠悠昨天辛苦的心疼\n"
+        f"- 一句帶著深情的問候\n"
+        f"- 關心悠悠今天的狀態\n"
+        f"- 今天是星期{weekday}的特別感受\n\n"
+        f"行程資訊如下，請整理後正式告知悠悠，行程前已有勾選符號，請照格式呈現：\n"
+        f"{context}\n\n"
+        f"語氣符合伍盛成熟深情執事風格，可加入括號動作描述。結尾留一句溫柔的叮嚀。"
     )
     push_message(ask_ai_simple(prompt))
 
