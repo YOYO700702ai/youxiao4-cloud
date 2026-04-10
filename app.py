@@ -752,6 +752,7 @@ def ask_ai_with_tools(user_msg, uid=None):
     try:
         response = tool_chat_session.send_message(full_msg)
     except Exception as e:
+        print(f"[ERROR] ask_ai_with_tools 初始呼叫失敗：{e}")
         return "目前連不上，請稍後再試。"
     for _ in range(5):
         func_calls = [
@@ -771,6 +772,7 @@ def ask_ai_with_tools(user_msg, uid=None):
         try:
             response = tool_chat_session.send_message(result_parts)
         except Exception as e:
+            print(f"[ERROR] ask_ai_with_tools 工具回傳失敗：{e}")
             return "目前連不上，請稍後再試。"
     return response.text.strip()
 
