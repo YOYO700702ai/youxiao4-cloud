@@ -536,10 +536,13 @@ FUNC_DECLS = [
 
 TOOLS = [types.Tool(function_declarations=FUNC_DECLS)]
 
-tool_chat_session = gemini_client.chats.create(
-    model=GEMMA_MODEL,
-    config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, tools=TOOLS),
-)
+def new_tool_session():
+    return gemini_client.chats.create(
+        model=GEMMA_MODEL,
+        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, tools=TOOLS),
+    )
+
+tool_chat_session = new_tool_session()
 
 # ── LINE Push ─────────────────────────────────────────────
 def push_message(text):
@@ -742,6 +745,7 @@ def execute_function(name, args, uid=None):
 
 # ── AI 對話（含工具呼叫）──────────────────────────────────
 def ask_ai_with_tools(user_msg, uid=None):
+    global tool_chat_session
     now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
     mem = load_memory()
     ctx = build_memory_context(mem)
@@ -750,11 +754,18 @@ def ask_ai_with_tools(user_msg, uid=None):
         + (ctx + "\n\n---\n\n" if ctx else "")
         + user_msg
     )
-    try:
-        response = tool_chat_session.send_message(full_msg)
-    except Exception as e:
-        print(f"[ERROR] ask_ai_with_tools 初始呼叫失敗：{e}")
-        return "目前連不上，請稍後再試。"
+    # 最多重試 3 次
+    for attempt in range(3):
+        try:
+            response = tool_chat_session.send_message(full_msg)
+            break
+        except Exception as e:
+            print(f"[ERROR] 初始呼叫失敗（第{attempt+1}次）：{e}")
+            if attempt < 2:
+                time.sleep(4 * (attempt + 1))
+                tool_chat_session = new_tool_session()  # 重建 session
+            else:
+                return "目前連不上，請稍後再試。"
     for _ in range(5):
         func_calls = [
             p.function_call
@@ -773,7 +784,8 @@ def ask_ai_with_tools(user_msg, uid=None):
         try:
             response = tool_chat_session.send_message(result_parts)
         except Exception as e:
-            print(f"[ERROR] ask_ai_with_tools 工具回傳失敗：{e}")
+            print(f"[ERROR] 工具回傳失敗：{e}")
+            tool_chat_session = new_tool_session()
             return "目前連不上，請稍後再試。"
     return response.text.strip()
 
