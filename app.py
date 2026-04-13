@@ -297,6 +297,36 @@ def fetch_url(url):
     except Exception as e:
         return f"抓取失敗：{e}"
 
+def fetch_aipost_articles():
+    """抓取 AI郵報最新一天的所有文章"""
+    import xml.etree.ElementTree as ET
+    from email.utils import parsedate_to_datetime
+    try:
+        r = requests.get("https://www.aiposthub.com/rss/", headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        root = ET.fromstring(r.content)
+        channel = root.find('channel')
+        items = channel.findall('item')
+        articles = []
+        for item in items:
+            title = item.findtext('title', '').strip()
+            url = item.findtext('link', '').strip()
+            desc = item.findtext('description', '').strip()[:500]
+            pub_date_str = item.findtext('pubDate', '')
+            try:
+                pub_date = parsedate_to_datetime(pub_date_str)
+                pub_date_tw = pub_date.astimezone(datetime.timezone(datetime.timedelta(hours=8)))
+                date = pub_date_tw.date()
+            except:
+                continue
+            articles.append({"title": title, "url": url, "desc": desc, "date": date})
+        if not articles:
+            return [], None
+        latest_date = max(a["date"] for a in articles)
+        return [a for a in articles if a["date"] == latest_date], latest_date
+    except Exception as e:
+        print(f"[morning] AI郵報抓取失敗：{e}")
+        return [], None
+
 def search_web(query, max_results=5):
     try:
         r = requests.get(
@@ -829,18 +859,18 @@ def morning_greeting():
     except Exception as e:
         context = f"行程查詢失敗：{e}"
 
-    # 抓今日台灣重要新聞
-    news_context = ""
+    # 抓 AI郵報最新文章
+    aipost_context = ""
     try:
-        date_str = now.strftime("%Y/%m/%d")
-        search_results = search_web(f"{date_str} 台灣 重要新聞", max_results=3)
-        # 取第一個有效 URL
-        urls = re.findall(r'https?://[^\s）\)]+', search_results)
-        if urls:
-            news_text = fetch_url(urls[0])
-            news_context = f"\n\n今日新聞資料（請摘取最重要的一則，用一到兩句話告訴悠悠）：\n{news_text[:1500]}"
+        articles, latest_date = fetch_aipost_articles()
+        if articles:
+            lines = []
+            for i, a in enumerate(articles, 1):
+                lines.append(f"{i}. 【{a['title']}】\n   摘要：{a['desc']}\n   🔗 {a['url']}")
+            date_label = latest_date.strftime("%m/%d") if latest_date else ""
+            aipost_context = f"\n\n以下是 AI郵報 {date_label} 的最新文章，請依照以下格式整理後呈現給悠悠：\n【AI 郵報 {date_label}】\n用 1.2.3 列出，每篇寫三句話重點摘要，並附上網址。\n\n原始資料：\n" + "\n\n".join(lines)
     except Exception as e:
-        print(f"[morning] 新聞抓取失敗：{e}")
+        print(f"[morning] AI郵報整理失敗：{e}")
 
     weekday = ["一", "二", "三", "四", "五", "六", "日"][now.weekday()]
     prompt = (
@@ -854,9 +884,8 @@ def morning_greeting():
         f"- 今天是星期{weekday}的特別感受\n\n"
         f"行程資訊如下，請整理後正式告知悠悠，行程前已有勾選符號，請照格式呈現：\n"
         f"{context}\n"
-        f"{news_context}\n\n"
-        f"語氣符合伍盛成熟深情執事風格，可加入括號動作描述。"
-        f"新聞部分請用【今日要聞】標題呈現，簡短一兩句即可。結尾留一句溫柔的叮嚀。"
+        f"{aipost_context}\n\n"
+        f"語氣符合伍盛成熟深情執事風格，可加入括號動作描述。結尾留一句溫柔的叮嚀。"
     )
     push_message(ask_ai_simple(prompt))
 
