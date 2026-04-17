@@ -1006,6 +1006,17 @@ def group_push(group_id, text):
         print(f"[group] group_push 失敗：{e}")
     return msg_id
 
+def _parse_msg_ids(cell):
+    if not cell:
+        return []
+    cell = cell.strip()
+    if cell.startswith('['):
+        try:
+            return json.loads(cell)
+        except:
+            return []
+    return [cell]
+
 def _row_to_event(row):
     return {
         'group_id': row[0], 'script': row[1],
@@ -1013,18 +1024,20 @@ def _row_to_event(row):
         'max': int(row[4]),
         'participants': json.loads(row[5]) if row[5] else [],
         'status': row[6],
-        'announce_msg_id': row[7] if len(row) >= 8 else '',
+        'announce_msg_ids': _parse_msg_ids(row[7]) if len(row) >= 8 else [],
     }
 
 def get_event_by_msg_id(group_id, msg_id):
-    """靠公告訊息 ID 找到對應的揪團"""
+    """靠公告訊息 ID（含所有報名表更新訊息）找到對應的揪團"""
     if not msg_id:
         return None, None
     try:
         ws = get_sheet('group_events')
         rows = ws.get_all_values()
         for i, row in enumerate(rows):
-            if len(row) >= 8 and row[0] == group_id and row[7] == msg_id and row[6] in ('open', 'full'):
+            if len(row) < 8 or row[0] != group_id or row[6] not in ('open', 'full'):
+                continue
+            if msg_id in _parse_msg_ids(row[7]):
                 return i + 1, _row_to_event(row)
     except Exception as e:
         print(f"[group] get_event_by_msg_id 失敗：{e}")
@@ -1032,11 +1045,13 @@ def get_event_by_msg_id(group_id, msg_id):
 
 def save_group_event(row_num, event):
     try:
+        ids = event.get('announce_msg_ids', [])
+        ids_str = json.dumps(ids, ensure_ascii=False) if ids else ''
         get_sheet('group_events').update(
             f'A{row_num}:H{row_num}',
             [[event['group_id'], event['script'], event['date'], event['time'],
               event['max'], json.dumps(event['participants'], ensure_ascii=False),
-              event['status'], event.get('announce_msg_id', '')]]
+              event['status'], ids_str]]
         )
     except Exception as e:
         print(f"[group] save_group_event 失敗：{e}")
@@ -1048,11 +1063,23 @@ def create_group_event_row(group_id, script, date, time_str, max_players):
         rows = ws.get_all_values()
         event = {'group_id': group_id, 'script': script, 'date': date,
                  'time': time_str, 'max': max_players, 'participants': [],
-                 'status': 'open', 'announce_msg_id': ''}
+                 'status': 'open', 'announce_msg_ids': []}
         return len(rows), event
     except Exception as e:
         print(f"[group] create_group_event_row 失敗：{e}")
         return None, None
+
+def push_signup_sheet(gid, event, row_num, extra_prefix=""):
+    """推送（更新版）報名表，並把新訊息 ID 加進 announce_msg_ids"""
+    text = (extra_prefix + format_signup_sheet(event)) if extra_prefix else format_signup_sheet(event)
+    msg_id = group_push(gid, text)
+    if msg_id:
+        ids = event.setdefault('announce_msg_ids', [])
+        ids.append(msg_id)
+        if len(ids) > 30:
+            del ids[:-30]
+        save_group_event(row_num, event)
+    return msg_id
 
 def format_signup_sheet(event):
     participants = event['participants']
@@ -1443,8 +1470,7 @@ if group_handler:
                     ev['participants'].append({'user_id': uid, 'name': name, 'slot': slot})
                     if len(ev['participants']) >= ev['max']:
                         ev['status'] = 'full'
-                        save_group_event(row_num, ev)
-                        group_push(gid, format_signup_sheet(ev))
+                        push_signup_sheet(gid, ev, row_num)
                         group_push(gid, f"🎉 成團！{ev['date']} {ev['time']} 測本《{ev['script']}》見！")
                         try:
                             start = f"{ev['date']}T{ev['time']}:00"
@@ -1455,8 +1481,7 @@ if group_handler:
                         except Exception as e:
                             print(f"[group] 建立行事曆失敗：{e}")
                     else:
-                        save_group_event(row_num, ev)
-                        group_push(gid, format_signup_sheet(ev))
+                        push_signup_sheet(gid, ev, row_num)
                     return
 
                 # 取消個人報名 -
@@ -1470,9 +1495,8 @@ if group_handler:
                     for i, participant in enumerate(ev['participants'], 1):
                         participant['slot'] = i
                     ev['status'] = 'open'
-                    save_group_event(row_num, ev)
                     prefix = f"😢 {p['name']} 退出了，目前 {len(ev['participants'])}/{ev['max']} 人\n\n" if was_full else ""
-                    group_push(gid, prefix + format_signup_sheet(ev))
+                    push_signup_sheet(gid, ev, row_num, extra_prefix=prefix)
                     return
 
         # ── 被 @（或 reply Bot）：先嘗試建立揪團，否則 AI 聊天 ──
@@ -1484,10 +1508,7 @@ if group_handler:
                     info.get('time', '10:00'), info.get('max', 6)
                 )
                 if ev:
-                    announce_id = group_push(gid, format_signup_sheet(ev))
-                    if announce_id:
-                        ev['announce_msg_id'] = announce_id
-                        save_group_event(row_num, ev)
+                    push_signup_sheet(gid, ev, row_num)
                 return
             # 非揪團 → AI 聊天回覆
             reply = group_chat_ai(msg, history=log, group_id=gid, speaker_uid=uid, speaker_name=sender_name)
