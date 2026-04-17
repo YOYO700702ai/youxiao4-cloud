@@ -1711,14 +1711,22 @@ if group_handler:
         if not bot_mentioned and '瑪莎' in msg:
             bot_mentioned = True
 
-        # ── 揪團指令（+ / -）必須是「回覆」揪團公告 ──
-        if msg in ('+', '-'):
+        # ── 揪團指令（+ / - / 取消揪團）必須是「回覆」揪團公告 ──
+        if msg in ('+', '-', '取消揪團'):
             if not quoted_id:
                 return  # 不是 reply，忽略
             with signup_lock:
                 row_num, ev = get_event_by_msg_id(gid, quoted_id)
                 if not ev:
                     return  # 找不到對應的揪團
+
+                # 取消整個揪團
+                if msg == '取消揪團':
+                    ev['status'] = 'closed'
+                    ev['announce_msg_ids'] = []
+                    save_group_event(row_num, ev)
+                    group_reply(rtoken, f"🗑 已取消揪團：《{ev['script']}》{ev['date']} {ev['time']}")
+                    return
 
                 # 報名 +
                 if msg == '+':
