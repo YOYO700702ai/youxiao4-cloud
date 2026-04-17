@@ -987,7 +987,7 @@ else:
     GROUP_BOT_USER_ID   = None
 
 def group_push(group_id, text):
-    """推播訊息到群組，回傳第一則訊息的 message_id（失敗回 None）"""
+    """推播訊息到群組（會扣額度），回傳第一則訊息的 message_id"""
     if not group_configuration:
         return None
     msg_id = None
@@ -1004,6 +1004,34 @@ def group_push(group_id, text):
                 group_bot_msg_ids.pop()
     except Exception as e:
         print(f"[group] group_push 失敗：{e}")
+    return msg_id
+
+def group_reply(reply_token, texts):
+    """用 reply_message 回覆（免費、不扣額度），texts 可為單字串或字串清單；回傳第一則訊息 ID"""
+    if not group_configuration or not reply_token:
+        return None
+    if isinstance(texts, str):
+        texts = [texts]
+    if not texts:
+        return None
+    texts = texts[:5]  # LINE 單次 reply 最多 5 則
+    msg_id = None
+    try:
+        with ApiClient(group_configuration) as api_client:
+            resp = MessagingApi(api_client).reply_message(
+                ReplyMessageRequest(
+                    reply_token=reply_token,
+                    messages=[TextMessage(text=t) for t in texts]
+                )
+            )
+            for m in (resp.sent_messages or []):
+                group_bot_msg_ids.add(m.id)
+                if msg_id is None:
+                    msg_id = m.id
+            if len(group_bot_msg_ids) > 200:
+                group_bot_msg_ids.pop()
+    except Exception as e:
+        print(f"[group] group_reply 失敗：{e}")
     return msg_id
 
 def _parse_msg_ids(cell):
@@ -1069,10 +1097,21 @@ def create_group_event_row(group_id, script, date, time_str, max_players):
         print(f"[group] create_group_event_row 失敗：{e}")
         return None, None
 
-def push_signup_sheet(gid, event, row_num, extra_prefix=""):
-    """推送（更新版）報名表，並把新訊息 ID 加進 announce_msg_ids"""
-    text = (extra_prefix + format_signup_sheet(event)) if extra_prefix else format_signup_sheet(event)
-    msg_id = group_push(gid, text)
+def send_signup_sheet(gid, event, row_num, extra_prefix="", reply_token=None, extra_text=None):
+    """送出（更新版）報名表，優先使用 reply（免費），失敗或無 token 才退回 push。
+    extra_text：可選的第二則訊息（例如成團通知），一起 bundle 進 reply。"""
+    sheet_text = (extra_prefix + format_signup_sheet(event)) if extra_prefix else format_signup_sheet(event)
+    msg_id = None
+    if reply_token:
+        texts = [sheet_text]
+        if extra_text:
+            texts.append(extra_text)
+        msg_id = group_reply(reply_token, texts)
+    if msg_id is None:
+        # fallback to push
+        msg_id = group_push(gid, sheet_text)
+        if extra_text:
+            group_push(gid, extra_text)
     if msg_id:
         ids = event.setdefault('announce_msg_ids', [])
         ids.append(msg_id)
@@ -1364,31 +1403,43 @@ def group_push_with_mentions(group_id, template_prefix, participants, template_s
         print(f"[group] group_push_with_mentions 失敗：{e}")
 
 def check_group_reminders():
-    """每天早上8:00提醒今天和明天成團的測本（真 TAG 參加者）"""
+    """每天早上8:00提醒今天成團的測本（同群組同天合併為一則、真 TAG 參加者）"""
     if not group_configuration:
         return
-    now      = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
-    today    = now.strftime("%Y-%m-%d")
-    tomorrow = (now + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    now   = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
+    today = now.strftime("%Y-%m-%d")
     try:
         rows = get_sheet('group_events').get_all_values()
+        # 依群組分桶收集今日成團事件
+        by_group = {}
         for row in rows:
             if len(row) < 7:
                 continue
             group_id, script, date, time_str, _, p_json, status = row[:7]
-            if status != 'full' or date not in (today, tomorrow):
+            if status != 'full' or date != today:
                 continue
             participants = json.loads(p_json) if p_json else []
             if not participants:
                 continue
-            label = "明天" if date == tomorrow else "今天"
-            prefix = (
-                f"⏰ 測本提醒｜{label} {date} {time_str}\n"
-                f"劇本：{script}\n"
-                f"參加者："
-            )
+            by_group.setdefault(group_id, []).append({
+                'script': script, 'time': time_str, 'participants': participants
+            })
+
+        for gid, events in by_group.items():
+            # 合併所有事件的參加者（去重）
+            seen = {}
+            for ev in events:
+                for p in ev['participants']:
+                    seen[p['user_id']] = p['name']
+            all_parts = [{'user_id': uid, 'name': name} for uid, name in seen.items()]
+
+            lines = [f"⏰ 今日測本提醒｜{today}"]
+            for ev in sorted(events, key=lambda x: x['time']):
+                names = "、".join([p['name'] for p in ev['participants']])
+                lines.append(f"・{ev['time']}《{ev['script']}》→ {names}")
+            prefix = "\n".join(lines) + "\n\n參加者："
             suffix = "\n\n大家準時到場囉！"
-            group_push_with_mentions(group_id, prefix, participants, suffix)
+            group_push_with_mentions(gid, prefix, all_parts, suffix)
     except Exception as e:
         print(f"[group] check_group_reminders 失敗：{e}")
 
@@ -1418,6 +1469,7 @@ if group_handler:
             return
         uid = event.source.user_id
         msg = event.message.text.strip()
+        rtoken = event.reply_token
 
         # ── 記錄訊息到短期上下文 + 落地到 buffer ──
         sender_name = get_member_name(gid, uid)
@@ -1455,24 +1507,24 @@ if group_handler:
                     ev['status'] = 'closed'
                     ev['announce_msg_ids'] = []
                     save_group_event(row_num, ev)
-                    group_push(gid, f"🗑 已取消揪團：《{ev['script']}》{ev['date']} {ev['time']}")
+                    group_reply(rtoken, f"🗑 已取消揪團：《{ev['script']}》{ev['date']} {ev['time']}")
                     return
 
                 # 報名 +
                 if msg == '+':
                     if any(p['user_id'] == uid for p in ev['participants']):
-                        group_push(gid, "你已經報名了喔！")
+                        group_reply(rtoken, "你已經報名了喔！")
                         return
                     if ev['status'] == 'full':
-                        group_push(gid, "已成團，目前沒有空缺。")
+                        group_reply(rtoken, "已成團，目前沒有空缺。")
                         return
                     name = get_member_name(gid, uid)
                     slot = len(ev['participants']) + 1
                     ev['participants'].append({'user_id': uid, 'name': name, 'slot': slot})
                     if len(ev['participants']) >= ev['max']:
                         ev['status'] = 'full'
-                        push_signup_sheet(gid, ev, row_num)
-                        group_push(gid, f"🎉 成團！{ev['date']} {ev['time']} 測本《{ev['script']}》見！")
+                        bonus = f"🎉 成團！{ev['date']} {ev['time']} 測本《{ev['script']}》見！"
+                        send_signup_sheet(gid, ev, row_num, reply_token=rtoken, extra_text=bonus)
                         try:
                             start = f"{ev['date']}T{ev['time']}:00"
                             end_h = int(ev['time'].split(':')[0]) + 3
@@ -1482,14 +1534,14 @@ if group_handler:
                         except Exception as e:
                             print(f"[group] 建立行事曆失敗：{e}")
                     else:
-                        push_signup_sheet(gid, ev, row_num)
+                        send_signup_sheet(gid, ev, row_num, reply_token=rtoken)
                     return
 
                 # 取消個人報名 -
                 if msg == '-':
                     p = next((x for x in ev['participants'] if x['user_id'] == uid), None)
                     if not p:
-                        group_push(gid, "你還沒有報名喔！")
+                        group_reply(rtoken, "你還沒有報名喔！")
                         return
                     was_full = ev['status'] == 'full'
                     ev['participants'].remove(p)
@@ -1497,7 +1549,7 @@ if group_handler:
                         participant['slot'] = i
                     ev['status'] = 'open'
                     prefix = f"😢 {p['name']} 退出了，目前 {len(ev['participants'])}/{ev['max']} 人\n\n" if was_full else ""
-                    push_signup_sheet(gid, ev, row_num, extra_prefix=prefix)
+                    send_signup_sheet(gid, ev, row_num, extra_prefix=prefix, reply_token=rtoken)
                     return
 
         # ── 被 @（或 reply Bot）：先嘗試建立揪團，否則 AI 聊天 ──
@@ -1509,17 +1561,17 @@ if group_handler:
                     info.get('time', '10:00'), info.get('max', 6)
                 )
                 if ev:
-                    push_signup_sheet(gid, ev, row_num)
+                    send_signup_sheet(gid, ev, row_num, reply_token=rtoken)
                 return
             # 非揪團 → AI 聊天回覆
             reply = group_chat_ai(msg, history=log, group_id=gid, speaker_uid=uid, speaker_name=sender_name)
-            group_push(gid, reply)
+            group_reply(rtoken, reply)
             return
 
         # ── 2% 機率主動插嘴 ──
         if random.random() < 0.02:
             reply = group_chat_ai(msg, history=log, group_id=gid, speaker_uid=uid, speaker_name=sender_name)
-            group_push(gid, reply)
+            group_reply(rtoken, reply)
 
 @app.route("/group/callback", methods=['POST'])
 def group_callback():
