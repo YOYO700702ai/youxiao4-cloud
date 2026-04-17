@@ -1453,6 +1453,7 @@ if group_handler:
                 # 取消整個揪團
                 if msg == '取消揪團':
                     ev['status'] = 'closed'
+                    ev['announce_msg_ids'] = []
                     save_group_event(row_num, ev)
                     group_push(gid, f"🗑 已取消揪團：《{ev['script']}》{ev['date']} {ev['time']}")
                     return
