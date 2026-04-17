@@ -1777,14 +1777,21 @@ if group_handler:
             ).strftime('%Y-%m-%d %H:%M（台灣時間）')
             user_turn = f"現在是 {now_str}。{sender_name} 對瑪莎說：{msg}"
 
-            session = get_group_tool_session(gid)
+            try:
+                session = get_group_tool_session(gid)
+            except Exception as e:
+                print(f"[group] session 建立失敗：{e}")
+                group_reply(rtoken, "瑪莎走神了一下，再說一次？")
+                return
+
             pending = {}
+            print(f"[group] 送訊息到 session：{user_turn[:50]}")
             try:
                 response = session.send_message(user_turn)
             except Exception as e:
-                print(f"[group] session 失敗，重建：{e}")
-                session = reset_group_tool_session(gid)
+                print(f"[group] session.send_message 失敗，重建：{e}")
                 try:
+                    session = reset_group_tool_session(gid)
                     response = session.send_message(user_turn)
                 except Exception as e2:
                     print(f"[group] session 重建後仍失敗：{e2}")
