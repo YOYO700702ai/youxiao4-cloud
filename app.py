@@ -972,6 +972,7 @@ signup_lock          = threading.Lock()
 group_chat_log       = {}   # {group_id: [{"name": ..., "text": ...}, ...]}
 GROUP_CHAT_LOG_MAX   = 20
 group_bot_msg_ids    = set()  # 記錄 Bot 發出的訊息 ID，用來偵測 reply
+pending_group_image  = {}    # {(gid, uid): (bytes, timestamp)} 等待上架的封面圖
 
 if GROUP_BOT_TOKEN and GROUP_BOT_SECRET:
     group_handler       = WebhookHandler(GROUP_BOT_SECRET)
@@ -1214,6 +1215,31 @@ GROUP_FUNC_DECLS = [
         ),
         parameters=types.Schema(type=types.Type.OBJECT, properties={}),
     ),
+    types.FunctionDeclaration(
+        name="upload_script",
+        description=(
+            "上架劇本到 Notion 資料庫。使用者說要上架/新增劇本並提供劇本資料時呼叫。"
+            "若使用者之前有傳封面圖，會自動作為封面。"
+        ),
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "data": types.Schema(type=types.Type.STRING, description="劇本完整資料，包含名稱、類型、人數、時長、價格、角色、簡介等"),
+            },
+            required=["data"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="remove_script",
+        description="下架（封存）Notion 中指定名稱的劇本。使用者說要下架某劇本時呼叫。",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "name": types.Schema(type=types.Type.STRING, description="要下架的劇本名稱"),
+            },
+            required=["name"],
+        ),
+    ),
 ]
 GROUP_TOOLS = [types.Tool(function_declarations=GROUP_FUNC_DECLS)]
 
@@ -1248,7 +1274,7 @@ def reset_group_tool_session(group_id):
     group_tool_sessions[group_id] = new_group_tool_session(group_id)
     return group_tool_sessions[group_id]
 
-def execute_group_function(name, args, group_id, pending):
+def execute_group_function(name, args, group_id, pending, uid=None):
     """執行工具；pending 是 mutable dict，用來收集需要後續處理的副作用（例如新建立的揪團）"""
     try:
         if name == 'create_team':
@@ -1276,6 +1302,28 @@ def execute_group_function(name, args, group_id, pending):
                     } for e in evs
                 ],
             }
+
+        if name == 'upload_script':
+            info = parse_script_info_with_ai(args.get('data', ''))
+            if not info or not info.get('名稱'):
+                return "請提供劇本名稱和資料，例如：名稱《XXX》類型 推理 人數 5人 時長 3小時 價格 800"
+            entry = pending_group_image.pop((group_id, uid), None) if uid else None
+            img_bytes = entry[0] if entry and (time.time() - entry[1]) < 1800 else None
+            cover_url = None
+            if img_bytes:
+                try:
+                    safe_name = re.sub(r'[\\/*?:"<>|]', '_', info['名稱'])
+                    cover_url = upload_image_to_github(img_bytes, f"{safe_name}.jpg")
+                except Exception as e:
+                    return f"封面上傳失敗：{e}"
+            ok, result = create_notion_script(info, cover_url)
+            if ok:
+                return f"《{info['名稱']}》已新增到 Notion{'，封面也上傳好了' if cover_url else '（未附封面圖）'}。"
+            return f"上架失敗：{result}"
+
+        if name == 'remove_script':
+            _, result = archive_notion_script(args['name'])
+            return result
 
         return {"error": f"unknown tool: {name}"}
     except Exception as e:
@@ -1590,6 +1638,22 @@ if group_handler:
             except Exception as e:
                 print(f"[group] leave_group 失敗：{e}")
 
+    @group_handler.add(MessageEvent, message=ImageMessageContent)
+    def group_handle_image(event):
+        if not hasattr(event.source, 'group_id'):
+            return
+        gid = event.source.group_id
+        if gid not in ALLOWED_GROUP_IDS:
+            return
+        uid = event.source.user_id
+        try:
+            with ApiClient(group_configuration) as api_client:
+                img_data = MessagingApiBlob(api_client).get_message_content(event.message.id)
+            pending_group_image[(gid, uid)] = (img_data, time.time())
+            print(f"[group] 封面圖已暫存：gid={gid} uid={uid}")
+        except Exception as e:
+            print(f"[group] 圖片暫存失敗：{e}")
+
     @group_handler.add(MessageEvent, message=TextMessageContent)
     def group_handle_message(event):
         if not hasattr(event.source, 'group_id'):
@@ -1720,7 +1784,7 @@ if group_handler:
                 result_parts = [
                     types.Part.from_function_response(
                         name=fc.name,
-                        response={"result": execute_group_function(fc.name, dict(fc.args), gid, pending)}
+                        response={"result": execute_group_function(fc.name, dict(fc.args), gid, pending, uid)}
                     )
                     for fc in func_calls
                 ]
