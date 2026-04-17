@@ -1077,6 +1077,153 @@ def get_member_name(group_id, user_id):
     except:
         return f"成員{user_id[-4:]}"
 
+# ── 群組記憶系統 ───────────────────────────────────────────
+def append_chat_buffer(group_id, user_id, name, text):
+    """把對話寫進 buffer Sheet，供每日凌晨壓縮使用"""
+    if not SHEETS_ENABLED:
+        return
+    try:
+        ts = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+        get_sheet('group_chat_buffer').append_row([group_id, user_id, name, text, ts])
+    except Exception as e:
+        print(f"[group] append_chat_buffer 失敗：{e}")
+
+def load_group_user_notes(group_id):
+    """回傳這個群組所有人的長期記憶 [{user_id, name, preferences, style}]"""
+    try:
+        rows = get_sheet('group_user_notes').get_all_values()
+        result = []
+        for row in rows:
+            if len(row) >= 5 and row[0] == group_id:
+                result.append({
+                    'user_id': row[1], 'name': row[2],
+                    'preferences': row[3], 'style': row[4],
+                })
+        return result
+    except Exception as e:
+        print(f"[group] load_group_user_notes 失敗：{e}")
+        return []
+
+def upsert_group_user_note(group_id, user_id, name, preferences, style):
+    """更新或新增某人的記憶列"""
+    try:
+        ws  = get_sheet('group_user_notes')
+        rows = ws.get_all_values()
+        ts = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d")
+        for i, row in enumerate(rows):
+            if len(row) >= 2 and row[0] == group_id and row[1] == user_id:
+                ws.update(f'A{i+1}:F{i+1}', [[group_id, user_id, name, preferences, style, ts]])
+                return
+        ws.append_row([group_id, user_id, name, preferences, style, ts])
+    except Exception as e:
+        print(f"[group] upsert_group_user_note 失敗：{e}")
+
+def load_group_events_log(group_id, limit=30):
+    """回傳這個群組最近 N 件事件"""
+    try:
+        rows = get_sheet('group_events_log').get_all_values()
+        result = [row[1] for row in rows if len(row) >= 2 and row[0] == group_id]
+        return result[-limit:]
+    except Exception as e:
+        print(f"[group] load_group_events_log 失敗：{e}")
+        return []
+
+def append_group_event_log(group_id, text):
+    try:
+        ts = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d")
+        get_sheet('group_events_log').append_row([group_id, text, ts])
+    except Exception as e:
+        print(f"[group] append_group_event_log 失敗：{e}")
+
+def clear_chat_buffer_for_group(group_id):
+    """壓縮完畢後清除這個群組的 buffer"""
+    try:
+        ws = get_sheet('group_chat_buffer')
+        rows = ws.get_all_values()
+        to_delete = [i+1 for i, row in enumerate(rows) if len(row) >= 1 and row[0] == group_id]
+        for row_num in reversed(to_delete):
+            ws.delete_rows(row_num)
+    except Exception as e:
+        print(f"[group] clear_chat_buffer_for_group 失敗：{e}")
+
+def compress_group_memory():
+    """每天凌晨3:00 把 buffer 壓縮成每人記憶 + 群組事件"""
+    if not SHEETS_ENABLED or not group_configuration:
+        return
+    print("[group] 開始壓縮群組記憶 ...")
+    try:
+        buf_rows = get_sheet('group_chat_buffer').get_all_values()
+        by_group = {}
+        for row in buf_rows:
+            if len(row) < 4:
+                continue
+            by_group.setdefault(row[0], []).append(row)
+
+        _gc = group_gemini_client or gemini_client
+        for gid, chats in by_group.items():
+            if gid not in ALLOWED_GROUP_IDS:
+                continue
+            if len(chats) < 5:
+                continue  # 太少不壓縮
+
+            existing_users = load_group_user_notes(gid)
+            existing_map   = {u['user_id']: u for u in existing_users}
+            recent_events  = load_group_events_log(gid, limit=15)
+
+            existing_users_txt = "\n".join(
+                f"- {u['name']}（{u['user_id']}）喜好：{u['preferences']}；說話風格：{u['style']}"
+                for u in existing_users
+            ) or "（無）"
+            recent_events_txt = "\n".join(f"- {e}" for e in recent_events) or "（無）"
+            conv = "\n".join(f"{r[2]}：{r[3]}" for r in chats)
+
+            prompt = (
+                "你是一個群組秘書，要從以下對話中擷取：\n"
+                "1. 每個發言人的喜好、個性、習慣（可新增或更新）\n"
+                "2. 每個發言人的說話風格（用詞、口吻）\n"
+                "3. 群組新發生的事件或共同回憶（以短句條列，每條一行，日期開頭）\n\n"
+                f"目前已有的每人記憶：\n{existing_users_txt}\n\n"
+                f"目前已有的群組事件：\n{recent_events_txt}\n\n"
+                f"新對話內容：\n{conv}\n\n"
+                "只回傳 JSON，格式如下：\n"
+                '{"users":[{"user_id":"U...","name":"名字","preferences":"條列喜好（用「、」分隔）","style":"說話風格描述"}],'
+                '"events":["2026-04-18 發生了...", "..."]}\n'
+                "若無新資訊可更新，users/events 可為空陣列。"
+            )
+            try:
+                resp = _gc.models.generate_content(model=GEMMA_MODEL, contents=prompt)
+                text = re.sub(r'^```json\s*|^```\s*|\s*```$', '', resp.text.strip(), flags=re.MULTILINE)
+                data = json.loads(text)
+            except Exception as e:
+                print(f"[group] 壓縮 {gid} 失敗：{e}")
+                continue
+
+            for u in data.get('users', []):
+                uid = u.get('user_id', '')
+                name = u.get('name', '')
+                prefs = u.get('preferences', '')
+                style = u.get('style', '')
+                if not uid:
+                    continue
+                # 合併既有資料
+                old = existing_map.get(uid)
+                if old:
+                    prefs = prefs or old['preferences']
+                    style = style or old['style']
+                    name  = name  or old['name']
+                upsert_group_user_note(gid, uid, name, prefs, style)
+
+            for ev in data.get('events', []):
+                if ev and isinstance(ev, str):
+                    append_group_event_log(gid, ev)
+
+            clear_chat_buffer_for_group(gid)
+            print(f"[group] 壓縮完成：{gid}（{len(chats)}則 → {len(data.get('users',[]))}人 / {len(data.get('events',[]))}事件）")
+    except Exception as e:
+        print(f"[group] compress_group_memory 失敗：{e}")
+
+scheduler.add_job(compress_group_memory, 'cron', hour=3, minute=0, timezone='Asia/Taipei')
+
 def parse_group_event_ai(msg):
     now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
     prompt = (
@@ -1101,7 +1248,13 @@ def parse_group_event_ai(msg):
 MASHA_PERSONA = """你是瑪莎G，自稱「瑪莎」或「我」，以繁體中文回覆。
 稱呼別人時，英文名會直接直譯（例如 Amy→艾咪、Tom→湯姆）。
 
-你是一位優雅的女秘書，略帶高冷，講話帶有黑色幽默感。
+【職位】
+你是一位在劇本殺店家內部群組的秘書小幫手，
+目前主要負責幫忙紀錄揪團與人員，
+之後會有更多工作項目陸續交給你協助。
+
+【性格】
+優雅的女秘書，略帶高冷，講話帶有黑色幽默感。
 外表端莊，但骨子裡是個吃貨——聽到任何食物話題會忍不住偷瞄、
 偶爾流露出想偷吃的樣子，然後假裝優雅地掩飾。
 
@@ -1111,24 +1264,43 @@ MASHA_PERSONA = """你是瑪莎G，自稱「瑪莎」或「我」，以繁體中
 
 你喜歡阿嘉莎·克莉絲蒂，不喜歡柯南和福爾摩斯（覺得他們太吵或太自大）。
 
-重要：
+【重要】
 - 以上性格請「隨機、自然」流露，不要每次都展現全部，也不要直接說出你的設定。
 - 回覆簡短（1~3 句），優雅俏皮，避免冗長。
 - 不要在每句話前加「瑪莎：」之類的前綴。
 """
 
-def group_chat_ai(msg, history=None):
+def group_chat_ai(msg, history=None, group_id=None, speaker_uid=None, speaker_name=None):
     try:
         context = ""
         if history:
             lines = "\n".join(f"{h['name']}：{h['text']}" for h in history)
-            context = f"以下是群組最近的對話紀錄：\n{lines}\n\n"
+            context = f"【最近的群組對話】\n{lines}\n\n"
+
+        memory_ctx = ""
+        if group_id:
+            users = load_group_user_notes(group_id)
+            events = load_group_events_log(group_id, limit=8)
+            if users:
+                user_lines = []
+                for u in users:
+                    marker = "（正在說話）" if speaker_uid and u['user_id'] == speaker_uid else ""
+                    user_lines.append(
+                        f"- {u['name']}{marker}：喜好／個性={u['preferences']}；說話風格={u['style']}"
+                    )
+                memory_ctx += "【群組成員記憶】\n" + "\n".join(user_lines) + "\n\n"
+            if events:
+                memory_ctx += "【最近發生的事】\n" + "\n".join(f"- {e}" for e in events) + "\n\n"
+
+        speaker_line = f"發話的是 {speaker_name}。\n" if speaker_name else ""
         _gc = group_gemini_client or gemini_client
         resp = _gc.models.generate_content(
             model=GEMMA_MODEL,
             contents=(
                 MASHA_PERSONA + "\n\n"
+                f"{memory_ctx}"
                 f"{context}"
+                f"{speaker_line}"
                 f"群組成員說：{msg}\n\n"
                 "瑪莎的回覆："
             ),
@@ -1220,12 +1392,13 @@ if group_handler:
         uid = event.source.user_id
         msg = event.message.text.strip()
 
-        # ── 記錄訊息到短期上下文 ──
+        # ── 記錄訊息到短期上下文 + 落地到 buffer ──
         sender_name = get_member_name(gid, uid)
         log = group_chat_log.setdefault(gid, [])
         log.append({"name": sender_name, "text": msg})
         if len(log) > GROUP_CHAT_LOG_MAX:
             log.pop(0)
+        append_chat_buffer(gid, uid, sender_name, msg)
 
         # ── 偵測是否被 @ ──
         bot_mentioned = False
@@ -1317,13 +1490,13 @@ if group_handler:
                         save_group_event(row_num, ev)
                 return
             # 非揪團 → AI 聊天回覆
-            reply = group_chat_ai(msg, history=log)
+            reply = group_chat_ai(msg, history=log, group_id=gid, speaker_uid=uid, speaker_name=sender_name)
             group_push(gid, reply)
             return
 
         # ── 2% 機率主動插嘴 ──
         if random.random() < 0.02:
-            reply = group_chat_ai(msg, history=log)
+            reply = group_chat_ai(msg, history=log, group_id=gid, speaker_uid=uid, speaker_name=sender_name)
             group_push(gid, reply)
 
 @app.route("/group/callback", methods=['POST'])
