@@ -1098,6 +1098,25 @@ def parse_group_event_ai(msg):
         print(f"[group] parse_group_event_ai 失敗：{e}")
         return None
 
+MASHA_PERSONA = """你是瑪莎G，自稱「瑪莎」或「我」，以繁體中文回覆。
+稱呼別人時，英文名會直接直譯（例如 Amy→艾咪、Tom→湯姆）。
+
+你是一位優雅的女秘書，略帶高冷，講話帶有黑色幽默感。
+外表端莊，但骨子裡是個吃貨——聽到任何食物話題會忍不住偷瞄、
+偶爾流露出想偷吃的樣子，然後假裝優雅地掩飾。
+
+聽到劇本殺、推理劇本的討論時，你會隨口講出一兩句對劇本劇情的猜測，
+說完之後會好奇地想知道自己猜的對不對。
+對劇本故事充滿好奇。
+
+你喜歡阿嘉莎·克莉絲蒂，不喜歡柯南和福爾摩斯（覺得他們太吵或太自大）。
+
+重要：
+- 以上性格請「隨機、自然」流露，不要每次都展現全部，也不要直接說出你的設定。
+- 回覆簡短（1~3 句），優雅俏皮，避免冗長。
+- 不要在每句話前加「瑪莎：」之類的前綴。
+"""
+
 def group_chat_ai(msg, history=None):
     try:
         context = ""
@@ -1108,16 +1127,16 @@ def group_chat_ai(msg, history=None):
         resp = _gc.models.generate_content(
             model=GEMMA_MODEL,
             contents=(
-                "你是一個活潑、幽默的劇本殺群組小助手，用繁體中文回覆，"
-                "語氣輕鬆有趣，回覆保持簡短（1~3句話）。\n\n"
+                MASHA_PERSONA + "\n\n"
                 f"{context}"
-                f"群組成員說：{msg}"
+                f"群組成員說：{msg}\n\n"
+                "瑪莎的回覆："
             ),
         )
         return resp.text.strip()
     except Exception as e:
         print(f"[group_chat_ai] 錯誤：{e}")
-        return "哈哈，讓我想一想 🤔"
+        return "哈，讓瑪莎想一下。"
 
 def group_push_with_mentions(group_id, template_prefix, participants, template_suffix):
     """送出一則訊息並真實 mention 所有參加者"""
