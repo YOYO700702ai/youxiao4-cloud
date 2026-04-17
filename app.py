@@ -7,7 +7,7 @@ from linebot.v3.messaging import (
     ReplyMessageRequest, PushMessageRequest, TextMessage,
 )
 from apscheduler.schedulers.background import BackgroundScheduler
-import os, json, re, time, datetime, threading
+import os, json, re, time, datetime, threading, random
 import requests
 from bs4 import BeautifulSoup
 from google import genai
@@ -970,9 +970,15 @@ signup_lock       = threading.Lock()
 if GROUP_BOT_TOKEN and GROUP_BOT_SECRET:
     group_handler       = WebhookHandler(GROUP_BOT_SECRET)
     group_configuration = Configuration(access_token=GROUP_BOT_TOKEN)
+    try:
+        with ApiClient(group_configuration) as _api:
+            GROUP_BOT_USER_ID = MessagingApi(_api).get_bot_info().user_id
+    except:
+        GROUP_BOT_USER_ID = None
 else:
     group_handler       = None
     group_configuration = None
+    GROUP_BOT_USER_ID   = None
 
 def group_push(group_id, text):
     if not group_configuration:
@@ -1065,6 +1071,22 @@ def parse_group_event_ai(msg):
         print(f"[group] parse_group_event_ai 失敗：{e}")
         return None
 
+def group_chat_ai(msg):
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        resp = client.models.generate_content(
+            model=GEMMA_MODEL,
+            contents=(
+                "你是一個活潑、幽默的劇本殺群組小助手，用繁體中文回覆，"
+                "語氣輕鬆有趣，回覆保持簡短（1~3句話）。\n\n"
+                f"群組成員說：{msg}"
+            ),
+        )
+        return resp.text.strip()
+    except Exception as e:
+        print(f"[group_chat_ai] 錯誤：{e}")
+        return "哈哈，讓我想一想 🤔"
+
 def check_group_reminders():
     """每天早上10:05提醒今天和明天成團的測本"""
     if not group_configuration:
@@ -1117,6 +1139,15 @@ if group_handler:
             return
         uid = event.source.user_id
         msg = event.message.text.strip()
+
+        # ── 偵測是否被 @ ──
+        bot_mentioned = False
+        mention = getattr(event.message, 'mention', None)
+        if mention and GROUP_BOT_USER_ID:
+            for m in getattr(mention, 'mentionees', []):
+                if getattr(m, 'user_id', None) == GROUP_BOT_USER_ID:
+                    bot_mentioned = True
+                    break
 
         # ── 報名「+」──
         if msg == '+':
@@ -1171,18 +1202,28 @@ if group_handler:
                 group_push(gid, prefix + format_signup_sheet(ev))
             return
 
-        # ── 建立揪團（AI 解析）──
-        info = parse_group_event_ai(msg)
-        if info and info.get('script') and info.get('date'):
-            _, existing = get_group_event(gid)
-            if existing:
-                return  # 已有進行中的揪團，忽略
-            row_num, ev = create_group_event_row(
-                gid, info['script'], info['date'],
-                info.get('time', '10:00'), info.get('max', 6)
-            )
-            if ev:
-                group_push(gid, format_signup_sheet(ev))
+        # ── 被 @ 時：先嘗試建立揪團，否則 AI 聊天 ──
+        if bot_mentioned:
+            info = parse_group_event_ai(msg)
+            if info and info.get('script') and info.get('date'):
+                _, existing = get_group_event(gid)
+                if not existing:
+                    row_num, ev = create_group_event_row(
+                        gid, info['script'], info['date'],
+                        info.get('time', '10:00'), info.get('max', 6)
+                    )
+                    if ev:
+                        group_push(gid, format_signup_sheet(ev))
+                    return
+            # 非揪團 → AI 聊天回覆
+            reply = group_chat_ai(msg)
+            group_push(gid, reply)
+            return
+
+        # ── 2% 機率主動插嘴 ──
+        if random.random() < 0.02:
+            reply = group_chat_ai(msg)
+            group_push(gid, reply)
 
 @app.route("/group/callback", methods=['POST'])
 def group_callback():
