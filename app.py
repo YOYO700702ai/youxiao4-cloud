@@ -1142,6 +1142,7 @@ if group_handler:
         if not hasattr(event.source, 'group_id'):
             return  # 個人訊息，忽略
         gid = event.source.group_id
+        print(f"[group] group_id={gid}")
         if gid not in ALLOWED_GROUP_IDS:
             return
         uid = event.source.user_id
