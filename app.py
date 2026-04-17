@@ -988,6 +988,31 @@ else:
     group_configuration = None
     GROUP_BOT_USER_ID   = None
 
+def load_bot_msg_ids():
+    """啟動時從 Sheets 載入 bot msg IDs，讓 deploy 後仍能識別舊訊息回覆"""
+    try:
+        ws = get_sheet('group_bot_msg_ids')
+        for row in ws.get_all_values():
+            if row and row[0]:
+                group_bot_msg_ids.add(row[0])
+        print(f"[group] 載入 {len(group_bot_msg_ids)} 個 bot msg IDs")
+    except Exception as e:
+        print(f"[group] load_bot_msg_ids 失敗（可能尚未建立分頁）：{e}")
+
+def save_bot_msg_ids():
+    """把目前所有 bot msg IDs 寫回 Sheets（覆蓋，最多保留 200 筆）"""
+    try:
+        ws = get_sheet('group_bot_msg_ids')
+        ids = list(group_bot_msg_ids)[-200:]
+        ws.clear()
+        if ids:
+            ws.update('A1', [[mid] for mid in ids])
+    except Exception as e:
+        print(f"[group] save_bot_msg_ids 失敗：{e}")
+
+# 啟動時載入（非同步，不阻塞主程式）
+threading.Thread(target=load_bot_msg_ids, daemon=True).start()
+
 def group_push(group_id, text):
     """推播訊息到群組（會扣額度），回傳第一則訊息的 message_id"""
     if not group_configuration:
@@ -1032,6 +1057,8 @@ def group_reply(reply_token, texts):
                     msg_id = m.id
             if len(group_bot_msg_ids) > 200:
                 group_bot_msg_ids.pop()
+            if msg_id:
+                threading.Thread(target=save_bot_msg_ids, daemon=True).start()
     except Exception as e:
         print(f"[group] group_reply 失敗：{e}")
     return msg_id
@@ -1059,6 +1086,8 @@ def group_reply_multi(reply_token, texts):
                 ids.append(m.id)
             if len(group_bot_msg_ids) > 200:
                 group_bot_msg_ids.pop()
+            if ids:
+                threading.Thread(target=save_bot_msg_ids, daemon=True).start()
     except Exception as e:
         print(f"[group] group_reply_multi 失敗：{e}")
     return ids
@@ -1776,7 +1805,14 @@ if group_handler:
             now_str = datetime.datetime.now(
                 datetime.timezone(datetime.timedelta(hours=8))
             ).strftime('%Y-%m-%d %H:%M（台灣時間）')
-            user_turn = f"現在是 {now_str}。{sender_name} 對瑪莎說：{msg}"
+            ctx_lines = ""
+            if log:
+                recent = log[:-1][-19:]  # 最近 19 則（不含當前這則）
+                if recent:
+                    ctx_lines = "【最近群組對話】\n" + "\n".join(
+                        f"{h['name']}：{h['text']}" for h in recent
+                    ) + "\n\n"
+            user_turn = f"現在是 {now_str}。\n{ctx_lines}{sender_name} 對瑪莎說：{msg}"
 
             try:
                 session = get_group_tool_session(gid)
