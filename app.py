@@ -1704,6 +1704,7 @@ if group_handler:
 
         # ── 偵測是否 reply Bot 的訊息 ──
         quoted_id = getattr(event.message, 'quoted_message_id', None)
+        print(f"[group] quoted_id={quoted_id} | in_bot_ids={quoted_id in group_bot_msg_ids if quoted_id else 'N/A'} | bot_ids_count={len(group_bot_msg_ids)}")
         if quoted_id and quoted_id in group_bot_msg_ids:
             bot_mentioned = True
 
