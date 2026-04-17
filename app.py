@@ -964,6 +964,8 @@ def handle_message(event):
 # ── 揪團 Bot ──────────────────────────────────────────────
 GROUP_BOT_TOKEN   = os.environ.get('GROUP_BOT_TOKEN', '')
 GROUP_BOT_SECRET  = os.environ.get('GROUP_BOT_SECRET', '')
+GROUP_GEMINI_KEY  = os.environ.get('GROUP_GEMINI_KEY', '')
+group_gemini_client = genai.Client(api_key=GROUP_GEMINI_KEY) if GROUP_GEMINI_KEY else None
 ALLOWED_GROUP_IDS = set(x.strip() for x in os.environ.get('ALLOWED_GROUP_IDS', '').split(',') if x.strip())
 signup_lock       = threading.Lock()
 group_chat_log    = {}   # {group_id: [{"name": ..., "text": ...}, ...]}
@@ -1064,7 +1066,8 @@ def parse_group_event_ai(msg):
         f"如果訊息中沒有明確的劇本名稱和日期，回傳 null。"
     )
     try:
-        resp = gemini_client.models.generate_content(model=GEMMA_MODEL, contents=prompt)
+        _gc = group_gemini_client or gemini_client
+        resp = _gc.models.generate_content(model=GEMMA_MODEL, contents=prompt)
         text = re.sub(r'^```json\s*|^```\s*|\s*```$', '', resp.text.strip(), flags=re.MULTILINE)
         if text.strip().lower() == 'null':
             return None
@@ -1079,8 +1082,8 @@ def group_chat_ai(msg, history=None):
         if history:
             lines = "\n".join(f"{h['name']}：{h['text']}" for h in history)
             context = f"以下是群組最近的對話紀錄：\n{lines}\n\n"
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        resp = client.models.generate_content(
+        _gc = group_gemini_client or gemini_client
+        resp = _gc.models.generate_content(
             model=GEMMA_MODEL,
             contents=(
                 "你是一個活潑、幽默的劇本殺群組小助手，用繁體中文回覆，"
