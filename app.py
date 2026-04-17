@@ -5,6 +5,7 @@ from linebot.v3.webhooks import MessageEvent, TextMessageContent, ImageMessageCo
 from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi, MessagingApiBlob,
     ReplyMessageRequest, PushMessageRequest, TextMessage,
+    TextMessageV2, MentionSubstitutionObject, UserMentionTarget,
 )
 from apscheduler.schedulers.background import BackgroundScheduler
 import os, json, re, time, datetime, threading, random
@@ -1118,8 +1119,34 @@ def group_chat_ai(msg, history=None):
         print(f"[group_chat_ai] 錯誤：{e}")
         return "哈哈，讓我想一想 🤔"
 
+def group_push_with_mentions(group_id, template_prefix, participants, template_suffix):
+    """送出一則訊息並真實 mention 所有參加者"""
+    if not group_configuration:
+        return
+    placeholders = []
+    substitution = {}
+    for i, p in enumerate(participants):
+        key = f"u{i}"
+        placeholders.append("{" + key + "}")
+        substitution[key] = MentionSubstitutionObject(
+            type="mention",
+            mentionee=UserMentionTarget(type="user", user_id=p['user_id'])
+        )
+    mention_line = " ".join(placeholders)
+    text = template_prefix + mention_line + template_suffix
+    try:
+        with ApiClient(group_configuration) as api_client:
+            MessagingApi(api_client).push_message(
+                PushMessageRequest(
+                    to=group_id,
+                    messages=[TextMessageV2(text=text, substitution=substitution)]
+                )
+            )
+    except Exception as e:
+        print(f"[group] group_push_with_mentions 失敗：{e}")
+
 def check_group_reminders():
-    """每天早上10:05提醒今天和明天成團的測本"""
+    """每天早上8:00提醒今天和明天成團的測本（真 TAG 參加者）"""
     if not group_configuration:
         return
     now      = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
@@ -1134,18 +1161,20 @@ def check_group_reminders():
             if status != 'full' or date not in (today, tomorrow):
                 continue
             participants = json.loads(p_json) if p_json else []
+            if not participants:
+                continue
             label = "明天" if date == tomorrow else "今天"
-            names = " ".join([f"@{p['name']}" for p in participants])
-            group_push(group_id, (
+            prefix = (
                 f"⏰ 測本提醒｜{label} {date} {time_str}\n"
                 f"劇本：{script}\n"
-                f"參加者：{names}\n\n"
-                f"大家準時到場囉！"
-            ))
+                f"參加者："
+            )
+            suffix = "\n\n大家準時到場囉！"
+            group_push_with_mentions(group_id, prefix, participants, suffix)
     except Exception as e:
         print(f"[group] check_group_reminders 失敗：{e}")
 
-scheduler.add_job(check_group_reminders, 'cron', hour=10, minute=5, timezone='Asia/Taipei')
+scheduler.add_job(check_group_reminders, 'cron', hour=8, minute=0, timezone='Asia/Taipei')
 
 if group_handler:
     @group_handler.add(MemberJoinedEvent)
