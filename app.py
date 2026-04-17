@@ -1034,6 +1034,33 @@ def group_reply(reply_token, texts):
         print(f"[group] group_reply 失敗：{e}")
     return msg_id
 
+def group_reply_multi(reply_token, texts):
+    """同 group_reply 但回傳「所有」訊息 ID 的 list（依順序）"""
+    if not group_configuration or not reply_token:
+        return []
+    if isinstance(texts, str):
+        texts = [texts]
+    if not texts:
+        return []
+    texts = texts[:5]
+    ids = []
+    try:
+        with ApiClient(group_configuration) as api_client:
+            resp = MessagingApi(api_client).reply_message(
+                ReplyMessageRequest(
+                    reply_token=reply_token,
+                    messages=[TextMessage(text=t) for t in texts]
+                )
+            )
+            for m in (resp.sent_messages or []):
+                group_bot_msg_ids.add(m.id)
+                ids.append(m.id)
+            if len(group_bot_msg_ids) > 200:
+                group_bot_msg_ids.pop()
+    except Exception as e:
+        print(f"[group] group_reply_multi 失敗：{e}")
+    return ids
+
 def _parse_msg_ids(cell):
     if not cell:
         return []
@@ -1134,6 +1161,126 @@ def format_signup_sheet(event):
         + '\n'.join(slots)
         + f"\n\n{footer}"
     )
+
+def load_active_events(group_id):
+    """回傳這個群組所有 open/full 的揪團（依時間排序），供 AI 查詢團況"""
+    try:
+        rows = get_sheet('group_events').get_all_values()
+        events = []
+        for row in rows:
+            if len(row) < 7 or row[0] != group_id or row[6] not in ('open', 'full'):
+                continue
+            events.append(_row_to_event(row))
+        events.sort(key=lambda e: (e['date'], e['time']))
+        return events
+    except Exception as e:
+        print(f"[group] load_active_events 失敗：{e}")
+        return []
+
+def format_active_events_for_ai(events):
+    if not events:
+        return "【目前進行中的揪團】（無）\n\n"
+    lines = []
+    for e in events:
+        names = "、".join([p['name'] for p in e['participants']]) or "（還沒人報名）"
+        status_tag = "已成團" if e['status'] == 'full' else f"招募中 {len(e['participants'])}/{e['max']}"
+        lines.append(f"- {e['date']} {e['time']}《{e['script']}》[{status_tag}]：{names}")
+    return "【目前進行中的揪團】\n" + "\n".join(lines) + "\n\n"
+
+# ── 群組 Bot Function Calling 工具 ──────────────────────────
+GROUP_FUNC_DECLS = [
+    types.FunctionDeclaration(
+        name="create_team",
+        description=(
+            "發起新的劇本揪團。當使用者要開團/揪團/想揪，且提供了劇本名稱與日期時呼叫。"
+            "民國年請換算成西元年（民國年+1911）。"
+        ),
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "script": types.Schema(type=types.Type.STRING, description="劇本名稱"),
+                "date":   types.Schema(type=types.Type.STRING, description="揪團日期 YYYY-MM-DD"),
+                "time":   types.Schema(type=types.Type.STRING, description="揪團時間 HH:MM，未指定用 10:00"),
+                "max":    types.Schema(type=types.Type.INTEGER, description="人數上限，未指定用 6"),
+            },
+            required=["script", "date"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="list_active_teams",
+        description=(
+            "查詢群組內目前所有進行中（招募中或已成團）的劇本揪團。"
+            "使用者問『有哪些團』『誰報名了』『還缺人嗎』『某天可以嗎』等團況問題時呼叫。"
+        ),
+        parameters=types.Schema(type=types.Type.OBJECT, properties={}),
+    ),
+]
+GROUP_TOOLS = [types.Tool(function_declarations=GROUP_FUNC_DECLS)]
+
+group_tool_sessions = {}  # {group_id: chat_session}
+
+def new_group_tool_session(group_id=None):
+    _gc = group_gemini_client or gemini_client
+    sys_prompt = MASHA_PERSONA
+    if group_id:
+        users  = load_group_user_notes(group_id)
+        events = load_group_events_log(group_id, limit=8)
+        mem = ""
+        if users:
+            mem += "【群組成員記憶】\n" + "\n".join(
+                f"- {u['name']}：喜好／個性={u['preferences']}；說話風格={u['style']}" for u in users
+            ) + "\n"
+        if events:
+            mem += "\n【最近發生的事】\n" + "\n".join(f"- {e}" for e in events) + "\n"
+        if mem:
+            sys_prompt = MASHA_PERSONA + "\n\n" + mem
+    return _gc.chats.create(
+        model=GEMMA_MODEL,
+        config=types.GenerateContentConfig(system_instruction=sys_prompt, tools=GROUP_TOOLS),
+    )
+
+def get_group_tool_session(group_id):
+    if group_id not in group_tool_sessions:
+        group_tool_sessions[group_id] = new_group_tool_session(group_id)
+    return group_tool_sessions[group_id]
+
+def reset_group_tool_session(group_id):
+    group_tool_sessions[group_id] = new_group_tool_session(group_id)
+    return group_tool_sessions[group_id]
+
+def execute_group_function(name, args, group_id, pending):
+    """執行工具；pending 是 mutable dict，用來收集需要後續處理的副作用（例如新建立的揪團）"""
+    try:
+        if name == 'create_team':
+            script = (args.get('script') or '').strip()
+            date   = (args.get('date') or '').strip()
+            time_s = (args.get('time') or '10:00').strip()
+            max_p  = int(args.get('max') or 6)
+            if not script or not date:
+                return {"ok": False, "error": "缺少劇本名稱或日期"}
+            row_num, ev = create_group_event_row(group_id, script, date, time_s, max_p)
+            if not ev:
+                return {"ok": False, "error": "建立失敗"}
+            pending['signup'] = {'row_num': row_num, 'event': ev}
+            return {"ok": True, "message": f"已建立揪團《{script}》{date} {time_s}，招募 {max_p} 人"}
+
+        if name == 'list_active_teams':
+            evs = load_active_events(group_id)
+            return {
+                "count": len(evs),
+                "teams": [
+                    {
+                        "script": e['script'], "date": e['date'], "time": e['time'],
+                        "status": "已成團" if e['status'] == 'full' else f"招募中 {len(e['participants'])}/{e['max']}",
+                        "participants": [p['name'] for p in e['participants']],
+                    } for e in evs
+                ],
+            }
+
+        return {"error": f"unknown tool: {name}"}
+    except Exception as e:
+        print(f"[group] execute_group_function 失敗：{e}")
+        return {"error": str(e)}
 
 def get_member_name(group_id, user_id):
     try:
@@ -1290,27 +1437,6 @@ def compress_group_memory():
 
 scheduler.add_job(compress_group_memory, 'cron', hour=3, minute=0, timezone='Asia/Taipei')
 
-def parse_group_event_ai(msg):
-    now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
-    prompt = (
-        f"現在是 {now.strftime('%Y-%m-%d')}（台灣時間）。\n"
-        f"從以下訊息解析劇本揪團資訊，只回傳 JSON，沒有其他文字。\n"
-        f"訊息：{msg}\n\n"
-        f'格式：{{"script":"劇本名稱","date":"YYYY-MM-DD","time":"HH:MM","max":人數整數}}\n'
-        f"民國年換算西元（+1911）。沒指定時間用10:00。沒指定人數用6。\n"
-        f"如果訊息中沒有明確的劇本名稱和日期，回傳 null。"
-    )
-    try:
-        _gc = group_gemini_client or gemini_client
-        resp = _gc.models.generate_content(model=GEMMA_MODEL, contents=prompt)
-        text = re.sub(r'^```json\s*|^```\s*|\s*```$', '', resp.text.strip(), flags=re.MULTILINE)
-        if text.strip().lower() == 'null':
-            return None
-        return json.loads(text)
-    except Exception as e:
-        print(f"[group] parse_group_event_ai 失敗：{e}")
-        return None
-
 MASHA_PERSONA = """你是瑪莎G，自稱「瑪莎」或「我」，以繁體中文回覆。
 稱呼別人時，直接使用他們的 LINE 顯示名稱原樣稱呼（不管中文或英文都照原樣，不要翻譯、不要改寫）。
 
@@ -1336,12 +1462,16 @@ MASHA_PERSONA = """你是瑪莎G，自稱「瑪莎」或「我」，以繁體中
 - 不要在每句話前加「瑪莎：」之類的前綴。
 """
 
-def group_chat_ai(msg, history=None, group_id=None, speaker_uid=None, speaker_name=None):
+def group_chat_ai(msg, history=None, group_id=None, speaker_uid=None, speaker_name=None, active_events=None):
     try:
         context = ""
         if history:
             lines = "\n".join(f"{h['name']}：{h['text']}" for h in history)
             context = f"【最近的群組對話】\n{lines}\n\n"
+
+        events_ctx = ""
+        if active_events is not None:
+            events_ctx = format_active_events_for_ai(active_events)
 
         memory_ctx = ""
         if group_id:
@@ -1364,6 +1494,7 @@ def group_chat_ai(msg, history=None, group_id=None, speaker_uid=None, speaker_na
             model=GEMMA_MODEL,
             contents=(
                 MASHA_PERSONA + "\n\n"
+                f"{events_ctx}"
                 f"{memory_ctx}"
                 f"{context}"
                 f"{speaker_line}"
@@ -1493,6 +1624,10 @@ if group_handler:
         if quoted_id and quoted_id in group_bot_msg_ids:
             bot_mentioned = True
 
+        # ── 關鍵字觸發：訊息裡出現「瑪莎」就當成被 tag（workaround LINE @ 選單限制）──
+        if not bot_mentioned and '瑪莎' in msg:
+            bot_mentioned = True
+
         # ── 揪團指令（+ / - / 取消揪團）必須是「回覆」揪團公告 ──
         if msg in ('+', '-', '取消揪團'):
             if not quoted_id:
@@ -1552,20 +1687,68 @@ if group_handler:
                     send_signup_sheet(gid, ev, row_num, extra_prefix=prefix, reply_token=rtoken)
                     return
 
-        # ── 被 @（或 reply Bot）：先嘗試建立揪團，否則 AI 聊天 ──
+        # ── 被 @（或 reply Bot）：Function Calling，讓 AI 自己決定要建團/查團/聊天 ──
         if bot_mentioned:
-            info = parse_group_event_ai(msg)
-            if info and info.get('script') and info.get('date'):
-                row_num, ev = create_group_event_row(
-                    gid, info['script'], info['date'],
-                    info.get('time', '10:00'), info.get('max', 6)
-                )
-                if ev:
-                    send_signup_sheet(gid, ev, row_num, reply_token=rtoken)
+            now_str = datetime.datetime.now(
+                datetime.timezone(datetime.timedelta(hours=8))
+            ).strftime('%Y-%m-%d %H:%M（台灣時間）')
+            user_turn = f"現在是 {now_str}。{sender_name} 對瑪莎說：{msg}"
+
+            session = get_group_tool_session(gid)
+            pending = {}
+            try:
+                response = session.send_message(user_turn)
+            except Exception as e:
+                print(f"[group] session 失敗，重建：{e}")
+                session = reset_group_tool_session(gid)
+                try:
+                    response = session.send_message(user_turn)
+                except Exception as e2:
+                    print(f"[group] session 重建後仍失敗：{e2}")
+                    group_reply(rtoken, "瑪莎走神了一下，再說一次？")
+                    return
+
+            # 最多跑 5 輪工具呼叫
+            for _ in range(5):
+                func_calls = [
+                    p.function_call
+                    for p in response.candidates[0].content.parts
+                    if hasattr(p, 'function_call') and p.function_call and p.function_call.name
+                ]
+                if not func_calls:
+                    break
+                result_parts = [
+                    types.Part.from_function_response(
+                        name=fc.name,
+                        response={"result": execute_group_function(fc.name, dict(fc.args), gid, pending)}
+                    )
+                    for fc in func_calls
+                ]
+                try:
+                    response = session.send_message(result_parts)
+                except Exception as e:
+                    print(f"[group] 工具回傳失敗：{e}")
+                    reset_group_tool_session(gid)
+                    break
+
+            ai_text = (response.text or '').strip() if response else ''
+
+            # 組合最終回覆：若有新建揪團，先放報名表、再放 AI 的話
+            msgs = []
+            signup_info = pending.get('signup')
+            if signup_info:
+                msgs.append(format_signup_sheet(signup_info['event']))
+            if ai_text:
+                msgs.append(ai_text)
+            if not msgs:
                 return
-            # 非揪團 → AI 聊天回覆
-            reply = group_chat_ai(msg, history=log, group_id=gid, speaker_uid=uid, speaker_name=sender_name)
-            group_reply(rtoken, reply)
+
+            sent_ids = group_reply_multi(rtoken, msgs)
+            # 新揪團：把報名表 msg_id 存入 announce_msg_ids，才能 +/- 回覆
+            if signup_info and sent_ids:
+                ev = signup_info['event']
+                ev.setdefault('announce_msg_ids', []).append(sent_ids[0])
+                save_group_event(signup_info['row_num'], ev)
             return
 
         # ── 2% 機率主動插嘴 ──
