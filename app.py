@@ -1,13 +1,13 @@
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.webhooks import MessageEvent, TextMessageContent, ImageMessageContent
+from linebot.v3.webhooks import MessageEvent, TextMessageContent, ImageMessageContent, MemberJoinedEvent
 from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi, MessagingApiBlob,
     ReplyMessageRequest, PushMessageRequest, TextMessage,
 )
 from apscheduler.schedulers.background import BackgroundScheduler
-import os, json, re, time, datetime
+import os, json, re, time, datetime, threading
 import requests
 from bs4 import BeautifulSoup
 from google import genai
@@ -960,6 +960,241 @@ def handle_message(event):
         MessagingApi(api_client).reply_message_with_http_info(
             ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply)])
         )
+
+# ── 揪團 Bot ──────────────────────────────────────────────
+GROUP_BOT_TOKEN   = os.environ.get('GROUP_BOT_TOKEN', '')
+GROUP_BOT_SECRET  = os.environ.get('GROUP_BOT_SECRET', '')
+ALLOWED_GROUP_IDS = set(x.strip() for x in os.environ.get('ALLOWED_GROUP_IDS', '').split(',') if x.strip())
+signup_lock       = threading.Lock()
+
+if GROUP_BOT_TOKEN and GROUP_BOT_SECRET:
+    group_handler       = WebhookHandler(GROUP_BOT_SECRET)
+    group_configuration = Configuration(access_token=GROUP_BOT_TOKEN)
+else:
+    group_handler       = None
+    group_configuration = None
+
+def group_push(group_id, text):
+    if not group_configuration:
+        return
+    with ApiClient(group_configuration) as api_client:
+        MessagingApi(api_client).push_message(
+            PushMessageRequest(to=group_id, messages=[TextMessage(text=text)])
+        )
+
+def get_group_event(group_id):
+    """取得群組目前進行中的報名"""
+    try:
+        ws = get_sheet('group_events')
+        rows = ws.get_all_values()
+        for i, row in enumerate(rows):
+            if len(row) >= 7 and row[0] == group_id and row[6] in ('open', 'full'):
+                return i + 1, {
+                    'group_id': row[0], 'script': row[1],
+                    'date': row[2], 'time': row[3],
+                    'max': int(row[4]),
+                    'participants': json.loads(row[5]) if row[5] else [],
+                    'status': row[6]
+                }
+    except Exception as e:
+        print(f"[group] get_group_event 失敗：{e}")
+    return None, None
+
+def save_group_event(row_num, event):
+    try:
+        get_sheet('group_events').update(
+            f'A{row_num}:G{row_num}',
+            [[event['group_id'], event['script'], event['date'], event['time'],
+              event['max'], json.dumps(event['participants'], ensure_ascii=False), event['status']]]
+        )
+    except Exception as e:
+        print(f"[group] save_group_event 失敗：{e}")
+
+def create_group_event_row(group_id, script, date, time_str, max_players):
+    try:
+        ws = get_sheet('group_events')
+        ws.append_row([group_id, script, date, time_str, max_players, '[]', 'open'])
+        rows = ws.get_all_values()
+        event = {'group_id': group_id, 'script': script, 'date': date,
+                 'time': time_str, 'max': max_players, 'participants': [], 'status': 'open'}
+        return len(rows), event
+    except Exception as e:
+        print(f"[group] create_group_event_row 失敗：{e}")
+        return None, None
+
+def format_signup_sheet(event):
+    participants = event['participants']
+    count = len(participants)
+    slots = []
+    for i in range(1, event['max'] + 1):
+        p = next((x for x in participants if x['slot'] == i), None)
+        slots.append(f"{i}. {'✅ ' + p['name'] if p else '（空缺）'}")
+    footer = "🎉 已成團！" if event['status'] == 'full' else "回覆「+」報名 ｜「-」取消"
+    return (
+        f"📋 劇本揪團 ｜ {event['date']} {event['time']}\n"
+        f"劇本：{event['script']} ｜ {count}/{event['max']} 人\n\n"
+        + '\n'.join(slots)
+        + f"\n\n{footer}"
+    )
+
+def get_member_name(group_id, user_id):
+    try:
+        with ApiClient(group_configuration) as api_client:
+            profile = MessagingApi(api_client).get_group_member_profile(group_id, user_id)
+            return profile.display_name
+    except:
+        return f"成員{user_id[-4:]}"
+
+def parse_group_event_ai(msg):
+    now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
+    prompt = (
+        f"現在是 {now.strftime('%Y-%m-%d')}（台灣時間）。\n"
+        f"從以下訊息解析劇本揪團資訊，只回傳 JSON，沒有其他文字。\n"
+        f"訊息：{msg}\n\n"
+        f'格式：{{"script":"劇本名稱","date":"YYYY-MM-DD","time":"HH:MM","max":人數整數}}\n'
+        f"民國年換算西元（+1911）。沒指定時間用10:00。沒指定人數用6。\n"
+        f"如果訊息中沒有明確的劇本名稱和日期，回傳 null。"
+    )
+    try:
+        resp = gemini_client.models.generate_content(model=GEMMA_MODEL, contents=prompt)
+        text = re.sub(r'^```json\s*|^```\s*|\s*```$', '', resp.text.strip(), flags=re.MULTILINE)
+        if text.strip().lower() == 'null':
+            return None
+        return json.loads(text)
+    except Exception as e:
+        print(f"[group] parse_group_event_ai 失敗：{e}")
+        return None
+
+def check_group_reminders():
+    """每天早上10:05提醒今天和明天成團的測本"""
+    if not group_configuration:
+        return
+    now      = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
+    today    = now.strftime("%Y-%m-%d")
+    tomorrow = (now + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    try:
+        rows = get_sheet('group_events').get_all_values()
+        for row in rows:
+            if len(row) < 7:
+                continue
+            group_id, script, date, time_str, _, p_json, status = row[:7]
+            if status != 'full' or date not in (today, tomorrow):
+                continue
+            participants = json.loads(p_json) if p_json else []
+            label = "明天" if date == tomorrow else "今天"
+            names = " ".join([f"@{p['name']}" for p in participants])
+            group_push(group_id, (
+                f"⏰ 測本提醒｜{label} {date} {time_str}\n"
+                f"劇本：{script}\n"
+                f"參加者：{names}\n\n"
+                f"大家準時到場囉！"
+            ))
+    except Exception as e:
+        print(f"[group] check_group_reminders 失敗：{e}")
+
+scheduler.add_job(check_group_reminders, 'cron', hour=10, minute=5, timezone='Asia/Taipei')
+
+if group_handler:
+    @group_handler.add(MemberJoinedEvent)
+    def group_member_joined(event):
+        if not hasattr(event.source, 'group_id'):
+            return
+        gid = event.source.group_id
+        if gid not in ALLOWED_GROUP_IDS:
+            try:
+                with ApiClient(group_configuration) as api_client:
+                    MessagingApi(api_client).leave_group(group_id=gid)
+                print(f"[group] 已離開非授權群組：{gid}")
+            except Exception as e:
+                print(f"[group] leave_group 失敗：{e}")
+
+    @group_handler.add(MessageEvent, message=TextMessageContent)
+    def group_handle_message(event):
+        if not hasattr(event.source, 'group_id'):
+            return  # 個人訊息，忽略
+        gid = event.source.group_id
+        if gid not in ALLOWED_GROUP_IDS:
+            return
+        uid = event.source.user_id
+        msg = event.message.text.strip()
+
+        # ── 報名「+」──
+        if msg == '+':
+            with signup_lock:
+                row_num, ev = get_group_event(gid)
+                if not ev:
+                    return
+                if any(p['user_id'] == uid for p in ev['participants']):
+                    group_push(gid, "你已經報名了喔！")
+                    return
+                if ev['status'] == 'full':
+                    group_push(gid, "已成團，目前沒有空缺。")
+                    return
+                name = get_member_name(gid, uid)
+                slot = len(ev['participants']) + 1
+                ev['participants'].append({'user_id': uid, 'name': name, 'slot': slot})
+                if len(ev['participants']) >= ev['max']:
+                    ev['status'] = 'full'
+                    save_group_event(row_num, ev)
+                    group_push(gid, format_signup_sheet(ev))
+                    group_push(gid, f"🎉 成團！{ev['date']} {ev['time']} 測本《{ev['script']}》見！")
+                    try:
+                        start = f"{ev['date']}T{ev['time']}:00"
+                        end_h = int(ev['time'].split(':')[0]) + 3
+                        end   = f"{ev['date']}T{end_h:02d}:{ev['time'].split(':')[1]}:00"
+                        desc  = "參加者：" + "、".join([p['name'] for p in ev['participants']])
+                        add_calendar_event(f"測本｜{ev['script']}", start, end, desc)
+                    except Exception as e:
+                        print(f"[group] 建立行事曆失敗：{e}")
+                else:
+                    save_group_event(row_num, ev)
+                    group_push(gid, format_signup_sheet(ev))
+            return
+
+        # ── 取消「-」──
+        if msg == '-':
+            with signup_lock:
+                row_num, ev = get_group_event(gid)
+                if not ev:
+                    return
+                p = next((x for x in ev['participants'] if x['user_id'] == uid), None)
+                if not p:
+                    group_push(gid, "你還沒有報名喔！")
+                    return
+                was_full = ev['status'] == 'full'
+                ev['participants'].remove(p)
+                for i, participant in enumerate(ev['participants'], 1):
+                    participant['slot'] = i
+                ev['status'] = 'open'
+                save_group_event(row_num, ev)
+                prefix = f"😢 {p['name']} 退出了，目前 {len(ev['participants'])}/{ev['max']} 人\n\n" if was_full else ""
+                group_push(gid, prefix + format_signup_sheet(ev))
+            return
+
+        # ── 建立揪團（AI 解析）──
+        info = parse_group_event_ai(msg)
+        if info and info.get('script') and info.get('date'):
+            _, existing = get_group_event(gid)
+            if existing:
+                return  # 已有進行中的揪團，忽略
+            row_num, ev = create_group_event_row(
+                gid, info['script'], info['date'],
+                info.get('time', '10:00'), info.get('max', 6)
+            )
+            if ev:
+                group_push(gid, format_signup_sheet(ev))
+
+@app.route("/group/callback", methods=['POST'])
+def group_callback():
+    if not group_handler:
+        abort(404)
+    signature = request.headers.get('X-Line-Signature', '')
+    body = request.get_data(as_text=True)
+    try:
+        group_handler.handle(body, signature)
+    except InvalidSignatureError:
+        abort(400)
+    return 'OK'
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
