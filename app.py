@@ -966,6 +966,8 @@ GROUP_BOT_TOKEN   = os.environ.get('GROUP_BOT_TOKEN', '')
 GROUP_BOT_SECRET  = os.environ.get('GROUP_BOT_SECRET', '')
 ALLOWED_GROUP_IDS = set(x.strip() for x in os.environ.get('ALLOWED_GROUP_IDS', '').split(',') if x.strip())
 signup_lock       = threading.Lock()
+group_chat_log    = {}   # {group_id: [{"name": ..., "text": ...}, ...]}
+GROUP_CHAT_LOG_MAX = 20
 
 if GROUP_BOT_TOKEN and GROUP_BOT_SECRET:
     group_handler       = WebhookHandler(GROUP_BOT_SECRET)
@@ -1071,14 +1073,19 @@ def parse_group_event_ai(msg):
         print(f"[group] parse_group_event_ai 失敗：{e}")
         return None
 
-def group_chat_ai(msg):
+def group_chat_ai(msg, history=None):
     try:
+        context = ""
+        if history:
+            lines = "\n".join(f"{h['name']}：{h['text']}" for h in history)
+            context = f"以下是群組最近的對話紀錄：\n{lines}\n\n"
         client = genai.Client(api_key=GEMINI_API_KEY)
         resp = client.models.generate_content(
             model=GEMMA_MODEL,
             contents=(
                 "你是一個活潑、幽默的劇本殺群組小助手，用繁體中文回覆，"
                 "語氣輕鬆有趣，回覆保持簡短（1~3句話）。\n\n"
+                f"{context}"
                 f"群組成員說：{msg}"
             ),
         )
@@ -1139,6 +1146,13 @@ if group_handler:
             return
         uid = event.source.user_id
         msg = event.message.text.strip()
+
+        # ── 記錄訊息到短期上下文 ──
+        sender_name = get_member_name(gid, uid)
+        log = group_chat_log.setdefault(gid, [])
+        log.append({"name": sender_name, "text": msg})
+        if len(log) > GROUP_CHAT_LOG_MAX:
+            log.pop(0)
 
         # ── 偵測是否被 @ ──
         bot_mentioned = False
@@ -1216,13 +1230,13 @@ if group_handler:
                         group_push(gid, format_signup_sheet(ev))
                     return
             # 非揪團 → AI 聊天回覆
-            reply = group_chat_ai(msg)
+            reply = group_chat_ai(msg, history=log)
             group_push(gid, reply)
             return
 
         # ── 2% 機率主動插嘴 ──
         if random.random() < 0.02:
-            reply = group_chat_ai(msg)
+            reply = group_chat_ai(msg, history=log)
             group_push(gid, reply)
 
 @app.route("/group/callback", methods=['POST'])
