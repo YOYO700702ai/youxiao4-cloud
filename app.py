@@ -967,9 +967,10 @@ GROUP_BOT_SECRET  = os.environ.get('GROUP_BOT_SECRET', '')
 GROUP_GEMINI_KEY  = os.environ.get('GROUP_GEMINI_KEY', '')
 group_gemini_client = genai.Client(api_key=GROUP_GEMINI_KEY) if GROUP_GEMINI_KEY else None
 ALLOWED_GROUP_IDS = set(x.strip() for x in os.environ.get('ALLOWED_GROUP_IDS', '').split(',') if x.strip())
-signup_lock       = threading.Lock()
-group_chat_log    = {}   # {group_id: [{"name": ..., "text": ...}, ...]}
-GROUP_CHAT_LOG_MAX = 20
+signup_lock          = threading.Lock()
+group_chat_log       = {}   # {group_id: [{"name": ..., "text": ...}, ...]}
+GROUP_CHAT_LOG_MAX   = 20
+group_bot_msg_ids    = set()  # 記錄 Bot 發出的訊息 ID，用來偵測 reply
 
 if GROUP_BOT_TOKEN and GROUP_BOT_SECRET:
     group_handler       = WebhookHandler(GROUP_BOT_SECRET)
@@ -988,9 +989,16 @@ def group_push(group_id, text):
     if not group_configuration:
         return
     with ApiClient(group_configuration) as api_client:
-        MessagingApi(api_client).push_message(
+        resp = MessagingApi(api_client).push_message(
             PushMessageRequest(to=group_id, messages=[TextMessage(text=text)])
         )
+        try:
+            for m in (resp.sent_messages or []):
+                group_bot_msg_ids.add(m.id)
+                if len(group_bot_msg_ids) > 200:
+                    group_bot_msg_ids.pop()
+        except:
+            pass
 
 def get_group_event(group_id):
     """取得群組目前進行中的報名"""
@@ -1166,6 +1174,11 @@ if group_handler:
                 if getattr(m, 'user_id', None) == GROUP_BOT_USER_ID:
                     bot_mentioned = True
                     break
+
+        # ── 偵測是否 reply Bot 的訊息 ──
+        quoted_id = getattr(event.message, 'quoted_message_id', None)
+        if quoted_id and quoted_id in group_bot_msg_ids:
+            bot_mentioned = True
 
         # ── 報名「+」──
         if msg == '+':
