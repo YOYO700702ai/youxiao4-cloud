@@ -1698,26 +1698,39 @@ if group_handler:
             return
         uid  = event.source.user_id
         key  = (gid, uid)
-        rtoken = event.reply_token
-        # 記錄此使用者最近傳的圖（30秒 TTL，供「先說文字再傳圖」或「先傳圖再說文字」兩種順序使用）
+        # 記錄此使用者最近傳的圖，供「先說文字再傳圖」或「先傳圖再說文字」兩種順序使用
         pending_group_image[key] = (event.message.id, time.time())
         print(f"[group] 圖片已暫存：gid={gid} uid={uid} msg_id={event.message.id}")
+        print(f"[group] pending_script_upload keys={list(pending_script_upload.keys())}")
 
         # 若有待上架的劇本資料，直接完成上架
         script_entry = pending_script_upload.pop(key, None)
         if script_entry and (time.time() - script_entry[1]) < 300:
-            print(f"[group] 收到封面圖，完成上架：gid={gid} uid={uid} msg_id={event.message.id}")
+            print(f"[group] 找到待上架資料，開始上架：{script_entry[0].get('名稱')}")
             info = script_entry[0]
             try:
                 with ApiClient(group_configuration) as api_client:
                     img_bytes = MessagingApiBlob(api_client).get_message_content(event.message.id)
+                print(f"[group] 圖片下載成功，大小={len(img_bytes)}")
                 safe_name = re.sub(r'[\\/*?:"<>|]', '_', info['名稱'])
                 cover_url = upload_image_to_github(img_bytes, f"{safe_name}.jpg")
+                print(f"[group] GitHub 上傳完成：{cover_url}")
                 ok, result = create_notion_script(info, cover_url)
+                print(f"[group] Notion 上架結果：ok={ok} result={result}")
                 msg = f"《{info['名稱']}》已上架到 Notion，封面也上傳好了！" if ok else f"上架失敗：{result}"
             except Exception as e:
+                print(f"[group] 上架時出錯：{e}")
                 msg = f"上架時出錯：{e}"
-            group_reply(rtoken, msg)
+            # 用 push 而非 reply，避免上傳耗時導致 reply token 過期
+            try:
+                with ApiClient(group_configuration) as api_client:
+                    MessagingApi(api_client).push_message(
+                        PushMessageRequest(to=gid, messages=[TextMessage(text=msg)])
+                    )
+            except Exception as e:
+                print(f"[group] image handler push 失敗：{e}")
+        else:
+            print(f"[group] 沒有待上架資料（script_entry={script_entry is not None}）")
 
     @group_handler.add(MessageEvent, message=TextMessageContent)
     def group_handle_message(event):
