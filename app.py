@@ -985,6 +985,47 @@ GROUP_BOT_SECRET  = os.environ.get('GROUP_BOT_SECRET', '')
 GROUP_GEMINI_KEY  = os.environ.get('GROUP_GEMINI_KEY', '')
 group_gemini_client = genai.Client(api_key=GROUP_GEMINI_KEY) if GROUP_GEMINI_KEY else None
 ALLOWED_GROUP_IDS = set(x.strip() for x in os.environ.get('ALLOWED_GROUP_IDS', '').split(',') if x.strip())
+
+# 群組成員性別對照表（以 LINE 顯示名稱關鍵字比對）
+GENDER_BY_NAME = {
+    '林昱丞': '男', '卡丘': '男',
+    '楊夕': '女', 'Cecilia': '女',
+    '楷': '男',
+    '科': '男',
+    '紀昀彤': '女', 'Selina': '女', '小夜': '女',
+    '苡辰': '女',
+    '訒J': '男', '訒j': '男',
+    '賴先生': '男', '奶粉': '男',
+    '尤尤': '女', 'yoyo': '女',
+    '51': '女',
+    'Anna': '女', '絡愉': '女',
+    'Cha Cha': '女', '宣辰': '女',
+    'Mia': '女',
+    'Pan': '男', '小潘': '男',
+    'Patty': '女',
+    'Pinky': '女',
+    'Vvn': '女',
+    'Weishiu': '男',
+    'Xuan': '女', '珞珞': '女',
+    '他口': '男',
+    '吳宛柔': '女',
+    '品淳': '女', '十隻餃': '女', 'すずね': '女',
+    '夏普': '男', '戴光': '男',
+    '宏穆': '女',
+    '銓': '男',
+    '阝百': '女',
+    '阿睦': '男',
+    '青': '女',
+    '張恪銘': '男',
+}
+
+def _lookup_gender_by_name(name: str) -> str:
+    """根據名稱關鍵字猜性別"""
+    for key, gender in GENDER_BY_NAME.items():
+        if key in name:
+            return gender
+    return ''
+
 signup_lock          = threading.Lock()
 group_chat_log       = {}   # {group_id: [{"name": ..., "text": ...}, ...]}
 GROUP_CHAT_LOG_MAX   = 20
@@ -1452,10 +1493,11 @@ def upsert_group_user_note(group_id, user_id, name, preferences, style, gender='
         for i, row in enumerate(rows):
             if len(row) >= 2 and row[0] == group_id and row[1] == user_id:
                 existing_gender = row[6] if len(row) >= 7 else ''
-                g = gender or existing_gender
+                g = gender or existing_gender or _lookup_gender_by_name(name)
                 ws.update(f'A{i+1}:G{i+1}', [[group_id, user_id, name, preferences, style, ts, g]])
                 return
-        ws.append_row([group_id, user_id, name, preferences, style, ts, gender])
+        g = gender or _lookup_gender_by_name(name)
+        ws.append_row([group_id, user_id, name, preferences, style, ts, g])
     except Exception as e:
         print(f"[group] upsert_group_user_note 失敗：{e}")
 
