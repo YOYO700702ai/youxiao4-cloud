@@ -1299,7 +1299,7 @@ GROUP_FUNC_DECLS = [
                 "script": types.Schema(type=types.Type.STRING, description="劇本名稱"),
                 "date":   types.Schema(type=types.Type.STRING, description="揪團日期 YYYY-MM-DD"),
                 "time":   types.Schema(type=types.Type.STRING, description="揪團時間 HH:MM，未指定用 10:00"),
-                "max":    types.Schema(type=types.Type.INTEGER, description="人數上限，未指定用 6"),
+                "max":    types.Schema(type=types.Type.INTEGER, description="人數上限。如果使用者有列編號（例如『1. 2. 3.』或『1.2.3.4.』）表示要幾個人就填幾（3 個編號=3 人）；若用『找X人/需X人/X缺/差X位』等描述也照數字填；完全沒提才用預設 6。"),
             },
             required=["script", "date"],
         ),
