@@ -983,6 +983,7 @@ def handle_message(event):
 GROUP_BOT_TOKEN   = os.environ.get('GROUP_BOT_TOKEN', '')
 GROUP_BOT_SECRET  = os.environ.get('GROUP_BOT_SECRET', '')
 GROUP_GEMINI_KEY  = os.environ.get('GROUP_GEMINI_KEY', '')
+GROUP_OWNER_ID    = os.environ.get('GROUP_OWNER_ID', '')
 group_gemini_client = genai.Client(api_key=GROUP_GEMINI_KEY) if GROUP_GEMINI_KEY else None
 ALLOWED_GROUP_IDS = set(x.strip() for x in os.environ.get('ALLOWED_GROUP_IDS', '').split(',') if x.strip())
 
@@ -1809,8 +1810,21 @@ if group_handler:
     @group_handler.add(MessageEvent, message=TextMessageContent)
     def group_handle_message(event):
         if not hasattr(event.source, 'group_id'):
+            uid = event.source.user_id
             msg = event.message.text.strip()
             rtoken = event.reply_token
+
+            # 查自己的 ID（用來設 GROUP_OWNER_ID）
+            if msg == '[我的ID]':
+                with ApiClient(group_configuration) as api_client:
+                    MessagingApi(api_client).reply_message(
+                        ReplyMessageRequest(reply_token=rtoken, messages=[TextMessage(text=f"你的 user_id：\n{uid}")])
+                    )
+                return
+
+            # 非 owner 封鎖（GROUP_OWNER_ID 設定後生效）
+            if GROUP_OWNER_ID and uid != GROUP_OWNER_ID:
+                return
 
             # 批量設性別指令
             if msg.startswith('[批量設性別]'):
