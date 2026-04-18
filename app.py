@@ -1761,7 +1761,18 @@ if group_handler:
     @group_handler.add(MessageEvent, message=TextMessageContent)
     def group_handle_message(event):
         if not hasattr(event.source, 'group_id'):
-            return  # 個人訊息，忽略
+            # 只有 owner 可以私訊
+            if event.source.user_id != MY_USER_ID:
+                return
+            msg = event.message.text.strip()
+            rtoken = event.reply_token
+            reply = group_chat_ai(msg)
+            if reply:
+                with ApiClient(group_configuration) as api_client:
+                    MessagingApi(api_client).reply_message(
+                        ReplyMessageRequest(reply_token=rtoken, messages=[TextMessage(text=reply)])
+                    )
+            return
         gid = event.source.group_id
         print(f"[group] group_id={gid}")
         if gid not in ALLOWED_GROUP_IDS:
