@@ -972,8 +972,8 @@ signup_lock          = threading.Lock()
 group_chat_log       = {}   # {group_id: [{"name": ..., "text": ...}, ...]}
 GROUP_CHAT_LOG_MAX   = 20
 group_bot_msg_ids    = set()  # 記錄 Bot 發出的訊息 ID，用來偵測 reply
-pending_group_image   = {}   # {(gid, uid): (message_id, timestamp)} 最近 10 分鐘的群組圖片 ID
-pending_script_upload = {}   # {(gid, uid): (info_dict, timestamp)} 等待封面圖的劇本資料
+pending_group_image   = {}   # {(gid, uid): (message_id, timestamp)} 同一使用者最近 30 秒的圖片
+pending_script_upload = {}   # {(gid, uid): (info_dict, timestamp)} 等待封面圖的劇本資料，5分鐘 TTL
 
 if GROUP_BOT_TOKEN and GROUP_BOT_SECRET:
     group_handler       = WebhookHandler(GROUP_BOT_SECRET)
@@ -1345,34 +1345,32 @@ def execute_group_function(name, args, group_id, pending, uid=None):
             if not info or not info.get('名稱'):
                 return "請提供劇本名稱和資料，例如：《XXX》推理 5人 3小時 800元"
 
-            # 有圖片就直接上架；沒圖就存資料等圖
+            # 檢查使用者自己最近 30 秒是否剛傳了圖
             img_entry = pending_group_image.pop(key, None) if key else None
             img_bytes = None
-            if img_entry and (time.time() - img_entry[1]) < 60:
+            if img_entry and (time.time() - img_entry[1]) < 30:
                 try:
                     with ApiClient(group_configuration) as api_client:
                         img_bytes = MessagingApiBlob(api_client).get_message_content(img_entry[0])
                 except Exception as e:
                     print(f"[group] 下載封面圖失敗：{e}")
 
-            if not img_bytes:
-                # 沒有圖→存劇本資料，等使用者傳圖後由圖片 handler 完成上架
-                if key:
-                    pending_script_upload[key] = (info, time.time())
-                return {"ok": False, "waiting_image": True,
-                        "message": f"《{info['名稱']}》資料收到了，請在1分鐘內傳封面圖，傳完自動上架。"}
-
-            cover_url = None
             if img_bytes:
                 try:
                     safe_name = re.sub(r'[\\/*?:"<>|]', '_', info['名稱'])
                     cover_url = upload_image_to_github(img_bytes, f"{safe_name}.jpg")
                 except Exception as e:
                     return f"封面上傳失敗：{e}"
-            ok, result = create_notion_script(info, cover_url)
-            if ok:
-                return f"《{info['名稱']}》已新增到 Notion{'，封面也上傳好了' if cover_url else '（未附封面圖）'}。"
-            return f"上架失敗：{result}"
+                ok, result = create_notion_script(info, cover_url)
+                if ok:
+                    return f"《{info['名稱']}》已新增到 Notion，封面也上傳好了！"
+                return f"上架失敗：{result}"
+
+            # 沒圖→存劇本資料，等使用者傳圖後由圖片 handler 完成上架
+            if key:
+                pending_script_upload[key] = (info, time.time())
+            return {"ok": False, "waiting_image": True,
+                    "message": f"《{info['名稱']}》資料收到了，請在5分鐘內傳封面圖，傳完自動上架。"}
 
         if name == 'remove_script':
             _, result = archive_notion_script(args['name'])
@@ -1701,17 +1699,18 @@ if group_handler:
         uid  = event.source.user_id
         key  = (gid, uid)
         rtoken = event.reply_token
+        # 記錄此使用者最近傳的圖（30秒 TTL，供「先說文字再傳圖」或「先傳圖再說文字」兩種順序使用）
         pending_group_image[key] = (event.message.id, time.time())
-        print(f"[group] 圖片 ID 已暫存：gid={gid} uid={uid} msg_id={event.message.id}")
+        print(f"[group] 圖片已暫存：gid={gid} uid={uid} msg_id={event.message.id}")
 
         # 若有待上架的劇本資料，直接完成上架
         script_entry = pending_script_upload.pop(key, None)
-        if script_entry and (time.time() - script_entry[1]) < 60:
+        if script_entry and (time.time() - script_entry[1]) < 300:
+            print(f"[group] 收到封面圖，完成上架：gid={gid} uid={uid} msg_id={event.message.id}")
             info = script_entry[0]
             try:
                 with ApiClient(group_configuration) as api_client:
                     img_bytes = MessagingApiBlob(api_client).get_message_content(event.message.id)
-                pending_group_image.pop(key, None)
                 safe_name = re.sub(r'[\\/*?:"<>|]', '_', info['名稱'])
                 cover_url = upload_image_to_github(img_bytes, f"{safe_name}.jpg")
                 ok, result = create_notion_script(info, cover_url)
