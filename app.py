@@ -1309,9 +1309,10 @@ def new_group_tool_session(group_id=None):
         events = load_group_events_log(group_id, limit=8)
         mem = ""
         if users:
-            mem += "【群組成員記憶】\n" + "\n".join(
-                f"- {u['name']}：喜好／個性={u['preferences']}；說話風格={u['style']}" for u in users
-            ) + "\n"
+            def _user_line(u):
+                gender_str = f"；性別={u['gender']}" if u.get('gender') else ''
+                return f"- {u['name']}：喜好／個性={u['preferences']}；說話風格={u['style']}{gender_str}"
+            mem += "【群組成員記憶】\n" + "\n".join(_user_line(u) for u in users) + "\n"
         if events:
             mem += "\n【最近發生的事】\n" + "\n".join(f"- {e}" for e in events) + "\n"
         if mem:
@@ -1426,7 +1427,7 @@ def append_chat_buffer(group_id, user_id, name, text):
         print(f"[group] append_chat_buffer 失敗：{e}")
 
 def load_group_user_notes(group_id):
-    """回傳這個群組所有人的長期記憶 [{user_id, name, preferences, style}]"""
+    """回傳這個群組所有人的長期記憶 [{user_id, name, preferences, style, gender}]"""
     try:
         rows = get_sheet('group_user_notes').get_all_values()
         result = []
@@ -1435,13 +1436,14 @@ def load_group_user_notes(group_id):
                 result.append({
                     'user_id': row[1], 'name': row[2],
                     'preferences': row[3], 'style': row[4],
+                    'gender': row[6] if len(row) >= 7 else '',
                 })
         return result
     except Exception as e:
         print(f"[group] load_group_user_notes 失敗：{e}")
         return []
 
-def upsert_group_user_note(group_id, user_id, name, preferences, style):
+def upsert_group_user_note(group_id, user_id, name, preferences, style, gender=''):
     """更新或新增某人的記憶列"""
     try:
         ws  = get_sheet('group_user_notes')
@@ -1449,9 +1451,11 @@ def upsert_group_user_note(group_id, user_id, name, preferences, style):
         ts = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d")
         for i, row in enumerate(rows):
             if len(row) >= 2 and row[0] == group_id and row[1] == user_id:
-                ws.update(f'A{i+1}:F{i+1}', [[group_id, user_id, name, preferences, style, ts]])
+                existing_gender = row[6] if len(row) >= 7 else ''
+                g = gender or existing_gender
+                ws.update(f'A{i+1}:G{i+1}', [[group_id, user_id, name, preferences, style, ts, g]])
                 return
-        ws.append_row([group_id, user_id, name, preferences, style, ts])
+        ws.append_row([group_id, user_id, name, preferences, style, ts, gender])
     except Exception as e:
         print(f"[group] upsert_group_user_note 失敗：{e}")
 
@@ -1508,7 +1512,7 @@ def compress_group_memory():
             recent_events  = load_group_events_log(gid, limit=15)
 
             existing_users_txt = "\n".join(
-                f"- {u['name']}（{u['user_id']}）喜好：{u['preferences']}；說話風格：{u['style']}"
+                f"- {u['name']}（{u['user_id']}）喜好：{u['preferences']}；說話風格：{u['style']}" + (f"；性別：{u['gender']}" if u.get('gender') else '')
                 for u in existing_users
             ) or "（無）"
             recent_events_txt = "\n".join(f"- {e}" for e in recent_events) or "（無）"
@@ -1542,13 +1546,15 @@ def compress_group_memory():
                 style = u.get('style', '')
                 if not uid:
                     continue
-                # 合併既有資料
+                # 合併既有資料（gender 只從 sheet 繼承，不由 AI 填寫）
                 old = existing_map.get(uid)
+                gender = ''
                 if old:
-                    prefs = prefs or old['preferences']
-                    style = style or old['style']
-                    name  = name  or old['name']
-                upsert_group_user_note(gid, uid, name, prefs, style)
+                    prefs  = prefs  or old['preferences']
+                    style  = style  or old['style']
+                    name   = name   or old['name']
+                    gender = old.get('gender', '')
+                upsert_group_user_note(gid, uid, name, prefs, style, gender)
 
             for ev in data.get('events', []):
                 if ev and isinstance(ev, str):
