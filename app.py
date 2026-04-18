@@ -1666,6 +1666,7 @@ def group_chat_ai(msg, history=None, group_id=None, speaker_uid=None, speaker_na
         _gc = group_gemini_client or gemini_client
         resp = _gc.models.generate_content(
             model=GEMMA_MODEL,
+            config=types.GenerateContentConfig(safety_settings=_SAFETY_OFF),
             contents=(
                 MASHA_PERSONA + "\n\n"
                 f"{events_ctx}"
@@ -1676,7 +1677,8 @@ def group_chat_ai(msg, history=None, group_id=None, speaker_uid=None, speaker_na
                 "陸傲天的回覆："
             ),
         )
-        return resp.text.strip()
+        text = resp.text.strip() if resp.text else ''
+        return text
     except Exception as e:
         print(f"[group_chat_ai] 錯誤：{e}")
         return "本總裁需要想一下。"
@@ -1814,8 +1816,8 @@ if group_handler:
             msg = event.message.text.strip()
             rtoken = event.reply_token
 
-            # 查自己的 ID（用來設 GROUP_OWNER_ID）
-            if msg == '[我的ID]':
+            # 查自己的 ID（任何人都能用，用來設定 GROUP_OWNER_ID）
+            if msg in ('[我的ID]', '我的ID'):
                 with ApiClient(group_configuration) as api_client:
                     MessagingApi(api_client).reply_message(
                         ReplyMessageRequest(reply_token=rtoken, messages=[TextMessage(text=f"你的 user_id：\n{uid}")])
