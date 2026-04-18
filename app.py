@@ -653,6 +653,7 @@ def create_notion_script(info, cover_url=None):
     r = requests.post("https://api.notion.com/v1/pages", headers=headers, json=body)
     if r.status_code == 200:
         return True, r.json().get("url", "")
+    print(f"[Notion] 上架失敗 status={r.status_code} body={r.text[:500]}")
     return False, r.text[:300]
 
 def parse_script_info_with_ai(msg):
