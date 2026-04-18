@@ -636,16 +636,16 @@ def create_notion_script(info, cover_url=None):
         "Notion-Version": "2022-06-28"
     }
     props = {"劇本名稱": {"title": [{"text": {"content": info.get("名稱", "")}}]}}
-    for field in ["劇情簡介", "類型標籤", "角色", "時長"]:
+    for field in ["劇情簡介", "類型標籤", "時長"]:
         key = {"劇情簡介": "簡介"}.get(field, field)
         if info.get(key):
             props[field] = {"rich_text": [{"text": {"content": str(info[key])}}]}
     if info.get("價格") is not None:
         try: props["價格"] = {"number": int(info["價格"])}
         except: pass
-    for field, key in [("類型", "類型"), ("人數", "人數")]:
+    for field, key in [("類型", "類型"), ("人數", "人數"), ("角色", "角色")]:
         if info.get(key):
-            items = [x.strip() for x in re.split(r'[/、,，]', str(info[key])) if x.strip()]
+            items = [x.strip() for x in re.split(r'[/、,，\n]', str(info[key])) if x.strip()]
             props[field] = {"multi_select": [{"name": x} for x in items]}
     body = {"parent": {"database_id": NOTION_DB_ID}, "properties": props}
     if cover_url:
@@ -661,11 +661,11 @@ def parse_script_info_with_ai(msg):
         "欄位說明：\n"
         "- 名稱：劇本名稱\n"
         "- 類型：【只能從以下選項挑選，多個用/分隔】恐怖/微恐/驚悚/沉浸/情感/演繹/推理/還原/機制/陣營/歡樂/撕逼/硬核/燒腦\n"
-        "- 類型標籤：不在上方清單的額外標籤或補充描述，自由填寫\n"
+        "- 類型標籤：封面卡片上顯示的自訂標籤，自由填寫（例如「推理沉浸」「高難度」），用/分隔\n"
         "- 人數：【只能從以下選項挑選，多個用/分隔】5人/6人/7人/8人/9人/10人/11人/浮動人\n"
         "- 時長：例如「3小時」「3.5小時」\n"
         "- 價格：數字，例如 800\n"
-        "- 角色：劇本角色名稱或描述\n"
+        "- 角色：劇本每個角色名稱，用/分隔，每個角色獨立列出（例如「小林光江/今尾千春/夏目格」）\n"
         "- 簡介：劇情簡介\n\n"
         '回傳格式：{"名稱":"","類型":"","類型標籤":"","人數":"","時長":"","價格":null,"角色":"","簡介":""}\n\n'
         "訊息：" + msg
