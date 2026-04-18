@@ -1250,6 +1250,7 @@ GROUP_FUNC_DECLS = [
         description=(
             "上架劇本到 Notion 資料庫。使用者說要上架/新增劇本並提供劇本資料時呼叫。"
             "若使用者之前有傳封面圖，會自動作為封面。"
+            "【重要】絕對不可以自行宣稱上架成功，必須實際呼叫本工具並根據回傳結果告知使用者。"
         ),
         parameters=types.Schema(
             type=types.Type.OBJECT,
@@ -1359,7 +1360,7 @@ def execute_group_function(name, args, group_id, pending, uid=None):
                 if key:
                     pending_script_upload[key] = (info, time.time())
                 return {"ok": False, "waiting_image": True,
-                        "message": f"《{info['名稱']}》資料收到了，請傳封面圖（10分鐘內），傳完自動上架。"}
+                        "message": f"《{info['名稱']}》資料收到了，請在1分鐘內傳封面圖，傳完自動上架。"}
 
             cover_url = None
             if img_bytes:
