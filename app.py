@@ -1772,6 +1772,43 @@ if group_handler:
                 return
             msg = event.message.text.strip()
             rtoken = event.reply_token
+
+            # 批量設性別指令
+            if msg.startswith('[批量設性別]'):
+                lines = msg.split('\n')[1:]
+                pairs = {}
+                for line in lines:
+                    line = line.strip()
+                    if '=' in line:
+                        k, v = line.split('=', 1)
+                        pairs[k.strip()] = v.strip()
+                if not pairs:
+                    reply_text = '格式錯誤，請用：\n[批量設性別]\n名字=男\n名字=女'
+                else:
+                    try:
+                        ws = get_sheet('group_user_notes')
+                        rows = ws.get_all_values()
+                        updated = []
+                        for i, row in enumerate(rows):
+                            if len(row) < 3:
+                                continue
+                            name = row[2]
+                            for key, gender in pairs.items():
+                                if key in name:
+                                    while len(row) < 7:
+                                        row.append('')
+                                    ws.update_cell(i+1, 7, gender)
+                                    updated.append(f"{name}={gender}")
+                                    break
+                        reply_text = f"✅ 已更新 {len(updated)} 人：\n" + '\n'.join(updated)
+                    except Exception as e:
+                        reply_text = f"更新失敗：{e}"
+                with ApiClient(group_configuration) as api_client:
+                    MessagingApi(api_client).reply_message(
+                        ReplyMessageRequest(reply_token=rtoken, messages=[TextMessage(text=reply_text)])
+                    )
+                return
+
             reply = group_chat_ai(msg)
             if reply:
                 with ApiClient(group_configuration) as api_client:
