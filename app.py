@@ -972,8 +972,7 @@ signup_lock          = threading.Lock()
 group_chat_log       = {}   # {group_id: [{"name": ..., "text": ...}, ...]}
 GROUP_CHAT_LOG_MAX   = 20
 group_bot_msg_ids    = set()  # 記錄 Bot 發出的訊息 ID，用來偵測 reply
-pending_group_image   = {}   # {(gid, uid): (bytes, timestamp)} 等待上架的封面圖
-pending_upload_req    = {}   # {(gid, uid): timestamp} 使用者說要上架、正在等圖片中
+pending_group_image   = {}   # {(gid, uid): (message_id, timestamp)} 最近 10 分鐘的群組圖片 ID
 
 if GROUP_BOT_TOKEN and GROUP_BOT_SECRET:
     group_handler       = WebhookHandler(GROUP_BOT_SECRET)
@@ -1337,20 +1336,22 @@ def execute_group_function(name, args, group_id, pending, uid=None):
             key = (group_id, uid) if uid else None
             data_str = (args.get('data') or '').strip()
 
-            # 沒有給資料 → 設旗標等封面圖，請使用者傳完圖再提供劇本資料
             if not data_str:
-                if key:
-                    pending_upload_req[key] = time.time()
-                return {"ok": False, "need_cover": True,
-                        "message": "請先傳封面圖（5分鐘內），傳完後再告訴我劇本名稱和資料。"}
+                return {"ok": False, "message": "請提供劇本資料（名稱、類型、人數等），若要附封面圖請先傳圖再說上架。"}
 
             info = parse_script_info_with_ai(data_str)
             if not info or not info.get('名稱'):
                 return "請提供劇本名稱和資料，例如：《XXX》推理 5人 3小時 800元"
 
+            # 找最近 10 分鐘內傳的圖片（存的是 message_id）
             img_entry = pending_group_image.pop(key, None) if key else None
-            img_bytes = img_entry[0] if img_entry and (time.time() - img_entry[1]) < 1800 else None
-            pending_upload_req.pop(key, None)
+            img_bytes = None
+            if img_entry and (time.time() - img_entry[1]) < 600:
+                try:
+                    with ApiClient(group_configuration) as api_client:
+                        img_bytes = MessagingApiBlob(api_client).get_message_content(img_entry[0])
+                except Exception as e:
+                    print(f"[group] 下載封面圖失敗：{e}")
             cover_url = None
             if img_bytes:
                 try:
@@ -1689,18 +1690,9 @@ if group_handler:
             return
         uid = event.source.user_id
         key = (gid, uid)
-        req_ts = pending_upload_req.get(key)
-        if not req_ts or (time.time() - req_ts) > 300:
-            pending_upload_req.pop(key, None)
-            return  # 沒有等待上架請求，忽略這張圖
-        try:
-            with ApiClient(group_configuration) as api_client:
-                img_data = MessagingApiBlob(api_client).get_message_content(event.message.id)
-            pending_group_image[key] = (img_data, time.time())
-            pending_upload_req.pop(key, None)
-            print(f"[group] 封面圖已暫存：gid={gid} uid={uid}")
-        except Exception as e:
-            print(f"[group] 圖片暫存失敗：{e}")
+        # 只存 message_id（不下載 bytes），10 分鐘內說上架就會用到
+        pending_group_image[key] = (event.message.id, time.time())
+        print(f"[group] 圖片 ID 已暫存：gid={gid} uid={uid} msg_id={event.message.id}")
 
     @group_handler.add(MessageEvent, message=TextMessageContent)
     def group_handle_message(event):
