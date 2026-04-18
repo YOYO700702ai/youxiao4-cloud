@@ -1195,6 +1195,13 @@ def send_signup_sheet(gid, event, row_num, extra_prefix="", reply_token=None, ex
         save_group_event(row_num, event)
     return msg_id
 
+def _short_date(date_str):
+    """把 2026-04-18 轉成 04/18，去掉西元年"""
+    parts = str(date_str).split('-')
+    if len(parts) == 3:
+        return f"{parts[1]}/{parts[2]}"
+    return date_str
+
 def format_signup_sheet(event):
     participants = event['participants']
     count = len(participants)
@@ -1202,9 +1209,10 @@ def format_signup_sheet(event):
     for i in range(1, event['max'] + 1):
         p = next((x for x in participants if x['slot'] == i), None)
         slots.append(f"{i}. {'✅ ' + p['name'] if p else '（空缺）'}")
-    footer = "🎉 已成團！" if event['status'] == 'full' else "⬆ 引用本訊息回覆「+」報名｜「-」取消個人｜「取消揪團」整團取消"
+    date_disp = _short_date(event['date'])
+    footer = "本總裁已宣布成團，諸位準備好。" if event['status'] == 'full' else "⬆ 引用本訊息回覆「+」報名｜「-」取消個人｜「取消揪團」整團取消"
     return (
-        f"📋 劇本揪團 ｜ {event['date']} {event['time']}\n"
+        f"📋 揪團令 ｜ {date_disp} {event['time']}\n"
         f"劇本：{event['script']} ｜ {count}/{event['max']} 人\n\n"
         + '\n'.join(slots)
         + f"\n\n{footer}"
@@ -1336,7 +1344,7 @@ def execute_group_function(name, args, group_id, pending, uid=None):
             if not ev:
                 return {"ok": False, "error": "建立失敗"}
             pending['signup'] = {'row_num': row_num, 'event': ev}
-            return {"ok": True, "message": f"已建立揪團《{script}》{date} {time_s}，招募 {max_p} 人"}
+            return {"ok": True, "message": f"揪團令已發出，《{script}》{_short_date(date)} {time_s}，本總裁需要 {max_p} 人，速去報名。"}
 
         if name == 'list_active_teams':
             evs = load_active_events(group_id)
@@ -1804,23 +1812,23 @@ if group_handler:
                     ev['status'] = 'closed'
                     ev['announce_msg_ids'] = []
                     save_group_event(row_num, ev)
-                    group_reply(rtoken, f"🗑 已取消揪團：《{ev['script']}》{ev['date']} {ev['time']}")
+                    group_reply(rtoken, f"本總裁已撤令。《{ev['script']}》{_short_date(ev['date'])} {ev['time']} 的揪團，就此作廢。")
                     return
 
                 # 報名 +
                 if msg == '+':
                     if any(p['user_id'] == uid for p in ev['participants']):
-                        group_reply(rtoken, "你已經報名了喔！")
+                        group_reply(rtoken, "本總裁的名冊上已有你的名字，不必重複。")
                         return
                     if ev['status'] == 'full':
-                        group_reply(rtoken, "已成團，目前沒有空缺。")
+                        group_reply(rtoken, "名額已滿，下次早點來。")
                         return
                     name = get_member_name(gid, uid)
                     slot = len(ev['participants']) + 1
                     ev['participants'].append({'user_id': uid, 'name': name, 'slot': slot})
                     if len(ev['participants']) >= ev['max']:
                         ev['status'] = 'full'
-                        bonus = f"🎉 成團！{ev['date']} {ev['time']} 測本《{ev['script']}》見！"
+                        bonus = f"名額已滿，本總裁宣布成團。{_short_date(ev['date'])} {ev['time']}，《{ev['script']}》，一個都不許遲到。"
                         send_signup_sheet(gid, ev, row_num, reply_token=rtoken, extra_text=bonus)
                         try:
                             start = f"{ev['date']}T{ev['time']}:00"
@@ -1838,14 +1846,14 @@ if group_handler:
                 if msg == '-':
                     p = next((x for x in ev['participants'] if x['user_id'] == uid), None)
                     if not p:
-                        group_reply(rtoken, "你還沒有報名喔！")
+                        group_reply(rtoken, "名冊上沒有你，取消什麼。")
                         return
                     was_full = ev['status'] == 'full'
                     ev['participants'].remove(p)
                     for i, participant in enumerate(ev['participants'], 1):
                         participant['slot'] = i
                     ev['status'] = 'open'
-                    prefix = f"😢 {p['name']} 退出了，目前 {len(ev['participants'])}/{ev['max']} 人\n\n" if was_full else ""
+                    prefix = f"{p['name']} 臨陣脫逃，名冊空出一位，本總裁允許補位。\n\n" if was_full else ""
                     send_signup_sheet(gid, ev, row_num, extra_prefix=prefix, reply_token=rtoken)
                     return
 
