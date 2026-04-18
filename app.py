@@ -973,6 +973,7 @@ group_chat_log       = {}   # {group_id: [{"name": ..., "text": ...}, ...]}
 GROUP_CHAT_LOG_MAX   = 20
 group_bot_msg_ids    = set()  # 記錄 Bot 發出的訊息 ID，用來偵測 reply
 pending_group_image   = {}   # {(gid, uid): (message_id, timestamp)} 最近 10 分鐘的群組圖片 ID
+pending_script_upload = {}   # {(gid, uid): (info_dict, timestamp)} 等待封面圖的劇本資料
 
 if GROUP_BOT_TOKEN and GROUP_BOT_SECRET:
     group_handler       = WebhookHandler(GROUP_BOT_SECRET)
@@ -1337,13 +1338,13 @@ def execute_group_function(name, args, group_id, pending, uid=None):
             data_str = (args.get('data') or '').strip()
 
             if not data_str:
-                return {"ok": False, "message": "請提供劇本資料（名稱、類型、人數等），若要附封面圖請先傳圖再說上架。"}
+                return {"ok": False, "message": "請提供劇本資料（名稱、類型、人數等）。"}
 
             info = parse_script_info_with_ai(data_str)
             if not info or not info.get('名稱'):
                 return "請提供劇本名稱和資料，例如：《XXX》推理 5人 3小時 800元"
 
-            # 找最近 10 分鐘內傳的圖片（存的是 message_id）
+            # 有圖片就直接上架；沒圖就存資料等圖
             img_entry = pending_group_image.pop(key, None) if key else None
             img_bytes = None
             if img_entry and (time.time() - img_entry[1]) < 600:
@@ -1352,6 +1353,14 @@ def execute_group_function(name, args, group_id, pending, uid=None):
                         img_bytes = MessagingApiBlob(api_client).get_message_content(img_entry[0])
                 except Exception as e:
                     print(f"[group] 下載封面圖失敗：{e}")
+
+            if not img_bytes:
+                # 沒有圖→存劇本資料，等使用者傳圖後由圖片 handler 完成上架
+                if key:
+                    pending_script_upload[key] = (info, time.time())
+                return {"ok": False, "waiting_image": True,
+                        "message": f"《{info['名稱']}》資料收到了，請傳封面圖（10分鐘內），傳完自動上架。"}
+
             cover_url = None
             if img_bytes:
                 try:
@@ -1688,11 +1697,27 @@ if group_handler:
         gid = event.source.group_id
         if gid not in ALLOWED_GROUP_IDS:
             return
-        uid = event.source.user_id
-        key = (gid, uid)
-        # 只存 message_id（不下載 bytes），10 分鐘內說上架就會用到
+        uid  = event.source.user_id
+        key  = (gid, uid)
+        rtoken = event.reply_token
         pending_group_image[key] = (event.message.id, time.time())
         print(f"[group] 圖片 ID 已暫存：gid={gid} uid={uid} msg_id={event.message.id}")
+
+        # 若有待上架的劇本資料，直接完成上架
+        script_entry = pending_script_upload.pop(key, None)
+        if script_entry and (time.time() - script_entry[1]) < 600:
+            info = script_entry[0]
+            try:
+                with ApiClient(group_configuration) as api_client:
+                    img_bytes = MessagingApiBlob(api_client).get_message_content(event.message.id)
+                pending_group_image.pop(key, None)
+                safe_name = re.sub(r'[\\/*?:"<>|]', '_', info['名稱'])
+                cover_url = upload_image_to_github(img_bytes, f"{safe_name}.jpg")
+                ok, result = create_notion_script(info, cover_url)
+                msg = f"《{info['名稱']}》已上架到 Notion，封面也上傳好了！" if ok else f"上架失敗：{result}"
+            except Exception as e:
+                msg = f"上架時出錯：{e}"
+            group_reply(rtoken, msg)
 
     @group_handler.add(MessageEvent, message=TextMessageContent)
     def group_handle_message(event):
