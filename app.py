@@ -1822,8 +1822,8 @@ if group_handler:
                     )
                 return
 
-            # 非 owner 封鎖（GROUP_OWNER_ID 設定後生效）
-            if GROUP_OWNER_ID and uid != GROUP_OWNER_ID:
+            # 非 owner 封鎖
+            if uid != MY_USER_ID:
                 return
 
             # 批量設性別指令
