@@ -799,9 +799,14 @@ def ask_ai_with_tools(user_msg, uid=None):
             else:
                 return "目前連不上，請稍後再試。"
     for _ in range(5):
+        candidate = response.candidates[0] if response.candidates else None
+        content = getattr(candidate, 'content', None) if candidate else None
+        parts = getattr(content, 'parts', None) if content else None
+        if not parts:
+            return (response.text or "").strip() or "嗯…讓我想一下。"
         func_calls = [
             p.function_call
-            for p in response.candidates[0].content.parts
+            for p in parts
             if hasattr(p, 'function_call') and p.function_call and p.function_call.name
         ]
         if not func_calls:
