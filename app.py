@@ -1809,9 +1809,6 @@ if group_handler:
     @group_handler.add(MessageEvent, message=TextMessageContent)
     def group_handle_message(event):
         if not hasattr(event.source, 'group_id'):
-            # 只有 owner 可以私訊
-            if event.source.user_id != MY_USER_ID:
-                return
             msg = event.message.text.strip()
             rtoken = event.reply_token
 
