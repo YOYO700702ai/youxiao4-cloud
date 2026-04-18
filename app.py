@@ -567,10 +567,21 @@ FUNC_DECLS = [
 
 TOOLS = [types.Tool(function_declarations=FUNC_DECLS)]
 
+_SAFETY_OFF = [
+    types.SafetySetting(category="HARM_CATEGORY_HARASSMENT",        threshold="OFF"),
+    types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH",       threshold="OFF"),
+    types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="OFF"),
+    types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="OFF"),
+]
+
 def new_tool_session():
     return gemini_client.chats.create(
         model=GEMMA_MODEL,
-        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, tools=TOOLS),
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            tools=TOOLS,
+            safety_settings=_SAFETY_OFF,
+        ),
     )
 
 tool_chat_session = new_tool_session()
@@ -747,7 +758,7 @@ def execute_function(name, args, uid=None):
         )
         generated = gemini_client.models.generate_content(
             model=GEMMA_MODEL, contents=post_prompt,
-            config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
+            config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, safety_settings=_SAFETY_OFF)
         ).text.strip()
         result = post_to_fb(page, generated, img)
         if img and uid:
@@ -831,7 +842,7 @@ def ask_ai_simple(text):
     try:
         return gemini_client.models.generate_content(
             model=GEMMA_MODEL, contents=text,
-            config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
+            config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, safety_settings=_SAFETY_OFF)
         ).text.strip()
     except Exception as e:
         return f"連線失敗：{e}"
@@ -943,7 +954,7 @@ def handle_image(event):
                 types.Part.from_bytes(data=image_data, mime_type='image/jpeg'),
                 types.Part(text="悠悠傳了這張圖，請描述。")
             ],
-            config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT)
+            config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, safety_settings=_SAFETY_OFF)
         ).text.strip()
     except Exception as e:
         reply = f"圖片收到，但無法分析：{e}"
