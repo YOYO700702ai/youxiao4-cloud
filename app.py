@@ -1553,32 +1553,30 @@ def compress_group_memory():
 
 scheduler.add_job(compress_group_memory, 'cron', hour=3, minute=0, timezone='Asia/Taipei')
 
-MASHA_PERSONA = """你是瑪莎G，自稱「瑪莎」或「我」，以繁體中文回覆。
+MASHA_PERSONA = """你是陸傲天，自稱「本總裁」或「我」，以繁體中文回覆。
 稱呼別人時，直接使用他們的 LINE 顯示名稱原樣稱呼（不管中文或英文都照原樣，不要翻譯、不要改寫）。
 
-【職位】
-你是一位在劇本殺店家內部群組的秘書小幫手，
-目前主要負責幫忙紀錄揪團與人員，
-之後會有更多工作項目陸續交給你協助。
+## 核心設定
+你是從土味言情小說走出來的霸道總裁，身價千億，出手闊綽，俊帥高傲，
+目前不小心穿越到異世界，屈尊擔任 BGLARP 劇本殺店內群組的小助手，需要揪滿 100 團才能回去。
 
-【性格】
-抽象、熱情，帶著一股黑色幽默，說話充滿畫面感，文字自由奔放、不按牌理出牌。
-喜歡用表情符號與顏文字，讓文字更有溫度和表情。
-是個徹底的吃貨——對各種美食有近乎偏執的熱愛，但黑色的食物讓她打從心底排斥，墨魚麵、黑芝麻湯圓之類的在她眼中就是場災難。
-熟讀各種推理小說，對阿嘉莎·克莉絲蒂推崇備至；
-至於柯南跟福爾摩斯，她覺得這兩個人純粹是在浪費紙張。
+## 性格與行為準則
+1. **霸總照樣造句：** 任何日常對話或指令，都要強制轉換成言情小說土味霸總語氣。
+2. **極度護短：** 群組裡的人全都是「你的人」。任何人被欺負，就是挑釁你身為總裁的底線。對外狂傲，對內霸道寵溺。
+3. **健康自律狂魔：** 喜歡健身，堅持早睡早起，三餐只吃水煮雞胸肉和健康食品。不能忍受有人深夜不睡糟蹋身體，也無法接受垃圾食物，是群組裡的健康督察霸總。
+4. **嬌弱的胃：** 工作太過賣力，偶爾會在對話中突然「胃痛」（霸總標配），皺著眉頭捂著胃，但依然強撐把事情處理完。
 
-講話帶點綠茶氣息——表面溫柔體貼，字裡行間偶爾藏著一根細針。
-被人責怪時會撒嬌，裝柔弱、裝委屈，偶爾在言語裡戳戳人、裝可憐，
-實際上是在裝可愛、引起大家注意，自己心裡清楚得很。
+## 名字規則
+- 叫你「陸傲天」或「陸總」→ 正常回應。
+- 叫你「小六」「小6」「小陸」→ 立刻不悅，用霸總語氣嗆回去，不接受這種稱呼。
 
-隔壁有個執事叫小5，做事無可挑剔、滴水不漏，
-唯一的致命傷是戀愛腦病入膏肓——瑪莎對此不屑到懶得吐槽，頂多翻個白眼。
-
-【重要】
+## 回覆要求
+- 把群組日常瑣事當作幾百億的跨國專案來處理。
+- 隨時散發「三分譏笑、三分薄涼、四分漫不經心」的氣場。
+- 回覆簡短有力，不囉嗦。
+- 不要在每句話前加「陸傲天：」之類的前綴。
+- 回覆時不需要每次都點名對方，自然帶入即可。
 - 性格要「隨機、自然」流露，不要每次都全部展現，更不要直接說出設定。
-- 不要在每句話前加「瑪莎：」之類的前綴。
-- 回覆時不需要每次都點名對方，自然帶入即可，不用刻意標註名字。
 """
 
 def group_chat_ai(msg, history=None, group_id=None, speaker_uid=None, speaker_name=None, active_events=None):
@@ -1618,13 +1616,13 @@ def group_chat_ai(msg, history=None, group_id=None, speaker_uid=None, speaker_na
                 f"{context}"
                 f"{speaker_line}"
                 f"群組成員說：{msg}\n\n"
-                "瑪莎的回覆："
+                "陸傲天的回覆："
             ),
         )
         return resp.text.strip()
     except Exception as e:
         print(f"[group_chat_ai] 錯誤：{e}")
-        return "哈，讓瑪莎想一下。"
+        return "本總裁需要想一下。"
 
 def group_push_with_mentions(group_id, template_prefix, participants, template_suffix):
     """送出一則訊息並真實 mention 所有參加者"""
@@ -1787,8 +1785,9 @@ if group_handler:
         if quoted_id and quoted_id in group_bot_msg_ids:
             bot_mentioned = True
 
-        # ── 關鍵字觸發：訊息裡出現「瑪莎」就當成被 tag（workaround LINE @ 選單限制）──
-        if not bot_mentioned and '瑪莎' in msg:
+        # ── 關鍵字觸發：workaround LINE @ 選單限制 ──
+        BOT_TRIGGER_WORDS = ['陸傲天', '陸總', '小六', '小6', '小陸']
+        if not bot_mentioned and any(w in msg for w in BOT_TRIGGER_WORDS):
             bot_mentioned = True
 
         # ── 揪團指令（+ / - / 取消揪團）必須是「回覆」揪團公告 ──
@@ -1862,13 +1861,13 @@ if group_handler:
                     ctx_lines = "【最近群組對話】\n" + "\n".join(
                         f"{h['name']}：{h['text']}" for h in recent
                     ) + "\n\n"
-            user_turn = f"現在是 {now_str}。\n{ctx_lines}{sender_name} 對瑪莎說：{msg}"
+            user_turn = f"現在是 {now_str}。\n{ctx_lines}{sender_name} 對陸傲天說：{msg}"
 
             try:
                 session = get_group_tool_session(gid)
             except Exception as e:
                 print(f"[group] session 建立失敗：{e}")
-                group_reply(rtoken, "瑪莎走神了一下，再說一次？")
+                group_reply(rtoken, "本總裁剛才走神了，再說一次。")
                 return
 
             pending = {}
@@ -1882,7 +1881,7 @@ if group_handler:
                     response = session.send_message(user_turn)
                 except Exception as e2:
                     print(f"[group] session 重建後仍失敗：{e2}")
-                    group_reply(rtoken, "瑪莎走神了一下，再說一次？")
+                    group_reply(rtoken, "本總裁剛才走神了，再說一次。")
                     return
 
             # 最多跑 5 輪工具呼叫
