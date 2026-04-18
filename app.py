@@ -1347,7 +1347,7 @@ def execute_group_function(name, args, group_id, pending, uid=None):
             # 有圖片就直接上架；沒圖就存資料等圖
             img_entry = pending_group_image.pop(key, None) if key else None
             img_bytes = None
-            if img_entry and (time.time() - img_entry[1]) < 600:
+            if img_entry and (time.time() - img_entry[1]) < 60:
                 try:
                     with ApiClient(group_configuration) as api_client:
                         img_bytes = MessagingApiBlob(api_client).get_message_content(img_entry[0])
@@ -1705,7 +1705,7 @@ if group_handler:
 
         # 若有待上架的劇本資料，直接完成上架
         script_entry = pending_script_upload.pop(key, None)
-        if script_entry and (time.time() - script_entry[1]) < 600:
+        if script_entry and (time.time() - script_entry[1]) < 60:
             info = script_entry[0]
             try:
                 with ApiClient(group_configuration) as api_client:
