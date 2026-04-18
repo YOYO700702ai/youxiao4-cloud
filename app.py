@@ -1348,7 +1348,7 @@ def execute_group_function(name, args, group_id, pending, uid=None):
             # 檢查使用者自己最近 30 秒是否剛傳了圖
             img_entry = pending_group_image.pop(key, None) if key else None
             img_bytes = None
-            if img_entry and (time.time() - img_entry[1]) < 30:
+            if img_entry and (time.time() - img_entry[1]) < 300:
                 try:
                     with ApiClient(group_configuration) as api_client:
                         img_bytes = MessagingApiBlob(api_client).get_message_content(img_entry[0])
