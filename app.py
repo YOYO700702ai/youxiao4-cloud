@@ -1903,7 +1903,7 @@ if group_handler:
             bot_mentioned = True
 
         # ── 關鍵字觸發：workaround LINE @ 選單限制 ──
-        BOT_TRIGGER_WORDS = ['陸傲天', '陸總', '小六', '小6', '小陸']
+        BOT_TRIGGER_WORDS = ['陸傲天', '傲天', '陸總', '小六', '小6', '小陸']
         if not bot_mentioned and any(w in msg for w in BOT_TRIGGER_WORDS):
             bot_mentioned = True
 
