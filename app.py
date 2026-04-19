@@ -1912,6 +1912,23 @@ if group_handler:
         else:
             print(f"[group] 沒有待上架資料（script_entry={script_entry is not None}）")
 
+        # ── 5% 機率看圖主動插嘴 ──
+        if random.random() < 0.05:
+            try:
+                with ApiClient(group_configuration) as api_client:
+                    img_bytes = MessagingApiBlob(api_client).get_message_content(event.message.id)
+                sender_name = get_member_name(gid, uid)
+                log = group_chat_log.get(gid, [])
+                reply = group_chat_ai(
+                    "（對方傳了一張圖，沒說話）", history=log, group_id=gid,
+                    speaker_uid=uid, speaker_name=sender_name,
+                    image_bytes=img_bytes,
+                )
+                if reply:
+                    group_reply(event.reply_token, reply)
+            except Exception as e:
+                print(f"[group] 圖片插嘴失敗：{e}")
+
     @group_handler.add(MessageEvent, message=TextMessageContent)
     def group_handle_message(event):
         if not hasattr(event.source, 'group_id'):
