@@ -2044,8 +2044,8 @@ if group_handler:
                 save_group_event(signup_info['row_num'], ev)
             return
 
-        # ── 2% 機率主動插嘴 ──
-        if random.random() < 0.02:
+        # ── 5% 機率主動插嘴 ──
+        if random.random() < 0.05:
             reply = group_chat_ai(msg, history=log, group_id=gid, speaker_uid=uid, speaker_name=sender_name)
             group_reply(rtoken, reply)
 
