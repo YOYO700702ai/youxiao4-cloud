@@ -692,6 +692,32 @@ def parse_script_info_with_ai(msg):
     except:
         return None
 
+def replace_notion_cover(name, cover_url):
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Content-Type": "application/json",
+        "Notion-Version": "2022-06-28"
+    }
+    r = requests.post(
+        f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query",
+        headers=headers,
+        json={"filter": {"property": "劇本名稱", "title": {"equals": name}}}
+    )
+    if r.status_code != 200:
+        return False, f"搜尋失敗：{r.text[:200]}"
+    results = r.json().get("results", [])
+    if not results:
+        return False, f"找不到《{name}》，請確認名稱是否正確。"
+    page_id = results[0]["id"]
+    r2 = requests.patch(
+        f"https://api.notion.com/v1/pages/{page_id}",
+        headers=headers,
+        json={"cover": {"type": "external", "external": {"url": cover_url}}}
+    )
+    if r2.status_code == 200:
+        return True, f"《{name}》封面已更新。"
+    return False, f"更新失敗：{r2.text[:200]}"
+
 def archive_notion_script(name):
     headers = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -1033,6 +1059,7 @@ GROUP_CHAT_LOG_MAX   = 20
 group_bot_msg_ids    = set()  # 記錄 Bot 發出的訊息 ID，用來偵測 reply
 pending_group_image   = {}   # {(gid, uid): (message_id, timestamp)} 同一使用者最近 30 秒的圖片
 pending_script_upload = {}   # {(gid, uid): (info_dict, timestamp)} 等待封面圖的劇本資料，5分鐘 TTL
+pending_cover_replace = {}   # {(gid, uid): (script_name, timestamp)} 等待新封面圖，5分鐘 TTL
 
 if GROUP_BOT_TOKEN and GROUP_BOT_SECRET:
     group_handler       = WebhookHandler(GROUP_BOT_SECRET)
@@ -1338,6 +1365,20 @@ GROUP_FUNC_DECLS = [
             required=["name"],
         ),
     ),
+    types.FunctionDeclaration(
+        name="replace_cover",
+        description=(
+            "換掉 Notion 上某本劇本的封面圖。使用者說『換圖』『換封面』『重新上傳封面』等時呼叫。"
+            "若使用者之前剛傳過圖，會直接用那張；否則會等使用者再傳新圖。"
+        ),
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "name": types.Schema(type=types.Type.STRING, description="要換封面的劇本名稱"),
+            },
+            required=["name"],
+        ),
+    ),
 ]
 GROUP_TOOLS = [types.Tool(function_declarations=GROUP_FUNC_DECLS)]
 
@@ -1443,6 +1484,36 @@ def execute_group_function(name, args, group_id, pending, uid=None):
         if name == 'remove_script':
             _, result = archive_notion_script(args['name'])
             return result
+
+        if name == 'replace_cover':
+            key = (group_id, uid) if uid else None
+            script_name = (args.get('name') or '').strip()
+            if not script_name:
+                return "請告訴本總裁要換哪一本的封面。"
+
+            # 檢查使用者最近 5 分鐘是否剛傳了圖
+            img_entry = pending_group_image.pop(key, None) if key else None
+            img_bytes = None
+            if img_entry and (time.time() - img_entry[1]) < 300:
+                try:
+                    with ApiClient(group_configuration) as api_client:
+                        img_bytes = MessagingApiBlob(api_client).get_message_content(img_entry[0])
+                except Exception as e:
+                    print(f"[group] 下載新封面失敗：{e}")
+
+            if img_bytes:
+                try:
+                    safe_name = re.sub(r'[\\/*?:"<>|]', '_', script_name)
+                    cover_url = upload_image_to_github(img_bytes, f"{safe_name}.jpg")
+                except Exception as e:
+                    return f"封面上傳失敗：{e}"
+                ok, result = replace_notion_cover(script_name, cover_url)
+                return result
+
+            # 沒圖→存起來等圖
+            if key:
+                pending_cover_replace[key] = (script_name, time.time())
+            return f"收到，請在5分鐘內傳《{script_name}》的新封面圖，傳完自動更新。"
 
         return {"error": f"unknown tool: {name}"}
     except Exception as e:
@@ -1779,6 +1850,30 @@ if group_handler:
         pending_group_image[key] = (event.message.id, time.time())
         print(f"[group] 圖片已暫存：gid={gid} uid={uid} msg_id={event.message.id}")
         print(f"[group] pending_script_upload keys={list(pending_script_upload.keys())}")
+
+        # 若有待換封面的劇本，直接換
+        cover_entry = pending_cover_replace.pop(key, None)
+        if cover_entry and (time.time() - cover_entry[1]) < 300:
+            script_name = cover_entry[0]
+            print(f"[group] 找到待換封面劇本：{script_name}")
+            try:
+                with ApiClient(group_configuration) as api_client:
+                    img_bytes = MessagingApiBlob(api_client).get_message_content(event.message.id)
+                safe_name = re.sub(r'[\\/*?:"<>|]', '_', script_name)
+                cover_url = upload_image_to_github(img_bytes, f"{safe_name}.jpg")
+                ok, result = replace_notion_cover(script_name, cover_url)
+                msg = result
+            except Exception as e:
+                print(f"[group] 換封面時出錯：{e}")
+                msg = f"換封面時出錯：{e}"
+            try:
+                with ApiClient(group_configuration) as api_client:
+                    MessagingApi(api_client).push_message(
+                        PushMessageRequest(to=gid, messages=[TextMessage(text=msg)])
+                    )
+            except Exception as e:
+                print(f"[group] 換封面 push 失敗：{e}")
+            return
 
         # 若有待上架的劇本資料，直接完成上架
         script_entry = pending_script_upload.pop(key, None)
