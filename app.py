@@ -1190,10 +1190,12 @@ def _parse_msg_ids(cell):
     return [cell]
 
 def _row_to_event(row):
+    max_p = int(row[4])
+    min_p = int(row[8]) if len(row) >= 9 and str(row[8]).strip() else max_p
     return {
         'group_id': row[0], 'script': row[1],
         'date': row[2], 'time': row[3],
-        'max': int(row[4]),
+        'max': max_p, 'min': min_p,
         'participants': json.loads(row[5]) if row[5] else [],
         'status': row[6],
         'announce_msg_ids': _parse_msg_ids(row[7]) if len(row) >= 8 else [],
@@ -1207,7 +1209,7 @@ def get_event_by_msg_id(group_id, msg_id):
         ws = get_sheet('group_events')
         rows = ws.get_all_values()
         for i, row in enumerate(rows):
-            if len(row) < 8 or row[0] != group_id or row[6] not in ('open', 'full'):
+            if len(row) < 8 or row[0] != group_id or row[6] not in ('open', 'confirmed', 'full'):
                 continue
             if msg_id in _parse_msg_ids(row[7]):
                 return i + 1, _row_to_event(row)
@@ -1220,22 +1222,24 @@ def save_group_event(row_num, event):
         ids = event.get('announce_msg_ids', [])
         ids_str = json.dumps(ids, ensure_ascii=False) if ids else ''
         get_sheet('group_events').update(
-            f'A{row_num}:H{row_num}',
+            f'A{row_num}:I{row_num}',
             [[event['group_id'], event['script'], event['date'], event['time'],
               event['max'], json.dumps(event['participants'], ensure_ascii=False),
-              event['status'], ids_str]]
+              event['status'], ids_str, event.get('min', event['max'])]]
         )
     except Exception as e:
         print(f"[group] save_group_event 失敗：{e}")
 
-def create_group_event_row(group_id, script, date, time_str, max_players):
+def create_group_event_row(group_id, script, date, time_str, max_players, min_players=None):
     try:
         ws = get_sheet('group_events')
-        ws.append_row([group_id, script, date, time_str, max_players, '[]', 'open', ''])
+        if min_players is None:
+            min_players = max_players
+        ws.append_row([group_id, script, date, time_str, max_players, '[]', 'open', '', min_players])
         rows = ws.get_all_values()
         event = {'group_id': group_id, 'script': script, 'date': date,
-                 'time': time_str, 'max': max_players, 'participants': [],
-                 'status': 'open', 'announce_msg_ids': []}
+                 'time': time_str, 'max': max_players, 'min': min_players,
+                 'participants': [], 'status': 'open', 'announce_msg_ids': []}
         return len(rows), event
     except Exception as e:
         print(f"[group] create_group_event_row 失敗：{e}")
@@ -1280,10 +1284,17 @@ def format_signup_sheet(event):
         slots.append(f"{i}. {'✅ ' + p['name'] if p else '（空缺）'}")
     date_disp = _short_date(event['date'])
     time_disp = event['time'] if event['time'] else "吉時未定"
-    footer = "本總裁已宣布成團，諸位準備好。" if event['status'] == 'full' else "⬆ 引用本訊息回覆「+」報名｜「-」取消個人｜「取消揪團」整團取消"
+    min_p = event.get('min', event['max'])
+    cap_disp = f"{min_p}~{event['max']}" if min_p != event['max'] else f"{event['max']}"
+    if event['status'] == 'full':
+        footer = "本總裁已宣布成團，名額已滿，諸位準備好。"
+    elif event['status'] == 'confirmed':
+        footer = f"本總裁已宣布成團（尚可加至 {event['max']} 人）。⬆ 引用本訊息回覆「+」報名｜「-」取消個人｜「取消揪團」整團取消"
+    else:
+        footer = "⬆ 引用本訊息回覆「+」報名｜「-」取消個人｜「取消揪團」整團取消"
     return (
         f"📋 揪團令 ｜ {date_disp} {time_disp}\n"
-        f"劇本：{event['script']} ｜ {count}/{event['max']} 人\n\n"
+        f"劇本：{event['script']} ｜ {count}/{cap_disp} 人\n\n"
         + '\n'.join(slots)
         + f"\n\n{footer}"
     )
@@ -1294,7 +1305,7 @@ def load_active_events(group_id):
         rows = get_sheet('group_events').get_all_values()
         events = []
         for row in rows:
-            if len(row) < 7 or row[0] != group_id or row[6] not in ('open', 'full'):
+            if len(row) < 7 or row[0] != group_id or row[6] not in ('open', 'confirmed', 'full'):
                 continue
             events.append(_row_to_event(row))
         events.sort(key=lambda e: (e['date'], e['time']))
@@ -1309,7 +1320,14 @@ def format_active_events_for_ai(events):
     lines = []
     for e in events:
         names = "、".join([p['name'] for p in e['participants']]) or "（還沒人報名）"
-        status_tag = "已成團" if e['status'] == 'full' else f"招募中 {len(e['participants'])}/{e['max']}"
+        min_p = e.get('min', e['max'])
+        cap_disp = f"{min_p}~{e['max']}" if min_p != e['max'] else f"{e['max']}"
+        if e['status'] == 'full':
+            status_tag = "已成團(滿)"
+        elif e['status'] == 'confirmed':
+            status_tag = f"已成團(可加) {len(e['participants'])}/{cap_disp}"
+        else:
+            status_tag = f"招募中 {len(e['participants'])}/{cap_disp}"
         time_disp = e['time'] if e['time'] else "吉時未定"
         lines.append(f"- {e['date']} {time_disp}《{e['script']}》[{status_tag}]：{names}")
     return "【目前進行中的揪團】\n" + "\n".join(lines) + "\n\n"
@@ -1328,7 +1346,8 @@ GROUP_FUNC_DECLS = [
                 "script": types.Schema(type=types.Type.STRING, description="劇本名稱"),
                 "date":   types.Schema(type=types.Type.STRING, description="揪團日期 YYYY-MM-DD"),
                 "time":   types.Schema(type=types.Type.STRING, description="揪團時間 HH:MM。使用者沒提時間就留空字串，不要自己填預設值。"),
-                "max":    types.Schema(type=types.Type.INTEGER, description="人數上限。如果使用者有列編號（例如『1. 2. 3.』或『1.2.3.4.』）表示要幾個人就填幾（3 個編號=3 人）；若用『找X人/需X人/X缺/差X位』等描述也照數字填；完全沒提才用預設 6。"),
+                "max":    types.Schema(type=types.Type.INTEGER, description="人數上限。如果使用者有列編號（例如『1. 2. 3.』或『1.2.3.4.』）表示要幾個人就填幾（3 個編號=3 人）；若用『找X人/需X人/X缺/差X位』等描述也照數字填；完全沒提才用預設 6。若使用者給範圍（例如『6~8人』『6到8』『6人起最多8』），max 填上限（8）。"),
+                "min":    types.Schema(type=types.Type.INTEGER, description="成團門檻人數（達此人數即自動成團，但仍可繼續加人到 max）。僅在使用者給範圍（如『6~8』『6到8』『6人起最多8』）時填，填下限（6）。沒給範圍就不要填這個欄位。"),
             },
             required=["script", "date"],
         ),
@@ -1424,16 +1443,23 @@ def execute_group_function(name, args, group_id, pending, uid=None):
             date   = (args.get('date') or '').strip()
             time_s = (args.get('time') or '').strip()
             max_p  = int(args.get('max') or 6)
+            min_raw = args.get('min')
+            min_p = int(min_raw) if min_raw else max_p
+            if min_p > max_p:
+                min_p = max_p
+            if min_p < 1:
+                min_p = max_p
             if not script or not date:
                 return {"ok": False, "error": "缺少劇本名稱或日期"}
-            row_num, ev = create_group_event_row(group_id, script, date, time_s, max_p)
+            row_num, ev = create_group_event_row(group_id, script, date, time_s, max_p, min_p)
             if not ev:
                 return {"ok": False, "error": "建立失敗"}
             pending['signup'] = {'row_num': row_num, 'event': ev}
+            cap_desc = f"{min_p}~{max_p} 人（滿 {min_p} 即成團，可加至 {max_p}）" if min_p != max_p else f"{max_p} 人"
             if time_s:
-                msg = f"揪團令已發出，《{script}》{_short_date(date)} {time_s}，本總裁需要 {max_p} 人，速去報名。"
+                msg = f"揪團令已發出，《{script}》{_short_date(date)} {time_s}，本總裁需要 {cap_desc}，速去報名。"
             else:
-                msg = f"揪團令已發出，《{script}》{_short_date(date)} 吉時未定，本總裁需要 {max_p} 人，速去報名。時辰何時？速稟本總裁。"
+                msg = f"揪團令已發出，《{script}》{_short_date(date)} 吉時未定，本總裁需要 {cap_desc}，速去報名。時辰何時？速稟本總裁。"
             return {"ok": True, "message": msg}
 
         if name == 'list_active_teams':
@@ -1443,7 +1469,14 @@ def execute_group_function(name, args, group_id, pending, uid=None):
                 "teams": [
                     {
                         "script": e['script'], "date": e['date'], "time": e['time'],
-                        "status": "已成團" if e['status'] == 'full' else f"招募中 {len(e['participants'])}/{e['max']}",
+                        "status": (
+                            "已成團(滿)" if e['status'] == 'full'
+                            else (f"已成團(可加) {len(e['participants'])}/{e.get('min', e['max'])}~{e['max']}"
+                                  if e['status'] == 'confirmed'
+                                  else (f"招募中 {len(e['participants'])}/{e.get('min', e['max'])}~{e['max']}"
+                                        if e.get('min', e['max']) != e['max']
+                                        else f"招募中 {len(e['participants'])}/{e['max']}"))
+                        ),
                         "participants": [p['name'] for p in e['participants']],
                     } for e in evs
                 ],
@@ -1808,7 +1841,7 @@ def check_group_reminders():
             if len(row) < 7:
                 continue
             group_id, script, date, time_str, _, p_json, status = row[:7]
-            if status != 'full' or date != today:
+            if status not in ('full', 'confirmed') or date != today:
                 continue
             participants = json.loads(p_json) if p_json else []
             if not participants:
@@ -2061,18 +2094,33 @@ if group_handler:
                     name = get_member_name(gid, uid)
                     slot = len(ev['participants']) + 1
                     ev['participants'].append({'user_id': uid, 'name': name, 'slot': slot})
-                    if len(ev['participants']) >= ev['max']:
+                    min_p = ev.get('min', ev['max'])
+                    prev_status = ev['status']
+                    count_now = len(ev['participants'])
+                    if count_now >= ev['max']:
                         ev['status'] = 'full'
-                        bonus = f"名額已滿，本總裁宣布成團。{_short_date(ev['date'])} {ev['time']}，《{ev['script']}》，一個都不許遲到。"
+                    elif count_now >= min_p:
+                        ev['status'] = 'confirmed'
+                    bonus = None
+                    time_disp = ev['time'] if ev['time'] else "吉時未定"
+                    if prev_status == 'open' and ev['status'] in ('confirmed', 'full'):
+                        if ev['status'] == 'full':
+                            bonus = f"名額已滿，本總裁宣布成團。{_short_date(ev['date'])} {time_disp}，《{ev['script']}》，一個都不許遲到。"
+                        else:
+                            bonus = f"人數已達 {min_p}，本總裁宣布成團。{_short_date(ev['date'])} {time_disp}，《{ev['script']}》，欲加入者速來，至多再收 {ev['max'] - count_now} 人。"
+                        if ev['time']:
+                            try:
+                                start = f"{ev['date']}T{ev['time']}:00"
+                                end_h = int(ev['time'].split(':')[0]) + 3
+                                end   = f"{ev['date']}T{end_h:02d}:{ev['time'].split(':')[1]}:00"
+                                desc  = "參加者：" + "、".join([p['name'] for p in ev['participants']])
+                                add_calendar_event(f"測本｜{ev['script']}", start, end, desc)
+                            except Exception as e:
+                                print(f"[group] 建立行事曆失敗：{e}")
+                    elif prev_status == 'confirmed' and ev['status'] == 'full':
+                        bonus = f"名額已滿，本總裁封團。{_short_date(ev['date'])} {time_disp}，《{ev['script']}》，一個都不許遲到。"
+                    if bonus:
                         send_signup_sheet(gid, ev, row_num, reply_token=rtoken, extra_text=bonus)
-                        try:
-                            start = f"{ev['date']}T{ev['time']}:00"
-                            end_h = int(ev['time'].split(':')[0]) + 3
-                            end   = f"{ev['date']}T{end_h:02d}:{ev['time'].split(':')[1]}:00"
-                            desc  = "參加者：" + "、".join([p['name'] for p in ev['participants']])
-                            add_calendar_event(f"測本｜{ev['script']}", start, end, desc)
-                        except Exception as e:
-                            print(f"[group] 建立行事曆失敗：{e}")
                     else:
                         send_signup_sheet(gid, ev, row_num, reply_token=rtoken)
                     return
@@ -2083,12 +2131,24 @@ if group_handler:
                     if not p:
                         group_reply(rtoken, "名冊上沒有你，取消什麼。")
                         return
-                    was_full = ev['status'] == 'full'
+                    prev_status = ev['status']
                     ev['participants'].remove(p)
                     for i, participant in enumerate(ev['participants'], 1):
                         participant['slot'] = i
-                    ev['status'] = 'open'
-                    prefix = f"{p['name']} 臨陣脫逃，名冊空出一位，本總裁允許補位。\n\n" if was_full else ""
+                    min_p = ev.get('min', ev['max'])
+                    count_now = len(ev['participants'])
+                    if count_now >= ev['max']:
+                        ev['status'] = 'full'
+                    elif count_now >= min_p:
+                        ev['status'] = 'confirmed'
+                    else:
+                        ev['status'] = 'open'
+                    if prev_status == 'full':
+                        prefix = f"{p['name']} 臨陣脫逃，名冊空出一位，本總裁允許補位。\n\n"
+                    elif prev_status == 'confirmed' and ev['status'] == 'open':
+                        prefix = f"{p['name']} 臨陣脫逃，成團破局，重新招募。\n\n"
+                    else:
+                        prefix = ""
                     send_signup_sheet(gid, ev, row_num, extra_prefix=prefix, reply_token=rtoken)
                     return
 
