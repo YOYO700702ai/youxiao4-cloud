@@ -1287,14 +1287,15 @@ def format_signup_sheet(event):
     if event['status'] == 'full':
         footer = "本總裁已宣布成團，名額已滿，諸位準備好。"
     elif event['status'] == 'confirmed':
-        footer = f"本總裁已宣布成團（尚可加至 {event['max']} 人）。⬆ 引用本訊息回覆「+」報名｜「-」取消個人｜「取消揪團」整團取消"
+        footer = f"本總裁已宣布成團（尚可加至 {event['max']} 人）。"
     else:
-        footer = "⬆ 引用本訊息回覆「+」報名｜「-」取消個人｜「取消揪團」整團取消"
-    return (
+        footer = ""
+    body = (
         f"📋 揪團令 ｜ {date_disp} {time_disp}\n"
         f"劇本：{event['script']} ｜ {count}/{cap_disp} 人\n"
-        f"{roster}\n\n{footer}"
+        f"{roster}"
     )
+    return body + (f"\n\n{footer}" if footer else "")
 
 def find_active_event_by_script(group_id, script, date=None):
     """依劇本名（模糊比對）找該群組進行中的團；多團時 date 用來消歧義。回傳 (row_num, event) 或 (None, None/錯誤訊息)"""
