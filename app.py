@@ -1276,16 +1276,14 @@ def _short_date(date_str):
     return date_str
 
 def format_signup_sheet(event):
-    participants = event['participants']
+    participants = sorted(event['participants'], key=lambda x: x['slot'])
     count = len(participants)
-    slots = []
-    for i in range(1, event['max'] + 1):
-        p = next((x for x in participants if x['slot'] == i), None)
-        slots.append(f"{i}. {'✅ ' + p['name'] if p else '（空缺）'}")
     date_disp = _short_date(event['date'])
     time_disp = event['time'] if event['time'] else "吉時未定"
     min_p = event.get('min', event['max'])
     cap_disp = f"{min_p}~{event['max']}" if min_p != event['max'] else f"{event['max']}"
+    names = "、".join(p['name'] for p in participants) if participants else "（尚無人報名）"
+    roster = f"人數{count}人：{names}"
     if event['status'] == 'full':
         footer = "本總裁已宣布成團，名額已滿，諸位準備好。"
     elif event['status'] == 'confirmed':
@@ -1294,9 +1292,8 @@ def format_signup_sheet(event):
         footer = "⬆ 引用本訊息回覆「+」報名｜「-」取消個人｜「取消揪團」整團取消"
     return (
         f"📋 揪團令 ｜ {date_disp} {time_disp}\n"
-        f"劇本：{event['script']} ｜ {count}/{cap_disp} 人\n\n"
-        + '\n'.join(slots)
-        + f"\n\n{footer}"
+        f"劇本：{event['script']} ｜ {count}/{cap_disp} 人\n"
+        f"{roster}\n\n{footer}"
     )
 
 def find_active_event_by_script(group_id, script, date=None):
