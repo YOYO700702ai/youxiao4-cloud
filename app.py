@@ -1299,6 +1299,31 @@ def format_signup_sheet(event):
         + f"\n\n{footer}"
     )
 
+def find_active_event_by_script(group_id, script, date=None):
+    """依劇本名（模糊比對）找該群組進行中的團；多團時 date 用來消歧義。回傳 (row_num, event) 或 (None, None/錯誤訊息)"""
+    try:
+        ws = get_sheet('group_events')
+        rows = ws.get_all_values()
+        script_n = script.strip().replace('《','').replace('》','')
+        matched = []
+        for i, row in enumerate(rows):
+            if len(row) < 7 or row[0] != group_id or row[6] not in ('open', 'confirmed', 'full'):
+                continue
+            row_script = row[1].replace('《','').replace('》','')
+            if script_n in row_script or row_script in script_n:
+                if date and row[2] != date:
+                    continue
+                matched.append((i + 1, _row_to_event(row)))
+        if not matched:
+            return None, "找不到進行中的團"
+        if len(matched) > 1:
+            dates = "、".join(e['date'] for _, e in matched)
+            return None, f"有多團《{script}》（{dates}），請加上日期指定"
+        return matched[0]
+    except Exception as e:
+        print(f"[group] find_active_event_by_script 失敗：{e}")
+        return None, "查詢失敗"
+
 def load_active_events(group_id):
     """回傳這個群組所有 open/full 的揪團（依時間排序），供 AI 查詢團況"""
     try:
@@ -1350,6 +1375,26 @@ GROUP_FUNC_DECLS = [
                 "min":    types.Schema(type=types.Type.INTEGER, description="成團門檻人數（達此人數即自動成團，但仍可繼續加人到 max）。僅在使用者給範圍（如『6~8』『6到8』『6人起最多8』）時填，填下限（6）。沒給範圍就不要填這個欄位。"),
             },
             required=["script", "date"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="update_team",
+        description=(
+            "修改群組內既有的揪團資訊（時間、日期、人數範圍）。"
+            "使用者說『XX那團時間定了/改到X點』『改日期』『加到X人』『改成X~X人』等時呼叫。"
+            "至少提供一個 new_* 欄位。民國年請換算成西元年（+1911）。"
+        ),
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "script":    types.Schema(type=types.Type.STRING, description="要修改的劇本名稱（必填，用來找到是哪一團）"),
+                "date":      types.Schema(type=types.Type.STRING, description="若群組內同劇本有多團，用原日期 YYYY-MM-DD 指定是哪一團；只有一團就不用填"),
+                "new_time":  types.Schema(type=types.Type.STRING, description="新時間 HH:MM，格式必須為 24 小時制。『下午兩點』=14:00、『晚上七點』=19:00"),
+                "new_date":  types.Schema(type=types.Type.STRING, description="新日期 YYYY-MM-DD"),
+                "new_max":   types.Schema(type=types.Type.INTEGER, description="新的人數上限"),
+                "new_min":   types.Schema(type=types.Type.INTEGER, description="新的成團門檻。如果要取消彈性（固定人數），把 new_min 和 new_max 設成一樣"),
+            },
+            required=["script"],
         ),
     ),
     types.FunctionDeclaration(
@@ -1438,6 +1483,47 @@ def reset_group_tool_session(group_id):
 def execute_group_function(name, args, group_id, pending, uid=None):
     """執行工具；pending 是 mutable dict，用來收集需要後續處理的副作用（例如新建立的揪團）"""
     try:
+        if name == 'update_team':
+            script = (args.get('script') or '').strip()
+            if not script:
+                return {"ok": False, "error": "缺少劇本名稱"}
+            date_filter = (args.get('date') or '').strip() or None
+            row_num, ev_or_err = find_active_event_by_script(group_id, script, date_filter)
+            if not row_num:
+                return {"ok": False, "error": ev_or_err}
+            ev = ev_or_err
+            changes = []
+            new_time = (args.get('new_time') or '').strip()
+            new_date = (args.get('new_date') or '').strip()
+            new_max  = args.get('new_max')
+            new_min  = args.get('new_min')
+            if new_time:
+                ev['time'] = new_time
+                changes.append(f"時辰 → {new_time}")
+            if new_date:
+                ev['date'] = new_date
+                changes.append(f"日期 → {_short_date(new_date)}")
+            if new_max is not None:
+                ev['max'] = int(new_max)
+                changes.append(f"上限 → {ev['max']}")
+            if new_min is not None:
+                ev['min'] = int(new_min)
+                changes.append(f"成團門檻 → {ev['min']}")
+            if not changes:
+                return {"ok": False, "error": "沒有提供任何要修改的欄位"}
+            if ev.get('min', ev['max']) > ev['max']:
+                ev['min'] = ev['max']
+            count_now = len(ev['participants'])
+            min_p = ev.get('min', ev['max'])
+            if count_now >= ev['max']:
+                ev['status'] = 'full'
+            elif count_now >= min_p:
+                ev['status'] = 'confirmed'
+            else:
+                ev['status'] = 'open'
+            save_group_event(row_num, ev)
+            return {"ok": True, "message": f"《{ev['script']}》已更新：" + "、".join(changes) + "。本總裁已登記在案。"}
+
         if name == 'create_team':
             script = (args.get('script') or '').strip()
             date   = (args.get('date') or '').strip()
