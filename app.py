@@ -1279,9 +1279,10 @@ def format_signup_sheet(event):
         p = next((x for x in participants if x['slot'] == i), None)
         slots.append(f"{i}. {'✅ ' + p['name'] if p else '（空缺）'}")
     date_disp = _short_date(event['date'])
+    time_disp = event['time'] if event['time'] else "吉時未定"
     footer = "本總裁已宣布成團，諸位準備好。" if event['status'] == 'full' else "⬆ 引用本訊息回覆「+」報名｜「-」取消個人｜「取消揪團」整團取消"
     return (
-        f"📋 揪團令 ｜ {date_disp} {event['time']}\n"
+        f"📋 揪團令 ｜ {date_disp} {time_disp}\n"
         f"劇本：{event['script']} ｜ {count}/{event['max']} 人\n\n"
         + '\n'.join(slots)
         + f"\n\n{footer}"
@@ -1309,7 +1310,8 @@ def format_active_events_for_ai(events):
     for e in events:
         names = "、".join([p['name'] for p in e['participants']]) or "（還沒人報名）"
         status_tag = "已成團" if e['status'] == 'full' else f"招募中 {len(e['participants'])}/{e['max']}"
-        lines.append(f"- {e['date']} {e['time']}《{e['script']}》[{status_tag}]：{names}")
+        time_disp = e['time'] if e['time'] else "吉時未定"
+        lines.append(f"- {e['date']} {time_disp}《{e['script']}》[{status_tag}]：{names}")
     return "【目前進行中的揪團】\n" + "\n".join(lines) + "\n\n"
 
 # ── 群組 Bot Function Calling 工具 ──────────────────────────
@@ -1325,7 +1327,7 @@ GROUP_FUNC_DECLS = [
             properties={
                 "script": types.Schema(type=types.Type.STRING, description="劇本名稱"),
                 "date":   types.Schema(type=types.Type.STRING, description="揪團日期 YYYY-MM-DD"),
-                "time":   types.Schema(type=types.Type.STRING, description="揪團時間 HH:MM，未指定用 10:00"),
+                "time":   types.Schema(type=types.Type.STRING, description="揪團時間 HH:MM。使用者沒提時間就留空字串，不要自己填預設值。"),
                 "max":    types.Schema(type=types.Type.INTEGER, description="人數上限。如果使用者有列編號（例如『1. 2. 3.』或『1.2.3.4.』）表示要幾個人就填幾（3 個編號=3 人）；若用『找X人/需X人/X缺/差X位』等描述也照數字填；完全沒提才用預設 6。"),
             },
             required=["script", "date"],
@@ -1420,7 +1422,7 @@ def execute_group_function(name, args, group_id, pending, uid=None):
         if name == 'create_team':
             script = (args.get('script') or '').strip()
             date   = (args.get('date') or '').strip()
-            time_s = (args.get('time') or '10:00').strip()
+            time_s = (args.get('time') or '').strip()
             max_p  = int(args.get('max') or 6)
             if not script or not date:
                 return {"ok": False, "error": "缺少劇本名稱或日期"}
@@ -1428,7 +1430,11 @@ def execute_group_function(name, args, group_id, pending, uid=None):
             if not ev:
                 return {"ok": False, "error": "建立失敗"}
             pending['signup'] = {'row_num': row_num, 'event': ev}
-            return {"ok": True, "message": f"揪團令已發出，《{script}》{_short_date(date)} {time_s}，本總裁需要 {max_p} 人，速去報名。"}
+            if time_s:
+                msg = f"揪團令已發出，《{script}》{_short_date(date)} {time_s}，本總裁需要 {max_p} 人，速去報名。"
+            else:
+                msg = f"揪團令已發出，《{script}》{_short_date(date)} 吉時未定，本總裁需要 {max_p} 人，速去報名。時辰何時？速稟本總裁。"
+            return {"ok": True, "message": msg}
 
         if name == 'list_active_teams':
             evs = load_active_events(group_id)
