@@ -2249,9 +2249,15 @@ if group_handler:
 
         # ── 被 @（或 reply Bot）：Function Calling，讓 AI 自己決定要建團/查團/聊天 ──
         if bot_mentioned:
-            # 若使用者最近 5 分鐘傳過圖，走視覺路線（不用 function calling）
+            # 工具意圖關鍵字：使用者明顯要動作（換封面/上架/揪團）→ 直接走 function calling，
+            # 不要被「最近有傳圖→走視覺路線」攔截，否則 AI 看不到工具就會嘴砲說「處理了」。
+            TOOL_INTENT_WORDS = ['換封面', '換圖', '換掉', '封面圖', '重新上傳', '上架', '揪團', '組團', '取消揪', '改時間', '改日期', '改人數']
+            has_tool_intent = any(w in msg for w in TOOL_INTENT_WORDS)
+            print(f"[group] bot_mentioned=True, tool_intent={has_tool_intent}, has_pending_img={(gid, uid) in pending_group_image}")
+
+            # 若使用者最近 5 分鐘傳過圖、且沒有明顯工具意圖 → 走視覺路線（看圖聊天，不用 function calling）
             img_entry = pending_group_image.get((gid, uid))
-            if img_entry and (time.time() - img_entry[1]) < 300:
+            if img_entry and (time.time() - img_entry[1]) < 300 and not has_tool_intent:
                 try:
                     with ApiClient(group_configuration) as api_client:
                         img_bytes = MessagingApiBlob(api_client).get_message_content(img_entry[0])
