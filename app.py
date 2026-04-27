@@ -2046,8 +2046,8 @@ if group_handler:
         else:
             print(f"[group] 沒有待上架資料（script_entry={script_entry is not None}）")
 
-        # ── 5% 機率看圖主動插嘴 ──
-        if random.random() < 0.05:
+        # ── 2% 機率看圖主動插嘴 ──
+        if random.random() < 0.02:
             try:
                 with ApiClient(group_configuration) as api_client:
                     img_bytes = MessagingApiBlob(api_client).get_message_content(event.message.id)
@@ -2349,8 +2349,8 @@ if group_handler:
                 save_group_event(signup_info['row_num'], ev)
             return
 
-        # ── 5% 機率主動插嘴 ──
-        if random.random() < 0.05:
+        # ── 2% 機率主動插嘴 ──
+        if random.random() < 0.02:
             reply = group_chat_ai(msg, history=log, group_id=gid, speaker_uid=uid, speaker_name=sender_name)
             group_reply(rtoken, reply)
 
