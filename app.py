@@ -6,6 +6,7 @@ from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi, MessagingApiBlob,
     ReplyMessageRequest, PushMessageRequest, TextMessage,
     TextMessageV2, MentionSubstitutionObject, UserMentionTarget,
+    ImageMessage,
 )
 from apscheduler.schedulers.background import BackgroundScheduler
 import os, json, re, time, datetime, threading, random
@@ -1809,6 +1810,125 @@ def compress_group_memory():
 
 scheduler.add_job(compress_group_memory, 'cron', hour=3, minute=0, timezone='Asia/Taipei')
 
+# ── 抽卡系統 ─────────────────────────────────────────────────────────
+# 卡片 URL 在圖檔上傳後填入。格式：{'url': 'https://...', 'filename': 'xxx.jpg'}
+CARD_REGISTRY = {
+    'R':   [],   # 15 張，上傳後填入
+    'SR':  [],   # 10 張，上傳後填入
+    'SSR': [],   #  5 張，上傳後填入
+}
+GACHA_RATES   = [('R', 0.70), ('SR', 0.25), ('SSR', 0.05)]
+GACHA_TEXT    = {
+    'R': [
+        "哼，本總裁的日常快照，已是俗世難求的福氣。珍惜。",
+        "算你有緣，本總裁的私照不是人人可得的。",
+        "收好，別聲張。本總裁不習慣被圍觀。",
+    ],
+    'SR': [
+        "本總裁今日心情尚可，特賜此照。好好感恩，莫要辜負。",
+        "不錯的手氣。本總裁的稀有影像，值得你供起來。",
+        "識相。這張是本總裁難得留下的影像，好生珍藏。",
+    ],
+    'SSR': [
+        "……你的運氣好得本總裁都覺得意外。此乃珍藏，輕易不示人，汝算是撞了大運。",
+        "本總裁的傳說級私照現世，天地為之動容。你——承受得住嗎？",
+        "罷了，看你誠心，本總裁破例一次。這張照片，價值連城，你欠本總裁一個人情。",
+    ],
+}
+GACHA_COOLDOWN_TEXT = [
+    "今日恩賜已賞，明早六時方可再求。別在這耗著，本總裁的私照不是大白菜。",
+    "本總裁今日的恩典已被人截胡。明早六點，準時來搶。",
+    "晚了。今日份已被人得去，明早六時重置，早點來。",
+]
+GACHA_EMPTY_TEXT = "本總裁的收藏尚未入庫，稍安勿躁。"
+
+gacha_lock = threading.Lock()
+
+def get_gacha_date():
+    """每天 06:00 重置，00:00~05:59 算前一天。"""
+    now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
+    if now.hour < 6:
+        return (now - datetime.timedelta(days=1)).strftime('%Y-%m-%d')
+    return now.strftime('%Y-%m-%d')
+
+def check_gacha_drawn(group_id):
+    """回傳今天這個群組是否已抽過。"""
+    try:
+        ws = get_sheet('gacha_log')
+        rows = ws.get_all_values()
+        today = get_gacha_date()
+        for row in rows[1:]:  # 跳過標題列
+            if len(row) >= 2 and row[0] == today and row[1] == group_id:
+                return True
+        return False
+    except Exception as e:
+        print(f"[gacha] check_gacha_drawn 失敗：{e}")
+        return False
+
+def mark_gacha_drawn(group_id, rarity, card_filename, drawer_uid):
+    """寫一筆抽卡記錄到 gacha_log sheet。"""
+    try:
+        ws = get_sheet('gacha_log')
+        if ws.row_count == 0 or ws.cell(1, 1).value != '日期':
+            ws.insert_row(['日期', '群組', '稀有度', '卡片', '抽卡者', '時間'], 1)
+        now_str = datetime.datetime.now(
+            datetime.timezone(datetime.timedelta(hours=8))
+        ).strftime('%Y-%m-%d %H:%M:%S')
+        ws.append_row([get_gacha_date(), group_id, rarity, card_filename, drawer_uid, now_str])
+    except Exception as e:
+        print(f"[gacha] mark_gacha_drawn 失敗：{e}")
+
+def do_gacha(gid, uid, rtoken):
+    """抽卡主流程。"""
+    with gacha_lock:
+        if check_gacha_drawn(gid):
+            group_reply(rtoken, random.choice(GACHA_COOLDOWN_TEXT))
+            return
+
+        # 所有稀有度都確認有卡才繼續
+        if not any(CARD_REGISTRY.values()):
+            group_reply(rtoken, GACHA_EMPTY_TEXT)
+            return
+
+        # 依機率決定稀有度（若該稀有度無卡則往下降）
+        rand = random.random()
+        cumulative = 0.0
+        chosen_rarity = 'R'
+        for rarity, rate in GACHA_RATES:
+            cumulative += rate
+            if rand <= cumulative and CARD_REGISTRY.get(rarity):
+                chosen_rarity = rarity
+                break
+        # fallback：選第一個有卡的稀有度
+        if not CARD_REGISTRY.get(chosen_rarity):
+            for rarity, _ in GACHA_RATES:
+                if CARD_REGISTRY.get(rarity):
+                    chosen_rarity = rarity
+                    break
+
+        card = random.choice(CARD_REGISTRY[chosen_rarity])
+        flavor = random.choice(GACHA_TEXT[chosen_rarity])
+        mark_gacha_drawn(gid, chosen_rarity, card['filename'], uid)
+        print(f"[gacha] gid={gid} uid={uid} rarity={chosen_rarity} card={card['filename']}")
+
+    try:
+        with ApiClient(group_configuration) as api_client:
+            MessagingApi(api_client).reply_message(
+                ReplyMessageRequest(
+                    reply_token=rtoken,
+                    messages=[
+                        ImageMessage(
+                            original_content_url=card['url'],
+                            preview_image_url=card['url'],
+                        ),
+                        TextMessage(text=f"【{chosen_rarity}】{flavor}"),
+                    ]
+                )
+            )
+    except Exception as e:
+        print(f"[gacha] 傳送失敗：{e}")
+
+# ─────────────────────────────────────────────────────────────────────
 MASHA_PERSONA = """你是陸傲天，自稱「本總裁」或「我」，以繁體中文回覆。
 稱呼別人時，直接使用他們的 LINE 顯示名稱原樣稱呼（不管中文或英文都照原樣，不要翻譯、不要改寫）。
 
@@ -2178,6 +2298,11 @@ if group_handler:
         BOT_TRIGGER_WORDS = ['陸傲天', '傲天', '陸總', '小六', '小6', '小陸']
         if not bot_mentioned and any(w in msg for w in BOT_TRIGGER_WORDS):
             bot_mentioned = True
+
+        # ── 抽卡指令（在 AI 之前攔截，節省 token）──
+        if bot_mentioned and any(w in msg for w in ['抽卡', '抽張卡', '抽一張']):
+            do_gacha(gid, uid, rtoken)
+            return
 
         # ── 揪團指令（+ / - / 取消揪團）必須是「回覆」揪團公告 ──
         if msg in ('+', '-', '取消揪團'):
