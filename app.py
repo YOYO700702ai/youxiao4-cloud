@@ -1811,11 +1811,52 @@ def compress_group_memory():
 scheduler.add_job(compress_group_memory, 'cron', hour=3, minute=0, timezone='Asia/Taipei')
 
 # ── 抽卡系統 ─────────────────────────────────────────────────────────
-# 卡片 URL 在圖檔上傳後填入。格式：{'url': 'https://...', 'filename': 'xxx.jpg'}
+import urllib.parse
+
+def _build_card(filename, quote):
+    return {
+        "filename": filename,
+        "url": "https://raw.githubusercontent.com/YOYO700702ai/youxiao4-cloud/main/" + urllib.parse.quote(f"傲天卡/{filename}"),
+        "quote": quote
+    }
+
 CARD_REGISTRY = {
-    'R':   [],   # 15 張，上傳後填入
-    'SR':  [],   # 10 張，上傳後填入
-    'SSR': [],   #  5 張，上傳後填入
+    'R': [
+        _build_card("早安總裁_R.png", "「一早就能看到本總裁穿睡袍的樣子，你該去買彩券了。」"),
+        _build_card("黑卡降臨_R.png", "「拿去刷，密碼是你生日。別問為什麼，本總裁樂意。」"),
+        _build_card("鐵律重訓_R.png", "「連舉鐵的毅力都沒有，怎麼舉起本總裁對你的愛？」"),
+        _build_card("廣場舞危機_R.png", "「本總裁的舞步，連大媽都為之瘋狂。還不快給我鼓掌？」"),
+        _build_card("LINE群巡邏_R.png", "「誰敢在群裡潛水？本總裁的眼線遍佈全網，最好給我乖乖說話。」"),
+        _build_card("胃痛但不說_R.png", "「嘶……本總裁這不是胃痛，是被你氣出來的內傷。還不快倒水？」"),
+        _build_card("不准熬夜_R.png", "「現在幾點了還不睡？黑眼圈要是掉到地上，本總裁可不幫你撿。」"),
+        _build_card("黑卡貓糧_R.png", "「這些流浪貓算運氣好，遇上本總裁。要是你，我可沒這麼好說話。」"),
+        _build_card("劇本殺點名_R.png", "「還沒到的傢伙，是不是想被本總裁封殺？給我五分鐘內出現！」"),
+        _build_card("萌犬包圍令_R.png", "「看什麼看？連狗都知道本總裁魅力無法擋，你還愣著幹嘛？」"),
+        _build_card("深蹲監工_R.png", "「再蹲低一點！本總裁的時間很寶貴，沒空看你在這偷懶。」"),
+        _build_card("菜市場併購案_R.png", "「這把青菜多少錢？算了，本總裁把整條街都買下來送你。」"),
+        _build_card("總裁的外套_R.png", "「披上！敢在本總裁面前發抖，是嫌我暖氣開得不夠強嗎？」"),
+        _build_card("晨跑巡城_R.png", "「本總裁這不叫晨跑，叫巡視領地。你要不要一起？」"),
+        _build_card("雞胸肉審判_R.png", "「炸雞？可笑。在本總裁的健康標準前，這些垃圾食物都得判死刑。」"),
+        _build_card("2500ml命令_R.png", "「喝水！今天沒喝夠 2500ml，本總裁親自拿水桶灌你。」"),
+        _build_card("垃圾食物退散_R.png", "「拿走你的珍奶和洋芋片！本總裁的結實腹肌，可不是靠這些玩意兒養出來的。」"),
+    ],
+    'SR': [
+        _build_card("武俠霸總_SR.png", "「本總裁就算拿著摺扇，也能扇走你所有的貧窮。」"),
+        _build_card("末日揪團令_SR.png", "「世界末日又怎樣？本總裁揪的團，喪屍也得給我乖乖繳報名費！」"),
+        _build_card("偵探陸總_SR.png", "「真相只有一個，那就是——你這輩子都別想逃出本總裁的手心。」"),
+        _build_card("密室總裁_SR.png", "「這點破謎題也想困住我？密室的門要是再不開，我就把它買下來拆了。」"),
+        _build_card("吸血總裁_SR.png", "「本總裁不吸血，只吸乾你的注意力。過來，讓我咬一口。」"),
+        _build_card("總裁料理課_SR.png", "「本總裁親自下廚，就算是一塊生雞胸肉，你也得給我笑著吃完！」"),
+        _build_card("暴雨車門_SR.png", "「別看了，快上車！難道要本總裁陪你在這淋雨感冒嗎？」"),
+        _build_card("太空董事會_SR.png", "「就算開會開到外太空，本總裁的決策依然是宇宙真理。」"),
+        _build_card("黑幫劇本夜_SR.png", "「這局我梭哈了。連你，本總裁也要一併贏走。」"),
+        _build_card("魔法契約書_SR.png", "「別管什麼魔法了，只要簽下你的名字，你就是本總裁的人了。」"),
+    ],
+    'SSR': [
+        _build_card("暗夜守護者_SSR.png", "「夜幕降臨，本總裁就是這座城市的王。而你，是我的專屬寶物。」"),
+        _build_card("異界百團契約_SSR.png", "「簽下這份契約，哪怕是異世界，本總裁也能為你包下所有的團！」"),
+        _build_card("白馬傲天_SSR.png", "「騎白馬的不一定是王子，更可能是要來帶你私奔的霸道總裁。」"),
+    ]
 }
 GACHA_RATES   = [('R', 0.70), ('SR', 0.25), ('SSR', 0.05)]
 GACHA_TEXT    = {
@@ -1907,7 +1948,7 @@ def do_gacha(gid, uid, rtoken):
                     break
 
         card = random.choice(CARD_REGISTRY[chosen_rarity])
-        flavor = random.choice(GACHA_TEXT[chosen_rarity])
+        flavor = card.get('quote', random.choice(GACHA_TEXT[chosen_rarity]))
         mark_gacha_drawn(gid, chosen_rarity, card['filename'], uid)
         print(f"[gacha] gid={gid} uid={uid} rarity={chosen_rarity} card={card['filename']}")
 
