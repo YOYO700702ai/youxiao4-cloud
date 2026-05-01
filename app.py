@@ -2341,9 +2341,15 @@ if group_handler:
             bot_mentioned = True
 
         # ── 抽卡指令（在 AI 之前攔截，節省 token）──
-        if bot_mentioned and any(w in msg for w in ['抽卡', '抽張卡', '抽一張']):
-            do_gacha(gid, uid, rtoken)
-            return
+        # 嚴格觸發：訊息結尾是抽卡關鍵字 且 訊息要短（≤ 12 字），避免聊抽卡誤觸
+        GACHA_WORDS = ('抽卡', '抽張卡', '抽一張')
+        if bot_mentioned and any(w in msg for w in GACHA_WORDS):
+            msg_clean = msg.rstrip('！!?？.。 \n\t')
+            ends_with_gacha = msg_clean.endswith(GACHA_WORDS)
+            is_short = len(msg) <= 12
+            if ends_with_gacha and is_short:
+                do_gacha(gid, uid, rtoken)
+                return
 
         # ── 揪團指令（+ / - / 取消揪團）必須是「回覆」揪團公告 ──
         if msg in ('+', '-', '取消揪團'):
