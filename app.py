@@ -906,17 +906,25 @@ def ask_ai_with_tools(user_msg, uid=None):
         ]
         if not func_calls:
             return response.text.strip()
-        result_parts = [
-            types.Part.from_function_response(
+        result_parts = []
+        for fc in func_calls:
+            res = execute_function(fc.name, dict(fc.args), uid)
+            print(f"[TOOL RESULT] {fc.name} -> {str(res)[:300]}")
+            result_parts.append(types.Part.from_function_response(
                 name=fc.name,
-                response={"result": execute_function(fc.name, dict(fc.args), uid)}
-            )
-            for fc in func_calls
-        ]
-        try:
-            response = tool_chat_session.send_message(result_parts)
-        except Exception as e:
-            print(f"[ERROR] 工具回傳失敗：{e}")
+                response={"result": res}
+            ))
+        sent = False
+        for attempt in range(3):
+            try:
+                response = tool_chat_session.send_message(result_parts)
+                sent = True
+                break
+            except Exception as e:
+                print(f"[ERROR] 工具回傳失敗（第{attempt+1}次）：{e}")
+                if attempt < 2:
+                    time.sleep(4 * (attempt + 1))
+        if not sent:
             tool_chat_session = new_tool_session()
             return "目前連不上，請稍後再試。"
     return response.text.strip()
