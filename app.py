@@ -197,6 +197,43 @@ def check_reminders():
     except Exception as e:
         print(f"check_reminders 錯誤：{e}")
 
+def list_reminders():
+    try:
+        ws = get_sheet('reminders')
+        rows = ws.get_all_values()
+        items = []
+        for i, row in enumerate(rows, start=1):
+            if len(row) < 4:
+                continue
+            if not row[1].strip() or ':' not in row[1]:
+                continue
+            status = '✅已發' if row[3] == 'True' else '⏳待發'
+            items.append(f"[{i}] {row[1]} {row[2]} （{status}）")
+        return "目前提醒清單：\n" + "\n".join(items) if items else "目前沒有任何提醒。"
+    except Exception as e:
+        return f"讀取失敗：{e}"
+
+def delete_reminder(keyword):
+    try:
+        ws = get_sheet('reminders')
+        rows = ws.get_all_values()
+        targets = []
+        for i, row in enumerate(rows, start=1):
+            if len(row) < 4:
+                continue
+            if not row[1].strip() or ':' not in row[1]:
+                continue
+            if keyword in row[2]:
+                targets.append((i, row[1], row[2]))
+        if not targets:
+            return f"找不到包含「{keyword}」的提醒。"
+        for i, _, _ in sorted(targets, key=lambda x: -x[0]):
+            ws.delete_rows(i)
+        deleted = "、".join(f"{t} {m}" for _, t, m in targets)
+        return f"已刪除 {len(targets)} 筆提醒：{deleted}"
+    except Exception as e:
+        return f"刪除失敗：{e}"
+
 # ── Google Calendar ───────────────────────────────────────
 def get_calendar_service():
     creds = Credentials.from_service_account_info(_creds_dict, scopes=SCOPES)
@@ -380,7 +417,7 @@ SYSTEM_PROMPT = (
     "【你的能力】\n"
     "- 爬網頁整理摘要（fetch_webpage）\n"
     "- 筆記管理（save_note / list_notes / delete_note）\n"
-    "- 定時提醒（set_reminder）\n"
+    "- 定時提醒（set_reminder / list_reminders / delete_reminder）\n"
     "- 記憶管理（add_memory_fact / show_memory）\n"
     "- Google 行事曆：新增、查詢、修改、刪除行程\n"
     "- Facebook 粉專發文（post_to_facebook）：草咩、一百分、BG\n"
@@ -505,6 +542,22 @@ FUNC_DECLS = [
                 "message": types.Schema(type=types.Type.STRING, description="提醒內容"),
             },
             required=["time", "message"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="list_reminders",
+        description="列出目前所有定時提醒（含待發與已發），用於查看或挑出要刪的目標",
+        parameters=types.Schema(type=types.Type.OBJECT, properties={}),
+    ),
+    types.FunctionDeclaration(
+        name="delete_reminder",
+        description="依關鍵字刪除提醒（會把提醒內容含此關鍵字的所有筆數整列刪除，待發已發都刪）",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "keyword": types.Schema(type=types.Type.STRING, description="提醒內容裡要比對的關鍵字，例如「手機保險」"),
+            },
+            required=["keyword"],
         ),
     ),
     types.FunctionDeclaration(
@@ -769,6 +822,10 @@ def execute_function(name, args, uid=None):
         return delete_note(int(args["idx"]))
     elif name == "set_reminder":
         return save_reminder(args["time"], args["message"])
+    elif name == "list_reminders":
+        return list_reminders()
+    elif name == "delete_reminder":
+        return delete_reminder(args["keyword"])
     elif name == "fetch_webpage":
         return fetch_url(args["url"])
     elif name == "search_web":
