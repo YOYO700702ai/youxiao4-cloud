@@ -337,7 +337,7 @@ def fetch_url(url):
         return f"抓取失敗：{e}"
 
 def fetch_ai5min_first():
-    """抓取 AI 五分鐘快報 (israynotarray.dev) 最新一篇的標題、發布日、完整內文"""
+    """抓取 AI 五分鐘快報 (israynotarray.dev) 最新一篇的：標題、發布日、目錄、30 秒看重點"""
     import xml.etree.ElementTree as ET
     from email.utils import parsedate_to_datetime
     try:
@@ -355,11 +355,37 @@ def fetch_ai5min_first():
             date_str = pub_date.astimezone(datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d")
         except Exception:
             date_str = ""
+
         page = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
         soup = BeautifulSoup(page.text, 'html.parser')
-        node = soup.select_one('.post-content') or soup.select_one('article.post-single') or soup.select_one('article')
-        content = node.get_text("\n", strip=True) if node else ""
-        return {"title": title, "url": url, "date": date_str, "content": content[:5000]}
+
+        # 目錄：抓 TableOfContents 裡所有連結文字
+        toc_lines = [f"- {a.get_text(strip=True)}" for a in soup.select('nav#TableOfContents a')]
+        toc_text = "\n".join(toc_lines)
+
+        # 30 秒看重點：找含「30 秒」的 h2，往後抓到下一個 h2 / hr
+        highlight_lines = []
+        target_h2 = None
+        for h2 in soup.select('.post-content h2'):
+            label = h2.get_text(strip=True).rstrip('#').strip()
+            if '30' in label and '秒' in label:
+                target_h2 = h2
+                break
+        if target_h2:
+            for sib in target_h2.next_siblings:
+                tag = getattr(sib, 'name', None)
+                if tag in ('h2', 'hr'):
+                    break
+                if tag == 'ul' or tag == 'ol':
+                    for li in sib.select('li'):
+                        highlight_lines.append(f"- {li.get_text(' ', strip=True)}")
+                elif tag:
+                    txt = sib.get_text(' ', strip=True)
+                    if txt:
+                        highlight_lines.append(txt)
+        highlights = "\n".join(highlight_lines)
+
+        return {"title": title, "url": url, "date": date_str, "toc": toc_text, "highlights": highlights}
     except Exception as e:
         print(f"[morning] AI5分鐘快報抓取失敗：{e}")
         return None
@@ -1010,17 +1036,19 @@ def morning_greeting():
     except Exception as e:
         print(f"[morning] AI郵報整理失敗：{e}")
 
-    # 抓 AI 五分鐘快報最新一篇（含完整內文）
+    # 抓 AI 五分鐘快報最新一篇（只取目錄與 30 秒看重點）
     ai5min_context = ""
     try:
         a = fetch_ai5min_first()
         if a:
             ai5min_context = (
-                f"\n\n以下是「AI 五分鐘快報」{a['date']} 的最新一篇完整內容，"
-                f"請依照以下格式整理後呈現給悠悠：\n"
+                f"\n\n以下是「AI 五分鐘快報」{a['date']} 的最新一篇，"
+                f"請照原樣呈現給悠悠（不要改寫、不要重新整理）：\n"
                 f"【AI 五分鐘快報 {a['date']}】\n"
-                f"標題照原樣寫出，內文用條列方式整理 5~8 個重點（不要逐字複述、要消化過再寫），最後附上原文網址。\n\n"
-                f"原始資料：\n標題：{a['title']}\n網址：{a['url']}\n內文：\n{a['content']}"
+                f"{a['title']}\n\n"
+                f"📑 目錄\n{a['toc']}\n\n"
+                f"⏱ 30 秒看重點\n{a['highlights']}\n\n"
+                f"🔗 {a['url']}"
             )
     except Exception as e:
         print(f"[morning] AI5分鐘快報整理失敗：{e}")
