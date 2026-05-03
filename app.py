@@ -2719,10 +2719,17 @@ if group_handler:
 
             pending = {}
             print(f"[group] 送訊息到 session：{user_turn[:50]}")
-            try:
-                response = session.send_message(user_turn)
-            except Exception as e:
-                print(f"[group] session.send_message 失敗，重建：{e}")
+            response = None
+            for attempt in range(3):
+                try:
+                    response = session.send_message(user_turn)
+                    break
+                except Exception as e:
+                    print(f"[group] session.send_message 失敗（第{attempt+1}次）：{e}")
+                    if attempt < 2:
+                        time.sleep(4 * (attempt + 1))
+            if response is None:
+                # 三次都失敗，重建 session 再試最後一次
                 try:
                     session = reset_group_tool_session(gid)
                     response = session.send_message(user_turn)
@@ -2740,17 +2747,25 @@ if group_handler:
                 ]
                 if not func_calls:
                     break
-                result_parts = [
-                    types.Part.from_function_response(
+                result_parts = []
+                for fc in func_calls:
+                    res = execute_group_function(fc.name, dict(fc.args), gid, pending, uid)
+                    print(f"[group] tool_result {fc.name} -> {str(res)[:300]}")
+                    result_parts.append(types.Part.from_function_response(
                         name=fc.name,
-                        response={"result": execute_group_function(fc.name, dict(fc.args), gid, pending, uid)}
-                    )
-                    for fc in func_calls
-                ]
-                try:
-                    response = session.send_message(result_parts)
-                except Exception as e:
-                    print(f"[group] 工具回傳失敗：{e}")
+                        response={"result": res}
+                    ))
+                sent = False
+                for attempt in range(3):
+                    try:
+                        response = session.send_message(result_parts)
+                        sent = True
+                        break
+                    except Exception as e:
+                        print(f"[group] 工具回傳失敗（第{attempt+1}次）：{e}")
+                        if attempt < 2:
+                            time.sleep(4 * (attempt + 1))
+                if not sent:
                     reset_group_tool_session(gid)
                     break
 
