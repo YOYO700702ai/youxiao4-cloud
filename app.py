@@ -411,24 +411,34 @@ def _fetch_rss_items(url, limit=8):
     return out
 
 def get_taiwan_today_news():
-    """取自由時報即時新聞前 8 則"""
+    """取自由時報即時新聞前 5 則（含原文連結）"""
     try:
-        items = _fetch_rss_items("https://news.ltn.com.tw/rss/all.xml", limit=8)
+        items = _fetch_rss_items("https://news.ltn.com.tw/rss/all.xml", limit=5)
         if not items:
             return "暫時抓不到新聞。"
         lines = [f"{i+1}. [{it['time']}] {it['title']}\n   🔗 {it['link']}" for i, it in enumerate(items)]
-        return "【今日台灣新聞 · 自由時報即時】\n" + "\n".join(lines)
+        return (
+            "【今日台灣新聞 · 自由時報即時】\n"
+            + "\n".join(lines)
+            + "\n\n（來源：自由時報 https://news.ltn.com.tw/）"
+            + "\n※ 必須完整保留每則新聞的 🔗 連結與最後的來源行，不可省略。"
+        )
     except Exception as e:
         return f"新聞抓取失敗：{e}"
 
 def get_taiwan_fun_news():
-    """取自由時報蒐奇前 8 則"""
+    """取自由時報蒐奇前 5 則（含原文連結）"""
     try:
-        items = _fetch_rss_items("https://news.ltn.com.tw/rss/novelty.xml", limit=8)
+        items = _fetch_rss_items("https://news.ltn.com.tw/rss/novelty.xml", limit=5)
         if not items:
             return "暫時抓不到趣聞。"
         lines = [f"{i+1}. {it['title']}\n   🔗 {it['link']}" for i, it in enumerate(items)]
-        return "【今日趣聞 · 自由時報蒐奇】\n" + "\n".join(lines)
+        return (
+            "【今日趣聞 · 自由時報蒐奇】\n"
+            + "\n".join(lines)
+            + "\n\n（來源：自由時報蒐奇 https://news.ltn.com.tw/list/breakingnews/novelty）"
+            + "\n※ 必須完整保留每則新聞的 🔗 連結與最後的來源行，不可省略。"
+        )
     except Exception as e:
         return f"趣聞抓取失敗：{e}"
 
