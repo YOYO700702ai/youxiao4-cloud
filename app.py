@@ -390,6 +390,48 @@ def fetch_ai5min_first():
         print(f"[morning] AI5分鐘快報抓取失敗：{e}")
         return None
 
+def _fetch_rss_items(url, limit=8):
+    """通用 RSS 抓取，回傳 [{title, link, time}] 最多 limit 筆"""
+    import xml.etree.ElementTree as ET
+    from email.utils import parsedate_to_datetime
+    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+    root = ET.fromstring(r.content)
+    items = root.find('channel').findall('item')[:limit]
+    out = []
+    for it in items:
+        title = it.findtext('title', '').strip()
+        link = it.findtext('link', '').strip()
+        pub = it.findtext('pubDate', '')
+        try:
+            pd = parsedate_to_datetime(pub).astimezone(datetime.timezone(datetime.timedelta(hours=8)))
+            t = pd.strftime("%H:%M")
+        except Exception:
+            t = ""
+        out.append({"title": title, "link": link, "time": t})
+    return out
+
+def get_taiwan_today_news():
+    """取自由時報即時新聞前 8 則"""
+    try:
+        items = _fetch_rss_items("https://news.ltn.com.tw/rss/all.xml", limit=8)
+        if not items:
+            return "暫時抓不到新聞。"
+        lines = [f"{i+1}. [{it['time']}] {it['title']}\n   🔗 {it['link']}" for i, it in enumerate(items)]
+        return "【今日台灣新聞 · 自由時報即時】\n" + "\n".join(lines)
+    except Exception as e:
+        return f"新聞抓取失敗：{e}"
+
+def get_taiwan_fun_news():
+    """取自由時報蒐奇前 8 則"""
+    try:
+        items = _fetch_rss_items("https://news.ltn.com.tw/rss/novelty.xml", limit=8)
+        if not items:
+            return "暫時抓不到趣聞。"
+        lines = [f"{i+1}. {it['title']}\n   🔗 {it['link']}" for i, it in enumerate(items)]
+        return "【今日趣聞 · 自由時報蒐奇】\n" + "\n".join(lines)
+    except Exception as e:
+        return f"趣聞抓取失敗：{e}"
+
 def fetch_aipost_articles():
     """抓取 AI郵報最新一天的所有文章"""
     import xml.etree.ElementTree as ET
@@ -1585,6 +1627,39 @@ GROUP_FUNC_DECLS = [
             required=["name"],
         ),
     ),
+    types.FunctionDeclaration(
+        name="get_today_news",
+        description="取得今日台灣即時新聞頭條（自由時報即時新聞）。使用者問『今日新聞』『有什麼新聞』『最近發生什麼事』等時呼叫。",
+        parameters=types.Schema(type=types.Type.OBJECT, properties={}),
+    ),
+    types.FunctionDeclaration(
+        name="get_fun_news",
+        description="取得今日有趣／獵奇／趣聞新聞（自由時報蒐奇）。使用者問『有趣的新聞』『奇聞』『無聊』『分享點好玩的』等時呼叫。",
+        parameters=types.Schema(type=types.Type.OBJECT, properties={}),
+    ),
+    types.FunctionDeclaration(
+        name="search_web",
+        description="用 DuckDuckGo 搜尋網路。使用者要查特定主題、人名、事件、商品等，需要最新資訊時呼叫。需要更深入內容時可接著呼叫 fetch_webpage 抓對應網址。",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "query":       types.Schema(type=types.Type.STRING, description="搜尋關鍵字"),
+                "max_results": types.Schema(type=types.Type.INTEGER, description="回傳幾筆結果，預設 5"),
+            },
+            required=["query"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="fetch_webpage",
+        description="抓取指定網頁的內文純文字（最多 3000 字）。通常在 search_web 之後，用來深入讀某個搜尋結果的連結。",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "url": types.Schema(type=types.Type.STRING, description="要抓取的網頁 URL"),
+            },
+            required=["url"],
+        ),
+    ),
 ]
 GROUP_TOOLS = [types.Tool(function_declarations=GROUP_FUNC_DECLS)]
 
@@ -1780,6 +1855,18 @@ def execute_group_function(name, args, group_id, pending, uid=None):
             if key:
                 pending_cover_replace[key] = (script_name, time.time())
             return f"收到，請在5分鐘內傳《{script_name}》的新封面圖，傳完自動更新。"
+
+        if name == 'get_today_news':
+            return get_taiwan_today_news()
+
+        if name == 'get_fun_news':
+            return get_taiwan_fun_news()
+
+        if name == 'search_web':
+            return search_web(args['query'], int(args.get('max_results', 5)))
+
+        if name == 'fetch_webpage':
+            return fetch_url(args['url'])
 
         return {"error": f"unknown tool: {name}"}
     except Exception as e:
