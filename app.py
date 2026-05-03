@@ -336,6 +336,34 @@ def fetch_url(url):
     except Exception as e:
         return f"抓取失敗：{e}"
 
+def fetch_ai5min_first():
+    """抓取 AI 五分鐘快報 (israynotarray.dev) 最新一篇的標題、發布日、完整內文"""
+    import xml.etree.ElementTree as ET
+    from email.utils import parsedate_to_datetime
+    try:
+        r = requests.get("https://ai-5min-news.israynotarray.dev/index.xml",
+                         headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        root = ET.fromstring(r.content)
+        item = root.find('channel').find('item')
+        if item is None:
+            return None
+        title = item.findtext('title', '').strip()
+        url = item.findtext('link', '').strip()
+        pub_date_str = item.findtext('pubDate', '')
+        try:
+            pub_date = parsedate_to_datetime(pub_date_str)
+            date_str = pub_date.astimezone(datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d")
+        except Exception:
+            date_str = ""
+        page = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        soup = BeautifulSoup(page.text, 'html.parser')
+        node = soup.select_one('.post-content') or soup.select_one('article.post-single') or soup.select_one('article')
+        content = node.get_text("\n", strip=True) if node else ""
+        return {"title": title, "url": url, "date": date_str, "content": content[:5000]}
+    except Exception as e:
+        print(f"[morning] AI5分鐘快報抓取失敗：{e}")
+        return None
+
 def fetch_aipost_articles():
     """抓取 AI郵報最新一天的所有文章"""
     import xml.etree.ElementTree as ET
@@ -982,6 +1010,21 @@ def morning_greeting():
     except Exception as e:
         print(f"[morning] AI郵報整理失敗：{e}")
 
+    # 抓 AI 五分鐘快報最新一篇（含完整內文）
+    ai5min_context = ""
+    try:
+        a = fetch_ai5min_first()
+        if a:
+            ai5min_context = (
+                f"\n\n以下是「AI 五分鐘快報」{a['date']} 的最新一篇完整內容，"
+                f"請依照以下格式整理後呈現給悠悠：\n"
+                f"【AI 五分鐘快報 {a['date']}】\n"
+                f"標題照原樣寫出，內文用條列方式整理 5~8 個重點（不要逐字複述、要消化過再寫），最後附上原文網址。\n\n"
+                f"原始資料：\n標題：{a['title']}\n網址：{a['url']}\n內文：\n{a['content']}"
+            )
+    except Exception as e:
+        print(f"[morning] AI5分鐘快報整理失敗：{e}")
+
     weekday = ["一", "二", "三", "四", "五", "六", "日"][now.weekday()]
     prompt = (
         f"現在是 {now.strftime('%Y年%m月%d日')} 星期{weekday} 早上11點。\n"
@@ -994,7 +1037,8 @@ def morning_greeting():
         f"- 今天是星期{weekday}的特別感受\n\n"
         f"行程資訊如下，請整理後正式告知悠悠，行程前已有勾選符號，請照格式呈現：\n"
         f"{context}\n"
-        f"{aipost_context}\n\n"
+        f"{aipost_context}"
+        f"{ai5min_context}\n\n"
         f"語氣符合伍盛成熟深情執事風格，可加入括號動作描述。結尾留一句溫柔的叮嚀。"
     )
     push_message(ask_ai_simple(prompt))
