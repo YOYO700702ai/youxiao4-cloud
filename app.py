@@ -853,51 +853,84 @@ def parse_script_info_with_ai(msg):
         return None
 
 def replace_notion_cover(name, cover_url):
+    page, err = find_notion_script_page(name)
+    if err:
+        return False, err
     headers = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
         "Content-Type": "application/json",
         "Notion-Version": "2022-06-28"
     }
-    r = requests.post(
-        f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query",
-        headers=headers,
-        json={"filter": {"property": "劇本名稱", "title": {"equals": name}}}
-    )
-    if r.status_code != 200:
-        return False, f"搜尋失敗：{r.text[:200]}"
-    results = r.json().get("results", [])
-    if not results:
-        return False, f"找不到《{name}》，請確認名稱是否正確。"
-    page_id = results[0]["id"]
+    page_id = page["id"]
+    title_prop = page["properties"].get("劇本名稱", {}).get("title", [])
+    real_name = title_prop[0]["plain_text"] if title_prop else name
     r2 = requests.patch(
         f"https://api.notion.com/v1/pages/{page_id}",
         headers=headers,
         json={"cover": {"type": "external", "external": {"url": cover_url}}}
     )
     if r2.status_code == 200:
-        return True, f"《{name}》封面已更新。"
+        return True, f"《{real_name}》封面已更新。"
     return False, f"更新失敗：{r2.text[:200]}"
 
-def update_notion_script(name, fields):
-    """修改既有劇本的欄位。fields 是 {欄位中文名: 新值}，只更新有給的。multi_select 為覆寫。"""
+def find_notion_script_page(name):
+    """查 Notion 劇本頁面：精準→contains→列出多筆要求釐清。
+    回傳 (page, error_msg)；page 為 None 時 error_msg 是給使用者看的提示。"""
     headers = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
         "Content-Type": "application/json",
         "Notion-Version": "2022-06-28"
     }
-    r = requests.post(
-        f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query",
-        headers=headers,
-        json={"filter": {"property": "劇本名稱", "title": {"equals": name}}}
-    )
-    if r.status_code != 200:
-        return False, f"搜尋失敗：{r.text[:200]}"
-    results = r.json().get("results", [])
+    query_url = f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query"
+
+    def _query(filter_obj):
+        r = requests.post(query_url, headers=headers, json={"filter": filter_obj})
+        if r.status_code != 200:
+            return None, f"搜尋失敗：{r.text[:200]}"
+        return r.json().get("results", []), None
+
+    # 1) 精準比對
+    results, err = _query({"property": "劇本名稱", "title": {"equals": name}})
+    if err:
+        return None, err
+    if len(results) == 1:
+        return results[0], None
+    if len(results) > 1:
+        titles = []
+        for p in results[:8]:
+            tp = p["properties"].get("劇本名稱", {}).get("title", [])
+            titles.append("《" + (tp[0]["plain_text"] if tp else "(無名)") + "》")
+        return None, f"剛好有 {len(results)} 本叫「{name}」，請說清楚是哪一本：" + "、".join(titles)
+
+    # 2) 模糊比對 (contains)
+    results, err = _query({"property": "劇本名稱", "title": {"contains": name}})
+    if err:
+        return None, err
     if not results:
-        return False, f"找不到《{name}》，請確認劇本名稱（含全形符號）是否正確。"
-    page = results[0]
+        return None, f"找不到含「{name}」的劇本，請確認名稱（劇本名要至少對到部分文字）。"
+    if len(results) == 1:
+        return results[0], None
+    titles = []
+    for p in results[:8]:
+        tp = p["properties"].get("劇本名稱", {}).get("title", [])
+        titles.append("《" + (tp[0]["plain_text"] if tp else "(無名)") + "》")
+    suffix = f"（共 {len(results)} 本，只列前 8 本）" if len(results) > 8 else ""
+    return None, f"含「{name}」的劇本有多本，請說清楚是哪一本：" + "、".join(titles) + suffix
+
+def update_notion_script(name, fields):
+    """修改既有劇本的欄位。fields 是 {欄位中文名: 新值}，只更新有給的。multi_select 為覆寫。"""
+    page, err = find_notion_script_page(name)
+    if err:
+        return False, err
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Content-Type": "application/json",
+        "Notion-Version": "2022-06-28"
+    }
     page_id = page["id"]
     cur = page["properties"]
+    title_prop = cur.get("劇本名稱", {}).get("title", [])
+    real_name = title_prop[0]["plain_text"] if title_prop else name
 
     def cur_text(key):
         v = cur.get(key, {}).get("rich_text", [])
@@ -937,7 +970,7 @@ def update_notion_script(name, fields):
                 diff_lines.append(f"{key}：{'/'.join(old) or '(空)'}→{'/'.join(items)}")
 
     if not patch_props:
-        return False, f"《{name}》沒有需要更新的欄位（給的值跟現在一樣）。"
+        return False, f"《{real_name}》沒有需要更新的欄位（給的值跟現在一樣）。"
 
     r2 = requests.patch(
         f"https://api.notion.com/v1/pages/{page_id}",
@@ -945,33 +978,28 @@ def update_notion_script(name, fields):
         json={"properties": patch_props}
     )
     if r2.status_code == 200:
-        return True, f"《{name}》已更新：\n" + "\n".join(f"- {x}" for x in diff_lines)
+        return True, f"《{real_name}》已更新：\n" + "\n".join(f"- {x}" for x in diff_lines)
     return False, f"更新失敗：{r2.text[:200]}"
 
 def archive_notion_script(name):
+    page, err = find_notion_script_page(name)
+    if err:
+        return False, err
     headers = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
         "Content-Type": "application/json",
         "Notion-Version": "2022-06-28"
     }
-    r = requests.post(
-        f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query",
-        headers=headers,
-        json={"filter": {"property": "劇本名稱", "title": {"equals": name}}}
-    )
-    if r.status_code != 200:
-        return False, f"搜尋失敗：{r.text[:200]}"
-    results = r.json().get("results", [])
-    if not results:
-        return False, f"找不到《{name}》，請確認名稱是否正確。"
-    page_id = results[0]["id"]
+    page_id = page["id"]
+    title_prop = page["properties"].get("劇本名稱", {}).get("title", [])
+    real_name = title_prop[0]["plain_text"] if title_prop else name
     r2 = requests.patch(
         f"https://api.notion.com/v1/pages/{page_id}",
         headers=headers,
         json={"archived": True}
     )
     if r2.status_code == 200:
-        return True, f"《{name}》已下架（封存）。"
+        return True, f"《{real_name}》已下架（封存）。"
     return False, f"下架失敗：{r2.text[:200]}"
 
 # ── Function 執行器 ────────────────────────────────────────
