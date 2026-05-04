@@ -878,6 +878,76 @@ def replace_notion_cover(name, cover_url):
         return True, f"《{name}》封面已更新。"
     return False, f"更新失敗：{r2.text[:200]}"
 
+def update_notion_script(name, fields):
+    """修改既有劇本的欄位。fields 是 {欄位中文名: 新值}，只更新有給的。multi_select 為覆寫。"""
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Content-Type": "application/json",
+        "Notion-Version": "2022-06-28"
+    }
+    r = requests.post(
+        f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query",
+        headers=headers,
+        json={"filter": {"property": "劇本名稱", "title": {"equals": name}}}
+    )
+    if r.status_code != 200:
+        return False, f"搜尋失敗：{r.text[:200]}"
+    results = r.json().get("results", [])
+    if not results:
+        return False, f"找不到《{name}》，請確認劇本名稱（含全形符號）是否正確。"
+    page = results[0]
+    page_id = page["id"]
+    cur = page["properties"]
+
+    def cur_text(key):
+        v = cur.get(key, {}).get("rich_text", [])
+        return v[0]["plain_text"] if v else ""
+    def cur_number(key):
+        return cur.get(key, {}).get("number")
+    def cur_multi(key):
+        return [x["name"] for x in cur.get(key, {}).get("multi_select", [])]
+
+    patch_props = {}
+    diff_lines = []
+
+    if "價格" in fields and fields["價格"] is not None:
+        try:
+            new = int(fields["價格"])
+            old = cur_number("價格")
+            if new != old:
+                patch_props["價格"] = {"number": new}
+                diff_lines.append(f"價格：{old}→{new}")
+        except Exception:
+            pass
+
+    for key in ("時長", "類型標籤", "劇情簡介"):
+        if key in fields and fields[key]:
+            new = str(fields[key])
+            old = cur_text(key)
+            if new != old:
+                patch_props[key] = {"rich_text": [{"text": {"content": new}}]}
+                diff_lines.append(f"{key}：{old or '(空)'}→{new}")
+
+    for key in ("類型", "人數", "角色"):
+        if key in fields and fields[key]:
+            items = [x.strip() for x in re.split(r'[/、,,\n]', str(fields[key])) if x.strip()]
+            old = cur_multi(key)
+            if items and items != old:
+                patch_props[key] = {"multi_select": [{"name": x} for x in items]}
+                diff_lines.append(f"{key}：{'/'.join(old) or '(空)'}→{'/'.join(items)}")
+
+    if not patch_props:
+        return False, f"《{name}》沒有需要更新的欄位（給的值跟現在一樣）。"
+
+    r2 = requests.patch(
+        f"https://api.notion.com/v1/pages/{page_id}",
+        headers=headers,
+        json={"properties": patch_props}
+    )
+    if r2.status_code == 200:
+        return True, f"《{name}》已更新：\n" + "\n".join(f"- {x}" for x in diff_lines)
+    return False, f"更新失敗：{r2.text[:200]}"
+
 def archive_notion_script(name):
     headers = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -1609,6 +1679,30 @@ GROUP_FUNC_DECLS = [
         ),
     ),
     types.FunctionDeclaration(
+        name="update_script",
+        description=(
+            "修改 Notion 上既有劇本的欄位（價格、人數、類型、時長、類型標籤、角色、劇情簡介）。"
+            "使用者說『《XXX》改成 X 人』『XXX 價格改 X』『把 XXX 的時長改成 X』『XXX 簡介改成…』等時呼叫。"
+            "至少要給一個 new_* 欄位。"
+            "【極重要】multi_select 欄位（人數/類型/角色）是『覆寫』，使用者給什麼就完全變成什麼，不是追加；除非使用者明說要保留原本再加。"
+            "【極重要】絕對禁止只用文字回覆『改好了』『更新完成』而不實際呼叫此工具。"
+        ),
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "name":         types.Schema(type=types.Type.STRING, description="要修改的劇本名稱（必填，用來定位 Notion 頁面，請完整準確）"),
+                "new_price":    types.Schema(type=types.Type.INTEGER, description="新價格，純數字（例如 800）"),
+                "new_people":   types.Schema(type=types.Type.STRING, description="新人數，多個用 / 分隔；合法值：5人/6人/7人/8人/9人/10人/11人/浮動人。會覆寫原本的人數設定"),
+                "new_type":     types.Schema(type=types.Type.STRING, description="新類型，多個用 / 分隔；合法值：恐怖/微恐/驚悚/沉浸/情感/演繹/推理/還原/機制/陣營/歡樂/撕逼/硬核/燒腦。會覆寫"),
+                "new_duration": types.Schema(type=types.Type.STRING, description="新時長，例如「3小時」「3.5小時」"),
+                "new_type_tag": types.Schema(type=types.Type.STRING, description="新的類型標籤（封面卡片自訂文字，例如「推理沉浸」「高難度」）"),
+                "new_roles":    types.Schema(type=types.Type.STRING, description="新角色清單，多個用 / 分隔。會覆寫"),
+                "new_summary":  types.Schema(type=types.Type.STRING, description="新的劇情簡介"),
+            },
+            required=["name"],
+        ),
+    ),
+    types.FunctionDeclaration(
         name="remove_script",
         description="下架（封存）Notion 中指定名稱的劇本。使用者說要下架某劇本時呼叫。",
         parameters=types.Schema(
@@ -1831,6 +1925,22 @@ def execute_group_function(name, args, group_id, pending, uid=None):
                 pending_script_upload[key] = (info, time.time())
             return {"ok": False, "waiting_image": True,
                     "message": f"《{info['名稱']}》資料收到了，請在5分鐘內傳封面圖，傳完自動上架。"}
+
+        if name == 'update_script':
+            field_map = {
+                'new_price':    '價格',
+                'new_people':   '人數',
+                'new_type':     '類型',
+                'new_duration': '時長',
+                'new_type_tag': '類型標籤',
+                'new_roles':    '角色',
+                'new_summary':  '劇情簡介',
+            }
+            fields = {field_map[k]: v for k, v in args.items() if k in field_map and v not in (None, '')}
+            if not fields:
+                return "至少要給一個要改的欄位（價格/人數/類型/時長/類型標籤/角色/簡介）。"
+            _, result = update_notion_script(args['name'], fields)
+            return result
 
         if name == 'remove_script':
             _, result = archive_notion_script(args['name'])
