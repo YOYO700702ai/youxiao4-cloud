@@ -303,7 +303,7 @@ def delete_calendar_event(keyword, date=None):
     except Exception as e:
         return f"刪除失敗：{e}"
 
-def update_calendar_event(keyword, new_title=None, new_start=None, new_end=None):
+def update_calendar_event(keyword, new_title=None, new_start=None, new_end=None, date=None):
     try:
         service = get_calendar_service()
         now = datetime.datetime.utcnow().isoformat() + 'Z'
@@ -311,23 +311,31 @@ def update_calendar_event(keyword, new_title=None, new_start=None, new_end=None)
         result = service.events().list(
             calendarId=GOOGLE_CALENDAR_ID,
             timeMin=now, timeMax=future,
-            maxResults=20, singleEvents=True, orderBy='startTime'
+            maxResults=50, singleEvents=True, orderBy='startTime'
         ).execute()
         events = result.get('items', [])
         matched = [e for e in events if keyword in e.get('summary', '')]
+        if date:
+            d = date.strip()
+            matched = [
+                e for e in matched
+                if e['start'].get('dateTime', e['start'].get('date', ''))[:10] == d
+            ]
         if not matched:
-            return f"找不到包含「{keyword}」的行程。"
+            scope = f"{date} 包含「{keyword}」" if date else f"包含「{keyword}」"
+            return f"找不到{scope}的行程。"
         if len(matched) > 1:
             names = '\n'.join([f"・{e['start'].get('dateTime',e['start'].get('date',''))[:16]} {e['summary']}" for e in matched])
-            return f"找到多筆行程，請說更具體的名稱：\n{names}"
+            return f"找到多筆行程，請補上日期（YYYY-MM-DD）或更具體的名稱：\n{names}"
         event = matched[0]
+        old_when = event['start'].get('dateTime', event['start'].get('date', ''))[:16].replace('T', ' ')
         if new_title:
             event['summary'] = new_title
         if new_start:
             event['start'] = {'dateTime': new_start, 'timeZone': 'Asia/Taipei'}
             event['end']   = {'dateTime': new_end or new_start, 'timeZone': 'Asia/Taipei'}
         service.events().update(calendarId=GOOGLE_CALENDAR_ID, eventId=event['id'], body=event).execute()
-        return f"已更新行程：{event['summary']}"
+        return f"已更新行程：{old_when} {event['summary']}"
     except Exception as e:
         return f"更新失敗：{e}"
 
@@ -582,7 +590,7 @@ FUNC_DECLS = [
     ),
     types.FunctionDeclaration(
         name="update_calendar_event",
-        description="修改 Google 行事曆行程的名稱或時間",
+        description="修改 Google 行事曆行程的名稱或時間。若同名行程有多筆不同日期，必須一起傳 date 才能精準改到指定那一筆。沒給 date 時：1 筆就改、多筆會列出讓使用者再說一次。",
         parameters=types.Schema(
             type=types.Type.OBJECT,
             properties={
@@ -590,6 +598,7 @@ FUNC_DECLS = [
                 "new_title": types.Schema(type=types.Type.STRING, description="新名稱（可省略）"),
                 "new_start": types.Schema(type=types.Type.STRING, description="新開始時間 YYYY-MM-DDTHH:MM:00（可省略）"),
                 "new_end":   types.Schema(type=types.Type.STRING, description="新結束時間 YYYY-MM-DDTHH:MM:00（可省略）"),
+                "date":      types.Schema(type=types.Type.STRING, description="行程目前日期 YYYY-MM-DD（可選）。當使用者明確指定日期或同名行程有多筆時必填。民國年要換算成西元年（民國年+1911）。"),
             },
             required=["keyword"],
         ),
@@ -1019,7 +1028,7 @@ def execute_function(name, args, uid=None):
     elif name == "delete_calendar_event":
         return delete_calendar_event(args["keyword"], args.get("date"))
     elif name == "update_calendar_event":
-        return update_calendar_event(args["keyword"], args.get("new_title"), args.get("new_start"), args.get("new_end"))
+        return update_calendar_event(args["keyword"], args.get("new_title"), args.get("new_start"), args.get("new_end"), args.get("date"))
     elif name == "list_calendar_events":
         return list_calendar_events(int(args.get("days", 7)))
     elif name == "add_memory_fact":
