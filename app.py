@@ -273,7 +273,7 @@ def list_calendar_events(days=7):
     except Exception as e:
         return f"查詢失敗：{e}"
 
-def delete_calendar_event(keyword):
+def delete_calendar_event(keyword, date=None):
     try:
         service = get_calendar_service()
         now = datetime.datetime.utcnow().isoformat() + 'Z'
@@ -281,17 +281,25 @@ def delete_calendar_event(keyword):
         result = service.events().list(
             calendarId=GOOGLE_CALENDAR_ID,
             timeMin=now, timeMax=future,
-            maxResults=20, singleEvents=True, orderBy='startTime'
+            maxResults=50, singleEvents=True, orderBy='startTime'
         ).execute()
         events = result.get('items', [])
         matched = [e for e in events if keyword in e.get('summary', '')]
+        if date:
+            d = date.strip()
+            matched = [
+                e for e in matched
+                if e['start'].get('dateTime', e['start'].get('date', ''))[:10] == d
+            ]
         if not matched:
-            return f"找不到包含「{keyword}」的行程。"
+            scope = f"{date} 包含「{keyword}」" if date else f"包含「{keyword}」"
+            return f"找不到{scope}的行程。"
         if len(matched) > 1:
             names = '\n'.join([f"・{e['start'].get('dateTime',e['start'].get('date',''))[:16]} {e['summary']}" for e in matched])
-            return f"找到多筆行程，請說更具體的名稱：\n{names}"
+            return f"找到多筆行程，請補上日期（YYYY-MM-DD）或更具體的名稱：\n{names}"
+        when = matched[0]['start'].get('dateTime', matched[0]['start'].get('date', ''))[:16].replace('T', ' ')
         service.events().delete(calendarId=GOOGLE_CALENDAR_ID, eventId=matched[0]['id']).execute()
-        return f"已刪除行程：{matched[0]['summary']}"
+        return f"已刪除行程：{when} {matched[0]['summary']}"
     except Exception as e:
         return f"刪除失敗：{e}"
 
@@ -562,11 +570,12 @@ FUNC_DECLS = [
     ),
     types.FunctionDeclaration(
         name="delete_calendar_event",
-        description="刪除 Google 行事曆中包含關鍵字的行程",
+        description="刪除 Google 行事曆中包含關鍵字的行程。若同名行程有多筆不同日期，必須一起傳 date 才能精準刪除指定那一筆。沒給 date 時：1 筆就刪、多筆會列出讓使用者再說一次。",
         parameters=types.Schema(
             type=types.Type.OBJECT,
             properties={
                 "keyword": types.Schema(type=types.Type.STRING, description="行程名稱關鍵字"),
+                "date":    types.Schema(type=types.Type.STRING, description="行程日期 YYYY-MM-DD（可選）。當使用者明確指定日期或同名行程有多筆時必填。民國年要換算成西元年（民國年+1911）。"),
             },
             required=["keyword"],
         ),
@@ -1008,7 +1017,7 @@ def execute_function(name, args, uid=None):
     if name == "add_calendar_event":
         return add_calendar_event(args["title"], args["start"], args["end"], args.get("description", ""))
     elif name == "delete_calendar_event":
-        return delete_calendar_event(args["keyword"])
+        return delete_calendar_event(args["keyword"], args.get("date"))
     elif name == "update_calendar_event":
         return update_calendar_event(args["keyword"], args.get("new_title"), args.get("new_start"), args.get("new_end"))
     elif name == "list_calendar_events":
