@@ -1249,8 +1249,8 @@ def morning_greeting():
         print(f"[morning] ai_simple 全部失敗，走 fallback：{ai_text}")
         weekday_name = ['一','二','三','四','五','六','日'][now.weekday()]
         fallback = (
-            f"☀️ 早安，悠悠。今天是 {now.strftime('%m/%d')} 星期{weekday_name}。\n"
-            f"（本總裁的腦子還在熱機，先把資料原文呈上）\n\n"
+            f"早安，悠悠。今天是 {now.strftime('%m/%d')} 星期{weekday_name}。\n"
+            f"（AI 服務這時段不太穩定，我先把今天的資料原文奉上，等等狀況好了再正式整理）\n\n"
             f"{context}"
             f"{aipost_context}"
             f"{ai5min_context}"
