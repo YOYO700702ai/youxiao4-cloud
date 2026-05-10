@@ -1152,14 +1152,20 @@ def ask_ai_with_tools(user_msg, uid=None):
     return response.text.strip()
 
 def ask_ai_simple(text):
-    """用於定時任務，不帶工具"""
-    try:
-        return gemini_client.models.generate_content(
-            model=GEMMA_MODEL, contents=text,
-            config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, safety_settings=_SAFETY_OFF)
-        ).text.strip()
-    except Exception as e:
-        return f"連線失敗：{e}"
+    """用於定時任務，不帶工具；含 3 次重試（4s/8s/12s 間隔）以擋 Gemini 尖峰 500/503"""
+    last_err = None
+    for attempt in range(3):
+        try:
+            return gemini_client.models.generate_content(
+                model=GEMMA_MODEL, contents=text,
+                config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, safety_settings=_SAFETY_OFF)
+            ).text.strip()
+        except Exception as e:
+            last_err = e
+            print(f"[ask_ai_simple] 第{attempt+1}次失敗：{e}")
+            if attempt < 2:
+                time.sleep(4 * (attempt + 1))
+    return f"連線失敗：{last_err}"
 
 # ── APScheduler ───────────────────────────────────────────
 scheduler = BackgroundScheduler(timezone='Asia/Taipei')
@@ -1237,7 +1243,21 @@ def morning_greeting():
         f"{ai5min_context}\n\n"
         f"語氣符合伍盛成熟深情執事風格，可加入括號動作描述。結尾留一句溫柔的叮嚀。"
     )
-    push_message(ask_ai_simple(prompt))
+    ai_text = ask_ai_simple(prompt)
+    if ai_text.startswith('連線失敗'):
+        # AI 三次都掛掉，直接把資料原汁原味推出去，不要讓老闆看到「連線失敗」
+        print(f"[morning] ai_simple 全部失敗，走 fallback：{ai_text}")
+        weekday_name = ['一','二','三','四','五','六','日'][now.weekday()]
+        fallback = (
+            f"☀️ 早安，悠悠。今天是 {now.strftime('%m/%d')} 星期{weekday_name}。\n"
+            f"（本總裁的腦子還在熱機，先把資料原文呈上）\n\n"
+            f"{context}"
+            f"{aipost_context}"
+            f"{ai5min_context}"
+        ).strip()
+        push_message(fallback)
+    else:
+        push_message(ai_text)
 
 FB_TOKEN_EXPIRY = datetime.datetime(2026, 6, 8, tzinfo=datetime.timezone(datetime.timedelta(hours=8)))
 
