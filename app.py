@@ -1919,16 +1919,6 @@ GROUP_FUNC_DECLS = [
         ),
     ),
     types.FunctionDeclaration(
-        name="get_today_news",
-        description="取得今日台灣即時新聞頭條（自由時報即時新聞）。使用者問『今日新聞』『有什麼新聞』『最近發生什麼事』等時呼叫。",
-        parameters=types.Schema(type=types.Type.OBJECT, properties={}),
-    ),
-    types.FunctionDeclaration(
-        name="get_fun_news",
-        description="取得今日有趣／獵奇／趣聞新聞（自由時報蒐奇）。使用者問『有趣的新聞』『奇聞』『無聊』『分享點好玩的』等時呼叫。",
-        parameters=types.Schema(type=types.Type.OBJECT, properties={}),
-    ),
-    types.FunctionDeclaration(
         name="search_web",
         description="用 DuckDuckGo 搜尋網路。使用者要查特定主題、人名、事件、商品等，需要最新資訊時呼叫。需要更深入內容時可接著呼叫 fetch_webpage 抓對應網址。",
         parameters=types.Schema(
@@ -2239,12 +2229,6 @@ def execute_group_function(name, args, group_id, pending, uid=None):
             if key:
                 pending_cover_replace[key] = (script_name, time.time())
             return f"收到，請在5分鐘內傳《{script_name}》的新封面圖，傳完自動更新。"
-
-        if name == 'get_today_news':
-            return get_taiwan_today_news()
-
-        if name == 'get_fun_news':
-            return get_taiwan_fun_news()
 
         if name == 'search_web':
             return search_web(args['query'], int(args.get('max_results', 5)))
