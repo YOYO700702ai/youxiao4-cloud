@@ -24,6 +24,7 @@ CHANNEL_SECRET       = os.environ['LINE_CHANNEL_SECRET']
 MY_USER_ID           = os.environ['LINE_MY_USER_ID']
 GEMINI_API_KEY       = os.environ['GEMINI_API_KEY']
 GEMMA_MODEL          = os.environ.get('GEMMA_MODEL', 'gemma-4-31b-it')
+GROUP_MODEL          = os.environ.get('GROUP_MODEL', GEMMA_MODEL)  # 小6 群組 bot 專用；沒設就跟小5 一樣
 GOOGLE_SHEET_ID      = os.environ.get('GOOGLE_SHEET_ID', '')
 _creds_raw           = os.environ.get('GOOGLE_CREDENTIALS_JSON', '')
 _creds_dict          = json.loads(_creds_raw) if _creds_raw else {}
@@ -1976,7 +1977,7 @@ def _build_group_sys_prompt(group_id):
 def new_group_tool_session(group_id=None, initial_history=None):
     _gc = group_gemini_client or gemini_client
     return _gc.chats.create(
-        model=GEMMA_MODEL,
+        model=GROUP_MODEL,
         history=initial_history or [],
         config=types.GenerateContentConfig(system_instruction=_build_group_sys_prompt(group_id), tools=GROUP_TOOLS),
     )
@@ -2382,7 +2383,7 @@ def compress_group_memory():
                 "若無新資訊可更新，users/events 可為空陣列。"
             )
             try:
-                resp = _gc.models.generate_content(model=GEMMA_MODEL, contents=prompt)
+                resp = _gc.models.generate_content(model=GROUP_MODEL, contents=prompt)
                 text = re.sub(r'^```json\s*|^```\s*|\s*```$', '', resp.text.strip(), flags=re.MULTILINE)
                 data = json.loads(text)
             except Exception as e:
@@ -2685,7 +2686,7 @@ def group_chat_ai(msg, history=None, group_id=None, speaker_uid=None, speaker_na
         else:
             contents = prompt_text
         resp = _gc.models.generate_content(
-            model=GEMMA_MODEL,
+            model=GROUP_MODEL,
             config=types.GenerateContentConfig(safety_settings=_SAFETY_OFF),
             contents=contents,
         )
