@@ -1648,6 +1648,101 @@ def find_active_event_by_script(group_id, script, date=None):
         print(f"[group] find_active_event_by_script 失敗：{e}")
         return None, "查詢失敗"
 
+def manage_team_members(group_id, action, script, member_name, new_name=None, date_filter=None):
+    """揪團名冊三合一工具：踢人 / 加人 / 換人。
+    自動重編 slot、重算狀態、重發報名表（push）。"""
+    if action not in ('remove', 'add', 'swap'):
+        return {'ok': False, 'error': f'未知 action：{action}'}
+    script = (script or '').strip()
+    member_name = (member_name or '').strip()
+    if not script:
+        return {'ok': False, 'error': '缺少劇本名稱'}
+    if not member_name:
+        return {'ok': False, 'error': '缺少目標成員姓名'}
+    if action == 'swap' and not (new_name or '').strip():
+        return {'ok': False, 'error': 'swap 必須提供 new_name'}
+
+    row_num, ev_or_err = find_active_event_by_script(group_id, script, (date_filter or '').strip() or None)
+    if row_num is None:
+        return {'ok': False, 'error': ev_or_err}
+    ev = ev_or_err
+    prev_status = ev['status']
+
+    def _find_member(target_name):
+        exact = next((p for p in ev['participants'] if p.get('name') == target_name), None)
+        if exact:
+            return exact, None
+        candidates = [p for p in ev['participants'] if target_name in p.get('name', '')]
+        if len(candidates) == 1:
+            return candidates[0], None
+        if len(candidates) > 1:
+            names = '、'.join(p.get('name', '?') for p in candidates)
+            return None, f'有多人名字含「{target_name}」：{names}，請給更明確的名字'
+        return None, f'《{ev["script"]}》名冊上沒有「{target_name}」'
+
+    if action == 'remove':
+        target, err = _find_member(member_name)
+        if err:
+            return {'ok': False, 'error': err}
+        ev['participants'].remove(target)
+        for i, p in enumerate(ev['participants'], 1):
+            p['slot'] = i
+        msg_summary = f'已踢掉 {target["name"]}'
+
+    elif action == 'add':
+        if any(p.get('name') == member_name for p in ev['participants']):
+            return {'ok': False, 'error': f'《{ev["script"]}》名冊上已經有「{member_name}」'}
+        if len(ev['participants']) >= ev['max']:
+            return {'ok': False, 'error': f'《{ev["script"]}》已達上限 {ev["max"]} 人，加不進去。先踢一個再加'}
+        slot = len(ev['participants']) + 1
+        ev['participants'].append({'user_id': '', 'name': member_name, 'slot': slot})
+        msg_summary = f'已加入 {member_name}'
+
+    else:  # swap
+        target, err = _find_member(member_name)
+        if err:
+            return {'ok': False, 'error': err}
+        new_name_clean = new_name.strip()
+        if any(p.get('name') == new_name_clean for p in ev['participants'] if p is not target):
+            return {'ok': False, 'error': f'《{ev["script"]}》名冊上已經有「{new_name_clean}」'}
+        old_name = target['name']
+        target['name'] = new_name_clean
+        target['user_id'] = ''
+        msg_summary = f'{old_name} → {new_name_clean}（slot {target.get("slot")}）'
+
+    # 重算狀態
+    min_p = ev.get('min', ev['max'])
+    count_now = len(ev['participants'])
+    if count_now >= ev['max']:
+        ev['status'] = 'full'
+    elif count_now >= min_p:
+        ev['status'] = 'confirmed'
+    else:
+        ev['status'] = 'open'
+
+    # 重發報名表（reply_token=None → 走 push；同時 save_group_event）
+    try:
+        prefix_map = {
+            'remove': '名冊更動：本總裁親自處理離隊事宜。\n\n',
+            'add':    '名冊更動：本總裁親自加人。\n\n',
+            'swap':   '名冊更動：本總裁親自換人。\n\n',
+        }
+        send_signup_sheet(group_id, ev, row_num, extra_prefix=prefix_map[action], reply_token=None)
+    except Exception as e:
+        print(f'[group] manage_team_members 重發名冊失敗：{e}')
+
+    return {
+        'ok': True,
+        'data': {
+            'script': ev['script'],
+            'date': ev['date'],
+            'action': action,
+            'message': msg_summary,
+            'count_now': count_now,
+            'status_change': f'{prev_status} → {ev["status"]}' if prev_status != ev['status'] else ev['status'],
+        }
+    }
+
 def load_active_events(group_id):
     """回傳這個群組所有「未過期 + 仍在 open/confirmed/full」的揪團（依時間排序），供 AI 查詢團況。
     日期 < 今天的會被當作已過期、從查詢結果排除。"""
@@ -1732,6 +1827,27 @@ GROUP_FUNC_DECLS = [
             "使用者問『有哪些團』『誰報名了』『還缺人嗎』『某天可以嗎』等團況問題時呼叫。"
         ),
         parameters=types.Schema(type=types.Type.OBJECT, properties={}),
+    ),
+    types.FunctionDeclaration(
+        name="manage_team_members",
+        description=(
+            "管理揪團名冊：踢人/加人/換人三合一。"
+            "action='remove' 踢掉某人；action='add' 加入某人（會擋超過 max）；"
+            "action='swap' 把 name 替換成 new_name（保留原 slot 位置）。"
+            "同劇本有多團須加 date 指定。"
+            "【極重要】禁止只用嘴砲說『踢了』『換了』，必須實際呼叫此工具。"
+        ),
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "action":   types.Schema(type=types.Type.STRING, description="remove / add / swap"),
+                "script":   types.Schema(type=types.Type.STRING, description="劇本名稱（找出哪一團）"),
+                "name":     types.Schema(type=types.Type.STRING, description="目標成員姓名（remove/swap=要動的人；add=新加的人）"),
+                "new_name": types.Schema(type=types.Type.STRING, description="僅 swap 時填：要換上去的新名字"),
+                "date":     types.Schema(type=types.Type.STRING, description="同劇本多團時指定 YYYY-MM-DD"),
+            },
+            required=["action", "script", "name"],
+        ),
     ),
     types.FunctionDeclaration(
         name="upload_script",
@@ -2024,6 +2140,16 @@ def execute_group_function(name, args, group_id, pending, uid=None):
                     } for e in evs
                 ],
             }
+
+        if name == 'manage_team_members':
+            return manage_team_members(
+                group_id,
+                action=(args.get('action') or '').strip(),
+                script=args.get('script') or '',
+                member_name=args.get('name') or '',
+                new_name=args.get('new_name'),
+                date_filter=args.get('date'),
+            )
 
         if name == 'upload_script':
             key = (group_id, uid) if uid else None
