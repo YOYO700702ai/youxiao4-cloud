@@ -1649,13 +1649,17 @@ def find_active_event_by_script(group_id, script, date=None):
         return None, "查詢失敗"
 
 def load_active_events(group_id):
-    """回傳這個群組所有 open/full 的揪團（依時間排序），供 AI 查詢團況"""
+    """回傳這個群組所有「未過期 + 仍在 open/confirmed/full」的揪團（依時間排序），供 AI 查詢團況。
+    日期 < 今天的會被當作已過期、從查詢結果排除。"""
     try:
         rows = get_sheet('group_events').get_all_values()
+        today_str = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d")
         events = []
         for row in rows:
             if len(row) < 7 or row[0] != group_id or row[6] not in ('open', 'confirmed', 'full'):
                 continue
+            if row[2] and row[2] < today_str:
+                continue  # 日期過了，排除
             events.append(_row_to_event(row))
         events.sort(key=lambda e: (e['date'], e['time']))
         return events
