@@ -1834,9 +1834,9 @@ GROUP_FUNC_DECLS = [
 GROUP_TOOLS = [types.Tool(function_declarations=GROUP_FUNC_DECLS)]
 
 group_tool_sessions = {}  # {group_id: chat_session}
+GROUP_HISTORY_KEEP_TURNS = 5   # session 內部對話歷史最多保留幾輪（user 訊息算一輪）
 
-def new_group_tool_session(group_id=None):
-    _gc = group_gemini_client or gemini_client
+def _build_group_sys_prompt(group_id):
     sys_prompt = MASHA_PERSONA
     if group_id:
         users  = load_group_user_notes(group_id)
@@ -1851,9 +1851,14 @@ def new_group_tool_session(group_id=None):
             mem += "\n【最近發生的事】\n" + "\n".join(f"- {e}" for e in events) + "\n"
         if mem:
             sys_prompt = MASHA_PERSONA + "\n\n" + mem
+    return sys_prompt
+
+def new_group_tool_session(group_id=None, initial_history=None):
+    _gc = group_gemini_client or gemini_client
     return _gc.chats.create(
         model=GEMMA_MODEL,
-        config=types.GenerateContentConfig(system_instruction=sys_prompt, tools=GROUP_TOOLS),
+        history=initial_history or [],
+        config=types.GenerateContentConfig(system_instruction=_build_group_sys_prompt(group_id), tools=GROUP_TOOLS),
     )
 
 def get_group_tool_session(group_id):
@@ -1864,6 +1869,39 @@ def get_group_tool_session(group_id):
 def reset_group_tool_session(group_id):
     group_tool_sessions[group_id] = new_group_tool_session(group_id)
     return group_tool_sessions[group_id]
+
+def _get_session_history(sess):
+    """嘗試多種方式取出 chat session 的對話歷史"""
+    for attr in ('get_history', '_curated_history'):
+        try:
+            val = getattr(sess, attr, None)
+            if callable(val):
+                return list(val())
+            if val is not None:
+                return list(val)
+        except Exception:
+            pass
+    return []
+
+def trim_group_session_history(group_id):
+    """把這個群 session 的對話歷史截掉，只保留最近 GROUP_HISTORY_KEEP_TURNS 輪。
+    主要為了壓 Gemma 模型每分鐘 input token 16k 的天花板。"""
+    sess = group_tool_sessions.get(group_id)
+    if not sess:
+        return
+    hist = _get_session_history(sess)
+    if not hist:
+        return
+    user_idxs = [i for i, c in enumerate(hist) if getattr(c, 'role', None) == 'user']
+    if len(user_idxs) <= GROUP_HISTORY_KEEP_TURNS:
+        return
+    cutoff = user_idxs[-GROUP_HISTORY_KEEP_TURNS]
+    trimmed = hist[cutoff:]
+    try:
+        group_tool_sessions[group_id] = new_group_tool_session(group_id, initial_history=trimmed)
+        print(f"[group] history trimmed {len(hist)} → {len(trimmed)} contents（保留最後 {GROUP_HISTORY_KEEP_TURNS} 輪）")
+    except Exception as e:
+        print(f"[group] trim 重建 session 失敗：{e}")
 
 def execute_group_function(name, args, group_id, pending, uid=None):
     """執行工具；pending 是 mutable dict，用來收集需要後續處理的副作用（例如新建立的揪團）"""
@@ -1923,6 +1961,35 @@ def execute_group_function(name, args, group_id, pending, uid=None):
                 min_p = max_p
             if not script or not date:
                 return {"ok": False, "error": "缺少劇本名稱或日期"}
+            existing_row, existing_ev = find_active_event_by_script(group_id, script, date)
+            if existing_row and isinstance(existing_ev, dict):
+                old_max = existing_ev['max']
+                old_min = existing_ev.get('min', old_max)
+                changes = []
+                if max_p != old_max:
+                    existing_ev['max'] = max_p
+                    changes.append(f"上限 {old_max} → {max_p}")
+                if min_p != old_min:
+                    existing_ev['min'] = min_p
+                    changes.append(f"成團門檻 {old_min} → {min_p}")
+                if time_s and time_s != existing_ev.get('time', ''):
+                    existing_ev['time'] = time_s
+                    changes.append(f"時辰 → {time_s}")
+                if not changes:
+                    count_now = len(existing_ev['participants'])
+                    return {"ok": False, "message": f"《{script}》{_short_date(date)} 這團早就開了，目前 {count_now}/{old_max} 人，本總裁不重複開團。要改人數請明說『加到X人』。"}
+                if existing_ev['min'] > existing_ev['max']:
+                    existing_ev['min'] = existing_ev['max']
+                count_now = len(existing_ev['participants'])
+                min_now = existing_ev.get('min', existing_ev['max'])
+                if count_now >= existing_ev['max']:
+                    existing_ev['status'] = 'full'
+                elif count_now >= min_now:
+                    existing_ev['status'] = 'confirmed'
+                else:
+                    existing_ev['status'] = 'open'
+                save_group_event(existing_row, existing_ev)
+                return {"ok": True, "message": f"《{script}》{_short_date(date)} 那團早已開立，本總裁不另起爐灶，改為更新：" + "、".join(changes) + "。原報名名單照舊（{}人）。".format(count_now)}
             row_num, ev = create_group_event_row(group_id, script, date, time_s, max_p, min_p)
             if not ev:
                 return {"ok": False, "error": "建立失敗"}
@@ -2958,6 +3025,9 @@ if group_handler:
                     break
 
             ai_text = (response.text or '').strip() if response else ''
+
+            # 截掉 session 內部對話歷史，只保留最近 GROUP_HISTORY_KEEP_TURNS 輪，避免 Gemma 16k token/分爆量
+            trim_group_session_history(gid)
 
             # 組合最終回覆：若有新建揪團，先放報名表、再放 AI 的話
             msgs = []
