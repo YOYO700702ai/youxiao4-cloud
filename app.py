@@ -2454,6 +2454,12 @@ CARD_REGISTRY = {
     ]
 }
 GACHA_RATES   = [('R', 0.70), ('SR', 0.25), ('SSR', 0.05)]
+# 指定群組「保底 SSR」：該群下一次抽卡固定吐 SSR，抽到後自動失效（log 裡有 SSR 紀錄就停止保底）。
+# 用法：Railway 環境變數 GACHA_GUARANTEED_SSR_GROUP_ID = <group_id>。
+# 抽完後可保留環境變數（會自動失效）或直接清空。
+# 可選 GACHA_GUARANTEED_SSR_AFTER 限定「只算這個日期以後抽到的 SSR」（避免被歷史紀錄擋住），格式 YYYY-MM-DD。
+GACHA_GUARANTEED_SSR_GROUP_ID = os.environ.get('GACHA_GUARANTEED_SSR_GROUP_ID', '').strip()
+GACHA_GUARANTEED_SSR_AFTER    = os.environ.get('GACHA_GUARANTEED_SSR_AFTER', '').strip()
 GACHA_TEXT    = {
     'R': [
         "哼，本總裁的日常快照，已是俗世難求的福氣。珍惜。",
@@ -2486,6 +2492,32 @@ def get_gacha_date():
     if now.hour < 6:
         return (now - datetime.timedelta(days=1)).strftime('%Y-%m-%d')
     return now.strftime('%Y-%m-%d')
+
+def _has_group_drawn_ssr_since(group_id, after_date):
+    """檢查指定群組在 after_date（含當天）之後是否已抽到過 SSR。
+    after_date 為空字串時等於『有史以來抽過就算』。"""
+    try:
+        rows = get_sheet('gacha_log').get_all_values()
+        for row in rows[1:]:
+            if len(row) >= 3 and row[1] == group_id and row[2] == 'SSR':
+                if not after_date or row[0] >= after_date:
+                    return True
+        return False
+    except Exception as e:
+        print(f"[gacha] _has_group_drawn_ssr_since 失敗：{e}")
+        return False
+
+def _should_force_ssr(group_id):
+    """這次抽卡要不要保底 SSR？"""
+    if not GACHA_GUARANTEED_SSR_GROUP_ID:
+        return False
+    if group_id != GACHA_GUARANTEED_SSR_GROUP_ID:
+        return False
+    if _has_group_drawn_ssr_since(group_id, GACHA_GUARANTEED_SSR_AFTER):
+        return False
+    if not CARD_REGISTRY.get('SSR'):
+        return False
+    return True
 
 def check_gacha_drawn(group_id):
     """回傳今天這個群組是否已抽過。"""
@@ -2526,15 +2558,20 @@ def do_gacha(gid, uid, rtoken):
             group_reply(rtoken, GACHA_EMPTY_TEXT)
             return
 
-        # 依機率決定稀有度（若該稀有度無卡則往下降）
-        rand = random.random()
-        cumulative = 0.0
-        chosen_rarity = 'R'
-        for rarity, rate in GACHA_RATES:
-            cumulative += rate
-            if rand <= cumulative and CARD_REGISTRY.get(rarity):
-                chosen_rarity = rarity
-                break
+        # 保底 SSR（指定群組、且該群尚未抽過 SSR 才生效）
+        if _should_force_ssr(gid):
+            chosen_rarity = 'SSR'
+            print(f"[gacha] 保底 SSR 觸發 gid={gid}")
+        else:
+            # 依機率決定稀有度（若該稀有度無卡則往下降）
+            rand = random.random()
+            cumulative = 0.0
+            chosen_rarity = 'R'
+            for rarity, rate in GACHA_RATES:
+                cumulative += rate
+                if rand <= cumulative and CARD_REGISTRY.get(rarity):
+                    chosen_rarity = rarity
+                    break
         # fallback：選第一個有卡的稀有度
         if not CARD_REGISTRY.get(chosen_rarity):
             for rarity, _ in GACHA_RATES:
