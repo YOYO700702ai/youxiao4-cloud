@@ -2454,7 +2454,7 @@ CARD_REGISTRY = {
         _build_card("竹影_SSR.png", "「林深處你以為躲得開本總裁？竹影一掠，我已經站在你身後了。」"),
     ]
 }
-GACHA_RATES   = [('R', 0.55), ('SR', 0.38), ('SSR', 0.07)]
+GACHA_RATES   = [('R', 0.60), ('SR', 0.33), ('SSR', 0.07)]
 # 指定群組「保底 SSR」：該群下一次抽卡固定吐 SSR，抽到後自動失效（log 裡有 SSR 紀錄就停止保底）。
 # 用法：Railway 環境變數 GACHA_GUARANTEED_SSR_GROUP_ID = <group_id>。
 # 抽完後可保留環境變數（會自動失效）或直接清空。
