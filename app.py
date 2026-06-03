@@ -1789,7 +1789,7 @@ def team_poll_get(poll_id):
                     'poll_id': r[0], 'group_id': r[1],
                     'organizer_uid': r[2], 'organizer_name': r[3],
                     'script': r[4], 'dates': r[5].split('|') if r[5] else [],
-                    'max_people': int(r[6]) if r[6].isdigit() else 6,
+                    'max_people': int(r[6]) if r[6].isdigit() else 0,
                     'status': r[7], 'chosen_date': r[8], 'created_at': r[9],
                 }
         return None
@@ -1883,7 +1883,8 @@ def build_team_poll_card(poll, votes):
         status_text = f"✅ 已成團：{poll['chosen_date']}"
         status_color = "#2E7D32"
     else:
-        status_text = f"📋 招募中｜上限 {poll['max_people']} 人｜已 {len(voted_people)} 人投票"
+        max_label = f"上限 {poll['max_people']} 人｜" if poll.get('max_people') else ""
+        status_text = f"📋 招募中｜{max_label}已 {len(voted_people)} 人投票"
         status_color = "#1976D2"
 
     # 日期區塊（每個日期一個 box）
@@ -2085,7 +2086,7 @@ GROUP_FUNC_DECLS = [
                     items=types.Schema(type=types.Type.STRING),
                     description="候選日期清單，每個元素是一個日期描述字串，例如 '7/1 整天'",
                 ),
-                "max_people": types.Schema(type=types.Type.INTEGER, description="人數上限，預設 6"),
+                "max_people": types.Schema(type=types.Type.INTEGER, description="人數上限。**召集人沒明確說人數時不要傳這個欄位**，留空就好。系統不會用任何預設值。"),
             },
         ),
     ),
@@ -2396,7 +2397,11 @@ def execute_group_function(name, args, group_id, pending, uid=None):
             script = (args.get('script') or '').strip()
             dates_in = args.get('dates') or []
             dates = [str(d).strip() for d in dates_in if str(d).strip()]
-            max_people = int(args.get('max_people') or 6)
+            # max_people 不預設，沒給就是 0（網頁/卡片會顯示「未指定」）
+            try:
+                max_people = int(args.get('max_people')) if args.get('max_people') else 0
+            except Exception:
+                max_people = 0
             if not script:
                 return {"ok": False, "error": "缺少劇本名稱"}
             if len(dates) < 2:
@@ -3631,7 +3636,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
 
 <div class="card">
   <h1>《{{ script }}》</h1>
-  <div class="meta">召集人：{{ organizer_name }}　|　上限 {{ max_people }} 人</div>
+  <div class="meta">召集人：{{ organizer_name }}{% if max_people %}　|　上限 {{ max_people }} 人{% endif %}</div>
   <div class="status {{ status }}">{% if status=='closed' %}已成團：{{ chosen_date }}{% else %}招募中（已 {{ voted_count }} 人投票）{% endif %}</div>
 </div>
 
@@ -3738,8 +3743,15 @@ document.getElementById('btn-save')?.addEventListener('click', async () => {
   });
   const d = await r.json();
   if (d.ok) {
-    toast('已送出，記得回 LINE 點「已投/成團刷新」');
-    setTimeout(()=>location.reload(), 1200);
+    toast('已送出！回 LINE 點「已投/成團刷新」讓大家看到');
+    // 嘗試關掉視窗回 LINE；如果關不掉（瀏覽器擋）就顯示提示
+    setTimeout(() => {
+      try { window.close(); } catch(e) {}
+      // 1 秒後還在這頁的話，換成「請手動回 LINE」的全屏訊息
+      setTimeout(() => {
+        document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;min-height:80vh;flex-direction:column;padding:20px;text-align:center"><div style="font-size:48px;margin-bottom:16px">✅</div><h2 style="color:#2E7D32;margin:0 0 8px">已送出</h2><p style="color:#555;font-size:15px;line-height:1.6">請手動關閉這個頁面，<br>回 LINE 群組點「已投/成團刷新」<br>讓大家看到你的投票。</p></div>';
+      }, 1000);
+    }, 1500);
   } else {
     toast(d.error || '送出失敗');
   }
@@ -3755,8 +3767,13 @@ document.getElementById('btn-close')?.addEventListener('click', async () => {
   });
   const d = await r.json();
   if (d.ok) {
-    toast('已成團！記得回 LINE 點「已投/成團刷新」通知大家');
-    setTimeout(()=>location.reload(), 1500);
+    toast('已成團！回 LINE 點「已投/成團刷新」通知大家');
+    setTimeout(() => {
+      try { window.close(); } catch(e) {}
+      setTimeout(() => {
+        document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;min-height:80vh;flex-direction:column;padding:20px;text-align:center"><div style="font-size:48px;margin-bottom:16px">🎉</div><h2 style="color:#2E7D32;margin:0 0 8px">成團！</h2><p style="color:#555;font-size:15px;line-height:1.6">請手動關閉這個頁面，<br><strong>回 LINE 群組點「已投/成團刷新」</strong><br>讓大家看到成團結果。</p></div>';
+      }, 1000);
+    }, 1500);
   } else {
     toast(d.error || '成團失敗');
   }
@@ -3771,7 +3788,12 @@ document.getElementById('btn-delete')?.addEventListener('click', async () => {
   const d = await r.json();
   if (d.ok) {
     toast('已刪除');
-    setTimeout(()=>location.reload(), 1000);
+    setTimeout(() => {
+      try { window.close(); } catch(e) {}
+      setTimeout(() => {
+        document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;min-height:80vh;flex-direction:column;padding:20px;text-align:center"><div style="font-size:48px;margin-bottom:16px">🗑</div><h2 style="color:#C62828;margin:0 0 8px">已刪除</h2><p style="color:#555;font-size:15px;line-height:1.6">這個揪團已被刪除。<br>可以關閉這個頁面回 LINE 了。</p></div>';
+      }, 1000);
+    }, 1200);
   } else {
     toast(d.error || '刪除失敗');
   }
