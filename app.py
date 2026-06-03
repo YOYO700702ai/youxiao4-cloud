@@ -3773,6 +3773,9 @@ document.getElementById('btn-delete-voter')?.addEventListener('click', async () 
 document.getElementById('btn-save')?.addEventListener('click', async () => {
   const name = document.getElementById('voter_name').value.trim();
   if (!name) { toast('請先輸入名字'); return; }
+  const btn = document.getElementById('btn-save');
+  btn.disabled = true;
+  btn.textContent = '送出中…';
   const votes = DATES.map(d => ({
     date_label: d,
     available: document.querySelector(`.avail[data-date="${CSS.escape(d)}"]`).checked,
@@ -3784,17 +3787,12 @@ document.getElementById('btn-save')?.addEventListener('click', async () => {
   });
   const d = await r.json();
   if (d.ok) {
-    toast('已送出！回 LINE 點「已投/成團刷新」讓大家看到');
-    // 嘗試關掉視窗回 LINE；如果關不掉（瀏覽器擋）就顯示提示
-    setTimeout(() => {
-      try { window.close(); } catch(e) {}
-      // 1 秒後還在這頁的話，換成「請手動回 LINE」的全屏訊息
-      setTimeout(() => {
-        document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;min-height:80vh;flex-direction:column;padding:20px;text-align:center"><div style="font-size:48px;margin-bottom:16px">✅</div><h2 style="color:#2E7D32;margin:0 0 8px">已送出</h2><p style="color:#555;font-size:15px;line-height:1.6">請手動關閉這個頁面，<br>回 LINE 群組點「已投/成團刷新」<br>讓大家看到你的投票。</p></div>';
-      }, 1000);
-    }, 1500);
+    // 立刻換畫面，不等 window.close（LINE 內建瀏覽器擋這個）
+    document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;min-height:80vh;flex-direction:column;padding:20px;text-align:center;background:#FFF8F0"><div style="font-size:64px;margin-bottom:16px">✅</div><h2 style="color:#2E7D32;margin:0 0 12px;font-size:22px">已送出</h2><p style="color:#555;font-size:15px;line-height:1.7">請關閉這個頁面，<br>回 LINE 群組點 <strong style="color:#1976D2">「刷新」</strong> 讓大家看到你的投票。</p></div>';
+    try { window.close(); } catch(e) {}
   } else {
     toast(d.error || '送出失敗');
+    document.getElementById('btn-save').disabled = false;
   }
 });
 
@@ -3893,13 +3891,44 @@ def team_poll_vote(poll_id):
     votes_in = data.get('votes') or []
     if not voter_name:
         return jsonify({'ok': False, 'error': '請輸入名字'})
-    for v in votes_in:
-        date_label = (v.get('date_label') or '').strip()
-        if date_label not in poll['dates']:
-            continue
-        team_poll_upsert_vote(poll_id, voter_name, date_label,
-                              bool(v.get('available')), (v.get('note') or '').strip())
-    return jsonify({'ok': True})
+    # 批次寫入：只打 Google Sheets 2 次 API（讀一次、寫一次），不像舊版每個日期 3 次
+    try:
+        ws = get_sheet('team_poll_votes')
+        rows = ws.get_all_values()
+        if not rows or (rows and rows[0][:1] != ['poll_id']):
+            ws.insert_row(['poll_id', 'voter_name', 'date_label', 'available', 'note', 'updated_at'], 1)
+            rows = ws.get_all_values()
+        # 建索引 (poll_id, voter_name, date_label) -> row_index
+        idx = {}
+        for i, r in enumerate(rows[1:], start=2):
+            if len(r) >= 3:
+                idx[(r[0], r[1], r[2])] = i
+        now_ts = _tp_now()
+        updates = []   # [{'range': 'A5:F5', 'values': [[...]]}, ...]
+        appends = []   # 新行
+        for v in votes_in:
+            date_label = (v.get('date_label') or '').strip()
+            if date_label not in poll['dates']:
+                continue
+            avail = 'Y' if v.get('available') else 'N'
+            note = (v.get('note') or '').strip()
+            row_vals = [poll_id, voter_name, date_label, avail, note, now_ts]
+            key = (poll_id, voter_name, date_label)
+            if key in idx:
+                i = idx[key]
+                updates.append({'range': f'A{i}:F{i}', 'values': [row_vals]})
+            else:
+                appends.append(row_vals)
+        # 一次 batch_update 處理所有 update
+        if updates:
+            ws.batch_update(updates, value_input_option='USER_ENTERED')
+        # 一次 append 處理所有新行
+        if appends:
+            ws.append_rows(appends, value_input_option='USER_ENTERED')
+        return jsonify({'ok': True})
+    except Exception as e:
+        print(f"[team_poll] vote 批次寫入失敗：{e}")
+        return jsonify({'ok': False, 'error': str(e)})
 
 @app.route("/team-poll/<poll_id>/delete-voter", methods=['POST'])
 def team_poll_delete_voter_route(poll_id):
