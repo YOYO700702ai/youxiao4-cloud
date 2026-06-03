@@ -3689,6 +3689,12 @@ button:disabled{opacity:.4;cursor:not-allowed}
   <button class="btn-success" id="btn-close">確認成團</button>
 </div>
 
+<div class="card" style="background:#FFF8E1;border:1px dashed #FFB300">
+  <h3 style="margin:0 0 6px;font-size:14px;color:#E65100">🧹 名字打錯了？</h3>
+  <p style="font-size:12px;color:#666;margin:0 0 8px">輸入要刪除的名字，會把<strong>這個名字底下所有投票</strong>清掉，方便你用正確名字重新投。</p>
+  <button class="btn-secondary" style="background:#FFB300;color:#fff" id="btn-delete-voter">刪除我所有投票</button>
+</div>
+
 <div class="card" style="background:#FFEBEE;border:1px dashed #E57373">
   <h3 style="margin:0 0 6px;font-size:14px;color:#B71C1C">🗑 刪除此揪團</h3>
   <p style="font-size:12px;color:#666;margin:0 0 8px">如果這個揪團開錯了或不再需要，可以刪除。投票紀錄會保留，網頁不再開放編輯。<strong>無法復原。</strong></p>
@@ -3712,22 +3718,53 @@ function toast(msg) {
 // 載入：如果使用者重新進來，把他名下的勾選還原
 async function loadMyVotes() {
   const name = document.getElementById('voter_name')?.value.trim();
-  if (!name) return;
+  if (!name) {
+    // 名字清空時也把勾選清掉，避免殘留
+    document.querySelectorAll('.avail').forEach(cb => cb.checked = false);
+    document.querySelectorAll('.note').forEach(nt => nt.value = '');
+    return;
+  }
   try {
     const r = await fetch(`/team-poll/${POLL_ID}/votes-for?name=${encodeURIComponent(name)}`);
     const d = await r.json();
     if (!d.ok) return;
-    for (const v of (d.votes || [])) {
+    // 先全部清掉再套用（避免換名字時殘留前一個名字的勾選）
+    document.querySelectorAll('.avail').forEach(cb => cb.checked = false);
+    document.querySelectorAll('.note').forEach(nt => nt.value = '');
+    const votes = d.votes || [];
+    for (const v of votes) {
       const cb = document.querySelector(`.avail[data-date="${CSS.escape(v.date_label)}"]`);
       const nt = document.querySelector(`.note[data-date="${CSS.escape(v.date_label)}"]`);
       if (cb) cb.checked = !!v.available;
       if (nt) nt.value = v.note || '';
     }
-    toast('已載入你的紀錄');
+    if (votes.length) toast(`✓ 已載入「${name}」之前的 ${votes.length} 筆投票`);
   } catch (e) {}
 }
 
-document.getElementById('voter_name')?.addEventListener('change', loadMyVotes);
+// 用 input + debounce：邊打就邊試載入，不用按 Tab 才觸發
+let _loadTimer = null;
+document.getElementById('voter_name')?.addEventListener('input', () => {
+  clearTimeout(_loadTimer);
+  _loadTimer = setTimeout(loadMyVotes, 400);
+});
+
+document.getElementById('btn-delete-voter')?.addEventListener('click', async () => {
+  const name = document.getElementById('voter_name').value.trim();
+  if (!name) { toast('請先在上面輸入要刪除的名字'); return; }
+  if (!confirm(`確定要刪除「${name}」底下所有投票嗎？無法復原。`)) return;
+  const r = await fetch(`/team-poll/${POLL_ID}/delete-voter`, {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({voter_name: name})
+  });
+  const d = await r.json();
+  if (d.ok) {
+    toast(`已刪除 ${d.deleted} 筆，重新整理中…`);
+    setTimeout(() => location.reload(), 800);
+  } else {
+    toast(d.error || '刪除失敗');
+  }
+});
 
 document.getElementById('btn-save')?.addEventListener('click', async () => {
   const name = document.getElementById('voter_name').value.trim();
@@ -3857,6 +3894,33 @@ def team_poll_vote(poll_id):
         team_poll_upsert_vote(poll_id, voter_name, date_label,
                               bool(v.get('available')), (v.get('note') or '').strip())
     return jsonify({'ok': True})
+
+@app.route("/team-poll/<poll_id>/delete-voter", methods=['POST'])
+def team_poll_delete_voter_route(poll_id):
+    """刪掉指定名字所有投票紀錄（給用戶清理打錯名字用）"""
+    poll = team_poll_get(poll_id)
+    if not poll:
+        return jsonify({'ok': False, 'error': '找不到這個揪團'})
+    if poll['status'] != 'open':
+        return jsonify({'ok': False, 'error': '揪團已成團或刪除，無法清理投票'})
+    data = request.get_json() or {}
+    voter_name = (data.get('voter_name') or '').strip()
+    if not voter_name:
+        return jsonify({'ok': False, 'error': '請給名字'})
+    try:
+        ws = get_sheet('team_poll_votes')
+        rows = ws.get_all_values()
+        to_delete = []
+        for i, r in enumerate(rows[1:], start=2):
+            if len(r) >= 2 and r[0] == poll_id and r[1] == voter_name:
+                to_delete.append(i)
+        # 由下往上刪避免 index 偏移
+        for n in reversed(to_delete):
+            ws.delete_rows(n)
+        return jsonify({'ok': True, 'deleted': len(to_delete)})
+    except Exception as e:
+        print(f"[team_poll] delete_voter 失敗：{e}")
+        return jsonify({'ok': False, 'error': str(e)})
 
 @app.route("/team-poll/<poll_id>/delete", methods=['POST'])
 def team_poll_delete_route(poll_id):
