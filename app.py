@@ -3497,9 +3497,17 @@ if group_handler:
 
             # 最多跑 5 輪工具呼叫
             for _ in range(5):
+                # Gemini 2.5 在 finish_reason=MAX_TOKENS/SAFETY/RECITATION 時 parts 會是 None
+                _cand = response.candidates[0] if response.candidates else None
+                _parts = (_cand.content.parts if _cand and _cand.content and _cand.content.parts else None) or []
+                if not _parts:
+                    _fr = getattr(_cand, 'finish_reason', None) if _cand else None
+                    print(f"[group] empty parts, finish_reason={_fr}")
+                    group_reply(rtoken, "本總裁話到嘴邊被打斷了，重講一次給我聽。")
+                    return
                 func_calls = [
                     p.function_call
-                    for p in response.candidates[0].content.parts
+                    for p in _parts
                     if hasattr(p, 'function_call') and p.function_call and p.function_call.name
                 ]
                 if not func_calls:
