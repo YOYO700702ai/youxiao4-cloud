@@ -1880,87 +1880,96 @@ def build_team_poll_card(poll, votes):
 
     # 頂端狀態
     if poll['status'] == 'closed':
-        status_text = f"✅ 已成團：{poll['chosen_date']}"
-        status_color = "#2E7D32"
+        status_text = f"✅ 已成團 {poll['chosen_date']}"
     else:
-        max_label = f"上限 {poll['max_people']} 人｜" if poll.get('max_people') else ""
-        status_text = f"📋 招募中｜{max_label}已 {len(voted_people)} 人投票"
-        status_color = "#1976D2"
+        max_label = f"・上限{poll['max_people']}人" if poll.get('max_people') else ""
+        status_text = f"📋 招募中・{len(voted_people)}人投票{max_label}"
 
-    # 日期區塊（每個日期一個 box）
+    # 備註 map：voter_name -> note
+    note_map = {}
+    for v in votes:
+        if v.get('note'):
+            note_map.setdefault(v['date_label'], {})[v['voter_name']] = v['note']
+
+    # 日期區塊：名字後面直接接備註，例如 yoyo(只能到16:00)
     date_contents = []
     for d in poll['dates']:
         info = by_date[d]
         yes_n = len(info['yes'])
-        names = "、".join(info['yes']) if info['yes'] else "（無）"
-        # 高亮成團日
+        if info['yes']:
+            parts = []
+            nmap = note_map.get(d, {})
+            for nm in info['yes']:
+                parts.append(f"{nm}({nmap[nm]})" if nm in nmap else nm)
+            names = "、".join(parts)
+        else:
+            names = "—"
         is_chosen = poll['status'] == 'closed' and poll['chosen_date'] == d
         date_row = {
             "type": "box",
             "layout": "vertical",
-            "spacing": "xs",
-            "margin": "md",
+            "spacing": "none",
             "paddingAll": "sm",
-            "backgroundColor": "#FFF3CD" if is_chosen else "#F5F5F5",
+            "margin": "sm",
+            "backgroundColor": "#FFF3CD" if is_chosen else "#FAFAFA",
             "cornerRadius": "md",
             "contents": [
                 {
                     "type": "box", "layout": "horizontal",
                     "contents": [
-                        {"type": "text", "text": ("⭐ " if is_chosen else "") + d, "size": "sm", "weight": "bold", "flex": 5, "wrap": True},
-                        {"type": "text", "text": f"{yes_n} 人", "size": "sm", "color": "#555555", "align": "end", "flex": 1},
+                        {"type": "text", "text": ("⭐" if is_chosen else "📅") + " " + d, "size": "xs", "weight": "bold", "flex": 5, "wrap": True, "color": "#5D4037"},
+                        {"type": "text", "text": f"{yes_n}人", "size": "xs", "color": "#1976D2", "weight": "bold", "align": "end", "flex": 1},
                     ],
                 },
-                {"type": "text", "text": names, "size": "xs", "color": "#777777", "wrap": True, "margin": "xs"},
+                {"type": "text", "text": names, "size": "xxs", "color": "#666666", "wrap": True, "margin": "xs"},
             ],
         }
         date_contents.append(date_row)
 
-    # 備註區塊
-    notes_block = []
-    all_notes = []
-    for d in poll['dates']:
-        all_notes.extend([f"{d}｜{n}" for n in by_date[d]['notes']])
-    if all_notes:
-        notes_block = [
-            {"type": "separator", "margin": "lg"},
-            {"type": "text", "text": "📝 備註", "weight": "bold", "size": "sm", "margin": "md", "color": "#555555"},
-        ] + [{"type": "text", "text": n, "size": "xs", "color": "#666666", "wrap": True, "margin": "xs"} for n in all_notes[:8]]
-        if len(all_notes) > 8:
-            notes_block.append({"type": "text", "text": f"...等 {len(all_notes)} 則（網頁看完整）", "size": "xs", "color": "#999999", "margin": "xs"})
-
     poll_url = f"{TEAM_POLL_BASE_URL}/team-poll/{poll['poll_id']}"
-    footer_buttons = []
     if poll['status'] != 'closed':
-        footer_buttons = [
-            {"type": "button", "style": "primary", "color": "#1976D2", "height": "sm",
-             "action": {"type": "uri", "label": "投票", "uri": poll_url}},
-            {"type": "button", "style": "secondary", "height": "sm", "margin": "sm",
-             "action": {"type": "postback", "label": "已投/成團刷新",
-                        "data": f"team_poll_refresh|{poll['poll_id']}",
-                        "displayText": "刷新揪團進度"}},
-        ]
+        footer_buttons = [{
+            "type": "box", "layout": "horizontal", "spacing": "sm",
+            "contents": [
+                {"type": "button", "style": "primary", "color": "#FF6B6B", "height": "sm", "flex": 1,
+                 "action": {"type": "uri", "label": "投票", "uri": poll_url}},
+                {"type": "button", "style": "primary", "color": "#4A90E2", "height": "sm", "flex": 1,
+                 "action": {"type": "postback", "label": "刷新",
+                            "data": f"team_poll_refresh|{poll['poll_id']}",
+                            "displayText": "刷新揪團進度"}},
+            ],
+        }]
     else:
-        footer_buttons = [
-            {"type": "button", "style": "secondary", "height": "sm",
-             "action": {"type": "uri", "label": "看詳情", "uri": poll_url}},
-        ]
+        footer_buttons = [{
+            "type": "button", "style": "secondary", "height": "sm",
+            "action": {"type": "uri", "label": "看詳情", "uri": poll_url},
+        }]
+
+    # 主標題：劇本 — 召集人，組合在同一行
+    title_text = f"《{poll['script']}》— {poll['organizer_name']}"
 
     bubble = {
         "type": "bubble", "size": "mega",
+        "styles": {
+            "body": {"backgroundColor": "#FFF8F0"},
+            "footer": {"backgroundColor": "#FFF8F0"},
+        },
         "body": {
-            "type": "box", "layout": "vertical", "paddingAll": "lg", "spacing": "sm",
+            "type": "box", "layout": "vertical", "paddingAll": "md", "spacing": "xs",
+            "background": {
+                "type": "linearGradient", "angle": "135deg",
+                "startColor": "#FFE0B2", "endColor": "#FFCCBC",
+            },
             "contents": [
-                {"type": "text", "text": f"《{poll['script']}》", "weight": "bold", "size": "lg", "wrap": True},
-                {"type": "text", "text": f"召集人：{poll['organizer_name']}", "size": "xs", "color": "#777777"},
-                {"type": "text", "text": status_text, "size": "sm", "color": status_color, "margin": "sm"},
-                {"type": "separator", "margin": "md"},
+                {"type": "text", "text": "🎭 揪團投票", "size": "xxs", "color": "#BF360C", "weight": "bold"},
+                {"type": "text", "text": title_text, "weight": "bold", "size": "md", "wrap": True, "color": "#3E2723"},
+                {"type": "text", "text": status_text, "size": "xxs", "color": "#5D4037", "margin": "xs"},
+                {"type": "separator", "margin": "sm", "color": "#FFAB91"},
                 *date_contents,
-                *notes_block,
             ],
         },
         "footer": {
-            "type": "box", "layout": "vertical", "paddingAll": "md", "contents": footer_buttons,
+            "type": "box", "layout": "vertical", "paddingAll": "sm", "contents": footer_buttons,
         },
     }
     return FlexMessage(alt_text=f"《{poll['script']}》揪團投票", contents=FlexContainer.from_dict(bubble))
@@ -3718,36 +3727,22 @@ function toast(msg) {
 // 載入：如果使用者重新進來，把他名下的勾選還原
 async function loadMyVotes() {
   const name = document.getElementById('voter_name')?.value.trim();
-  if (!name) {
-    // 名字清空時也把勾選清掉，避免殘留
-    document.querySelectorAll('.avail').forEach(cb => cb.checked = false);
-    document.querySelectorAll('.note').forEach(nt => nt.value = '');
-    return;
-  }
+  if (!name) return;
   try {
     const r = await fetch(`/team-poll/${POLL_ID}/votes-for?name=${encodeURIComponent(name)}`);
     const d = await r.json();
     if (!d.ok) return;
-    // 先全部清掉再套用（避免換名字時殘留前一個名字的勾選）
-    document.querySelectorAll('.avail').forEach(cb => cb.checked = false);
-    document.querySelectorAll('.note').forEach(nt => nt.value = '');
-    const votes = d.votes || [];
-    for (const v of votes) {
+    for (const v of (d.votes || [])) {
       const cb = document.querySelector(`.avail[data-date="${CSS.escape(v.date_label)}"]`);
       const nt = document.querySelector(`.note[data-date="${CSS.escape(v.date_label)}"]`);
       if (cb) cb.checked = !!v.available;
       if (nt) nt.value = v.note || '';
     }
-    if (votes.length) toast(`✓ 已載入「${name}」之前的 ${votes.length} 筆投票`);
+    toast('已載入你的紀錄');
   } catch (e) {}
 }
 
-// 用 input + debounce：邊打就邊試載入，不用按 Tab 才觸發
-let _loadTimer = null;
-document.getElementById('voter_name')?.addEventListener('input', () => {
-  clearTimeout(_loadTimer);
-  _loadTimer = setTimeout(loadMyVotes, 400);
-});
+document.getElementById('voter_name')?.addEventListener('change', loadMyVotes);
 
 document.getElementById('btn-delete-voter')?.addEventListener('click', async () => {
   const name = document.getElementById('voter_name').value.trim();
@@ -3846,6 +3841,8 @@ def team_poll_page(poll_id):
     poll = team_poll_get(poll_id)
     if not poll:
         return "找不到這個揪團", 404
+    if poll['status'] == 'deleted':
+        return '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>此團已取消</title><body style="margin:0;font-family:system-ui,-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;background:#FAFAFA;color:#666;font-size:22px">此團已取消</body>'
     votes = team_poll_get_votes(poll_id)
     date_summary = {d: {'yes': [], 'no': [], 'notes': []} for d in poll['dates']}
     for v in votes:
