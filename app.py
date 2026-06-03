@@ -3539,7 +3539,8 @@ if group_handler:
             # 截掉 session 內部對話歷史，只保留最近 GROUP_HISTORY_KEEP_TURNS 輪，避免 Gemma 16k token/分爆量
             trim_group_session_history(gid)
 
-            # 組合最終回覆：若有新建揪團或新投票卡，加進去；最後放 AI 的話
+            # 組合最終回覆：若有新建揪團或新投票卡，加進去
+            # 規則：有卡片時就不附 AI 的廢話了（卡片本身已經是答案）
             msgs = []  # mixed: str (TextMessage) 或 FlexMessage 物件
             signup_info = pending.get('signup')
             if signup_info:
@@ -3550,7 +3551,7 @@ if group_handler:
                 if tp_poll:
                     tp_votes = team_poll_get_votes(team_poll_info['poll_id'])
                     msgs.append(build_team_poll_card(tp_poll, tp_votes))
-            if ai_text:
+            if ai_text and not msgs:
                 msgs.append(ai_text)
             if not msgs:
                 return
