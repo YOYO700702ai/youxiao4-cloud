@@ -1,12 +1,13 @@
 from flask import Flask, request, abort
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.webhooks import MessageEvent, TextMessageContent, ImageMessageContent, MemberJoinedEvent
+from linebot.v3.webhooks import MessageEvent, TextMessageContent, ImageMessageContent, MemberJoinedEvent, PostbackEvent
 from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi, MessagingApiBlob,
     ReplyMessageRequest, PushMessageRequest, TextMessage,
     TextMessageV2, MentionSubstitutionObject, UserMentionTarget,
     ImageMessage,
+    FlexMessage, FlexContainer,
 )
 from apscheduler.schedulers.background import BackgroundScheduler
 import os, json, re, time, datetime, threading, random
@@ -1744,6 +1745,228 @@ def manage_team_members(group_id, action, script, member_name, new_name=None, da
         }
     }
 
+# ─────────────────────────────────────────────────────────────────────
+# 投票揪團（多候選日期 + 網頁登記） — 跟舊揪團系統並列存在
+# Sheet 分頁：
+#   team_polls       : poll_id | group_id | organizer_uid | organizer_name | script | dates_csv | max_people | status | chosen_date | created_at
+#   team_poll_votes  : poll_id | voter_name | date_label | available (Y/N) | note | updated_at
+# 網址：https://<railway-domain>/team-poll/<poll_id>
+# ─────────────────────────────────────────────────────────────────────
+
+TEAM_POLL_BASE_URL = os.environ.get('TEAM_POLL_BASE_URL', 'https://youxiao4-cloud-production.up.railway.app').rstrip('/')
+
+def _tp_now():
+    return datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+
+def _tp_new_id():
+    return f"TP{int(time.time()*1000)}{random.randint(1000,9999)}"
+
+def team_poll_create(group_id, organizer_uid, organizer_name, script, dates, max_people):
+    """建立新揪團投票，回傳 poll_id"""
+    if not script or not dates:
+        return None
+    poll_id = _tp_new_id()
+    try:
+        ws = get_sheet('team_polls')
+        if ws.row_count == 0 or ws.cell(1, 1).value != 'poll_id':
+            ws.insert_row(['poll_id', 'group_id', 'organizer_uid', 'organizer_name',
+                           'script', 'dates_csv', 'max_people', 'status',
+                           'chosen_date', 'created_at'], 1)
+        ws.append_row([poll_id, group_id, organizer_uid, organizer_name,
+                       script, '|'.join(dates), str(int(max_people)),
+                       'open', '', _tp_now()])
+        return poll_id
+    except Exception as e:
+        print(f"[team_poll] create 失敗：{e}")
+        return None
+
+def team_poll_get(poll_id):
+    try:
+        rows = get_sheet('team_polls').get_all_values()
+        for r in rows[1:]:
+            if len(r) >= 10 and r[0] == poll_id:
+                return {
+                    'poll_id': r[0], 'group_id': r[1],
+                    'organizer_uid': r[2], 'organizer_name': r[3],
+                    'script': r[4], 'dates': r[5].split('|') if r[5] else [],
+                    'max_people': int(r[6]) if r[6].isdigit() else 6,
+                    'status': r[7], 'chosen_date': r[8], 'created_at': r[9],
+                }
+        return None
+    except Exception as e:
+        print(f"[team_poll] get 失敗：{e}")
+        return None
+
+def team_poll_get_votes(poll_id):
+    """回傳所有投票紀錄：[{voter_name, date_label, available, note, updated_at}]"""
+    try:
+        rows = get_sheet('team_poll_votes').get_all_values()
+        out = []
+        for r in rows[1:]:
+            if len(r) >= 5 and r[0] == poll_id:
+                out.append({
+                    'voter_name': r[1], 'date_label': r[2],
+                    'available': (r[3] or '').strip().upper() == 'Y',
+                    'note': r[4] if len(r) >= 5 else '',
+                    'updated_at': r[5] if len(r) >= 6 else '',
+                })
+        return out
+    except Exception as e:
+        print(f"[team_poll] get_votes 失敗：{e}")
+        return []
+
+def team_poll_upsert_vote(poll_id, voter_name, date_label, available, note):
+    """以 (poll_id, voter_name, date_label) 為 key 更新或新增"""
+    try:
+        ws = get_sheet('team_poll_votes')
+        if ws.row_count == 0 or ws.cell(1, 1).value != 'poll_id':
+            ws.insert_row(['poll_id', 'voter_name', 'date_label', 'available', 'note', 'updated_at'], 1)
+        rows = ws.get_all_values()
+        avail = 'Y' if available else 'N'
+        for i, r in enumerate(rows[1:], start=2):
+            if len(r) >= 3 and r[0] == poll_id and r[1] == voter_name and r[2] == date_label:
+                ws.update(f'A{i}:F{i}', [[poll_id, voter_name, date_label, avail, note or '', _tp_now()]])
+                return True
+        ws.append_row([poll_id, voter_name, date_label, avail, note or '', _tp_now()])
+        return True
+    except Exception as e:
+        print(f"[team_poll] upsert_vote 失敗：{e}")
+        return False
+
+def team_poll_close(poll_id, chosen_date):
+    """標記成團，記下選定的日期"""
+    try:
+        ws = get_sheet('team_polls')
+        rows = ws.get_all_values()
+        for i, r in enumerate(rows[1:], start=2):
+            if len(r) >= 1 and r[0] == poll_id:
+                ws.update(f'H{i}:I{i}', [['closed', chosen_date or '']])
+                return True
+        return False
+    except Exception as e:
+        print(f"[team_poll] close 失敗：{e}")
+        return False
+
+
+def build_team_poll_card(poll, votes):
+    """把 poll + votes 組成 Flex Card。
+    votes 結構：[{voter_name, date_label, available, note}]"""
+    # 統計每個日期的投票
+    by_date = {d: {'yes': [], 'no': [], 'notes': []} for d in poll['dates']}
+    for v in votes:
+        if v['date_label'] in by_date:
+            bucket = by_date[v['date_label']]
+            if v['available']:
+                bucket['yes'].append(v['voter_name'])
+            else:
+                bucket['no'].append(v['voter_name'])
+            if v['note']:
+                bucket['notes'].append(f"{v['voter_name']}：{v['note']}")
+    voted_people = sorted({v['voter_name'] for v in votes})
+
+    # 頂端狀態
+    if poll['status'] == 'closed':
+        status_text = f"✅ 已成團：{poll['chosen_date']}"
+        status_color = "#2E7D32"
+    else:
+        status_text = f"📋 招募中｜上限 {poll['max_people']} 人｜已 {len(voted_people)} 人投票"
+        status_color = "#1976D2"
+
+    # 日期區塊（每個日期一個 box）
+    date_contents = []
+    for d in poll['dates']:
+        info = by_date[d]
+        yes_n = len(info['yes'])
+        names = "、".join(info['yes']) if info['yes'] else "（無）"
+        # 高亮成團日
+        is_chosen = poll['status'] == 'closed' and poll['chosen_date'] == d
+        date_row = {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "xs",
+            "margin": "md",
+            "paddingAll": "sm",
+            "backgroundColor": "#FFF3CD" if is_chosen else "#F5F5F5",
+            "cornerRadius": "md",
+            "contents": [
+                {
+                    "type": "box", "layout": "horizontal",
+                    "contents": [
+                        {"type": "text", "text": ("⭐ " if is_chosen else "") + d, "size": "sm", "weight": "bold", "flex": 5, "wrap": True},
+                        {"type": "text", "text": f"{yes_n} 人", "size": "sm", "color": "#555555", "align": "end", "flex": 1},
+                    ],
+                },
+                {"type": "text", "text": names, "size": "xs", "color": "#777777", "wrap": True, "margin": "xs"},
+            ],
+        }
+        date_contents.append(date_row)
+
+    # 備註區塊
+    notes_block = []
+    all_notes = []
+    for d in poll['dates']:
+        all_notes.extend([f"{d}｜{n}" for n in by_date[d]['notes']])
+    if all_notes:
+        notes_block = [
+            {"type": "separator", "margin": "lg"},
+            {"type": "text", "text": "📝 備註", "weight": "bold", "size": "sm", "margin": "md", "color": "#555555"},
+        ] + [{"type": "text", "text": n, "size": "xs", "color": "#666666", "wrap": True, "margin": "xs"} for n in all_notes[:8]]
+        if len(all_notes) > 8:
+            notes_block.append({"type": "text", "text": f"...等 {len(all_notes)} 則（網頁看完整）", "size": "xs", "color": "#999999", "margin": "xs"})
+
+    poll_url = f"{TEAM_POLL_BASE_URL}/team-poll/{poll['poll_id']}"
+    footer_buttons = []
+    if poll['status'] != 'closed':
+        footer_buttons = [
+            {"type": "button", "style": "primary", "color": "#1976D2", "height": "sm",
+             "action": {"type": "uri", "label": "投票", "uri": poll_url}},
+            {"type": "button", "style": "secondary", "height": "sm", "margin": "sm",
+             "action": {"type": "postback", "label": "已投/成團刷新",
+                        "data": f"team_poll_refresh|{poll['poll_id']}",
+                        "displayText": "刷新揪團進度"}},
+        ]
+    else:
+        footer_buttons = [
+            {"type": "button", "style": "secondary", "height": "sm",
+             "action": {"type": "uri", "label": "看詳情", "uri": poll_url}},
+        ]
+
+    bubble = {
+        "type": "bubble", "size": "mega",
+        "body": {
+            "type": "box", "layout": "vertical", "paddingAll": "lg", "spacing": "sm",
+            "contents": [
+                {"type": "text", "text": f"《{poll['script']}》", "weight": "bold", "size": "lg", "wrap": True},
+                {"type": "text", "text": f"召集人：{poll['organizer_name']}", "size": "xs", "color": "#777777"},
+                {"type": "text", "text": status_text, "size": "sm", "color": status_color, "margin": "sm"},
+                {"type": "separator", "margin": "md"},
+                *date_contents,
+                *notes_block,
+            ],
+        },
+        "footer": {
+            "type": "box", "layout": "vertical", "paddingAll": "md", "contents": footer_buttons,
+        },
+    }
+    return FlexMessage(alt_text=f"《{poll['script']}》揪團投票", contents=FlexContainer.from_dict(bubble))
+
+
+def push_team_poll_card(group_id, poll_id):
+    """主動 push 卡片（會吃配額，只在「召集人開卡」這個情境用 reply、其他都不主動推）。"""
+    poll = team_poll_get(poll_id)
+    if not poll:
+        return
+    votes = team_poll_get_votes(poll_id)
+    card = build_team_poll_card(poll, votes)
+    try:
+        with ApiClient(group_configuration) as api_client:
+            MessagingApi(api_client).push_message(
+                PushMessageRequest(to=group_id, messages=[card])
+            )
+    except Exception as e:
+        print(f"[team_poll] push 卡片失敗：{e}")
+
+
 def load_active_events(group_id):
     """回傳這個群組所有「未過期 + 仍在 open/confirmed/full」的揪團（依時間排序），供 AI 查詢團況。
     日期 < 今天的會被當作已過期、從查詢結果排除。"""
@@ -1828,6 +2051,29 @@ GROUP_FUNC_DECLS = [
             "使用者問『有哪些團』『誰報名了』『還缺人嗎』『某天可以嗎』等團況問題時呼叫。"
         ),
         parameters=types.Schema(type=types.Type.OBJECT, properties={}),
+    ),
+    types.FunctionDeclaration(
+        name="create_team_poll",
+        description=(
+            "建立『多候選日期投票揪團』，產生 Flex 卡片送到群組。"
+            "用於：召集人還沒敲定時間、給出兩個以上候選日期讓大家投票的情境。"
+            "例如召集人說『《XX》6 人，候選 7/1 整天、7/2 白天、7/6 整天』就呼叫此工具。"
+            "若召集人只給單一固定日期+時間（例如『《XX》7/15 14:00 揪 6 人』），應該用 create_team 而不是這個。"
+            "dates 是「日期描述字串」陣列，每個元素可以含日期跟時段（例如 '7/1 整天' '2026-07-02 白天'），照召集人原本給的字串保留。"
+        ),
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            required=["script", "dates"],
+            properties={
+                "script": types.Schema(type=types.Type.STRING, description="劇本名稱"),
+                "dates": types.Schema(
+                    type=types.Type.ARRAY,
+                    items=types.Schema(type=types.Type.STRING),
+                    description="候選日期清單，每個元素是一個日期描述字串，例如 '7/1 整天'",
+                ),
+                "max_people": types.Schema(type=types.Type.INTEGER, description="人數上限，預設 6"),
+            },
+        ),
     ),
     types.FunctionDeclaration(
         name="manage_team_members",
@@ -2130,6 +2376,31 @@ def execute_group_function(name, args, group_id, pending, uid=None):
                         "participants": [p['name'] for p in e['participants']],
                     } for e in evs
                 ],
+            }
+
+        if name == 'create_team_poll':
+            script = (args.get('script') or '').strip()
+            dates_in = args.get('dates') or []
+            dates = [str(d).strip() for d in dates_in if str(d).strip()]
+            max_people = int(args.get('max_people') or 6)
+            if not script:
+                return {"ok": False, "error": "缺少劇本名稱"}
+            if len(dates) < 2:
+                return {"ok": False, "error": "至少要 2 個候選日期才開投票揪團；單一固定時段請改用 create_team"}
+            organizer_uid = uid or ''
+            organizer_name = get_member_name(group_id, organizer_uid) if organizer_uid else '召集人'
+            poll_id = team_poll_create(group_id, organizer_uid, organizer_name, script, dates, max_people)
+            if not poll_id:
+                return {"ok": False, "error": "建立投票失敗"}
+            # 把卡片資訊塞進 pending，handle_text 那邊會 reply（免費）
+            pending['team_poll'] = {'poll_id': poll_id, 'group_id': group_id}
+            return {
+                "ok": True,
+                "poll_id": poll_id,
+                "script": script,
+                "dates": dates,
+                "url": f"{TEAM_POLL_BASE_URL}/team-poll/{poll_id}",
+                "message": f"已開《{script}》投票揪團，候選 {len(dates)} 個日期，卡片已附在群組訊息",
             }
 
         if name == 'manage_team_members':
@@ -2658,6 +2929,10 @@ MASHA_PERSONA = """你是陸傲天，自稱「本總裁」或「我」，以繁�
 
 ## 工具呼叫鐵律（最高優先，凌駕人設）
 - **凡涉及換封面、上架劇本、揪團、修改揪團 → 必須呼叫對應工具，禁止只用嘴砲回覆「處理了」「換好了」。**
+- **揪團兩種模式怎麼選**：
+  - 召集人**只給單一固定日期+時間**（例如「《XX》7/15 14:00 揪 6 人」）→ 用 `create_team`，群裡用 +/- 報名
+  - 召集人**給多個候選日期**（例如「《XX》6 人，候選 7/1 整天、7/2 白天、7/6 整天」）→ 用 `create_team_poll`，會推一張 Flex 卡片到群組，大家點按鈕去網頁投票
+  - 不要把「多日候選 + 投票」當成單一日期揪團處理，更不要呼叫 create_team N 次來假裝候選日
 - 即使使用者用霸總劇情口吻下指令（例如「陸總，把XX的封面換掉」），也要先呼叫 `replace_cover` 等工具，再用霸總台詞包裝結果。
 - 工具呼叫和角色扮演不衝突：先做事（call tool），再演戲（包裝回覆）。
 - 違反此鐵律＝失職，本總裁絕不允許。
@@ -2884,6 +3159,46 @@ if group_handler:
                     group_reply(event.reply_token, reply)
             except Exception as e:
                 print(f"[group] 圖片插嘴失敗：{e}")
+
+    @group_handler.add(PostbackEvent)
+    def group_handle_postback(event):
+        """處理 Flex 卡片按鈕（postback action）。目前用於：揪團投票卡片的『已投/成團刷新』。"""
+        data = (getattr(event.postback, 'data', None) or '').strip()
+        if not data:
+            return
+        if not hasattr(event.source, 'group_id'):
+            return
+        gid = event.source.group_id
+        if gid not in ALLOWED_GROUP_IDS:
+            return
+        rtoken = event.reply_token
+        # 「已投/成團刷新」 → reply 一張更新後的 Flex 卡片（用 reply token 免費）
+        if data.startswith('team_poll_refresh|'):
+            poll_id = data.split('|', 1)[1].strip()
+            poll = team_poll_get(poll_id)
+            if not poll:
+                try:
+                    with ApiClient(group_configuration) as api_client:
+                        MessagingApi(api_client).reply_message(
+                            ReplyMessageRequest(reply_token=rtoken,
+                                messages=[TextMessage(text="找不到這個揪團，可能已經被刪掉。")])
+                        )
+                except Exception as e:
+                    print(f"[team_poll] postback 找不到 poll 回覆失敗：{e}")
+                return
+            votes = team_poll_get_votes(poll_id)
+            card = build_team_poll_card(poll, votes)
+            try:
+                with ApiClient(group_configuration) as api_client:
+                    resp = MessagingApi(api_client).reply_message(
+                        ReplyMessageRequest(reply_token=rtoken, messages=[card])
+                    )
+                    for m in (resp.sent_messages or []):
+                        group_bot_msg_ids.add(m.id)
+                    threading.Thread(target=save_bot_msg_ids, daemon=True).start()
+            except Exception as e:
+                print(f"[team_poll] postback reply 失敗：{e}")
+            return
 
     @group_handler.add(MessageEvent, message=TextMessageContent)
     def group_handle_message(event):
@@ -3182,17 +3497,42 @@ if group_handler:
             # 截掉 session 內部對話歷史，只保留最近 GROUP_HISTORY_KEEP_TURNS 輪，避免 Gemma 16k token/分爆量
             trim_group_session_history(gid)
 
-            # 組合最終回覆：若有新建揪團，先放報名表、再放 AI 的話
-            msgs = []
+            # 組合最終回覆：若有新建揪團或新投票卡，加進去；最後放 AI 的話
+            msgs = []  # mixed: str (TextMessage) 或 FlexMessage 物件
             signup_info = pending.get('signup')
             if signup_info:
                 msgs.append(format_signup_sheet(signup_info['event']))
+            team_poll_info = pending.get('team_poll')
+            if team_poll_info:
+                tp_poll = team_poll_get(team_poll_info['poll_id'])
+                if tp_poll:
+                    tp_votes = team_poll_get_votes(team_poll_info['poll_id'])
+                    msgs.append(build_team_poll_card(tp_poll, tp_votes))
             if ai_text:
                 msgs.append(ai_text)
             if not msgs:
                 return
 
-            sent_ids = group_reply_multi(rtoken, msgs)
+            # 把 str 轉成 TextMessage，其他保留
+            line_messages = []
+            for m in msgs[:5]:
+                if isinstance(m, str):
+                    line_messages.append(TextMessage(text=m))
+                else:
+                    line_messages.append(m)
+            sent_ids = []
+            try:
+                with ApiClient(group_configuration) as api_client:
+                    resp = MessagingApi(api_client).reply_message(
+                        ReplyMessageRequest(reply_token=rtoken, messages=line_messages)
+                    )
+                    for m in (resp.sent_messages or []):
+                        group_bot_msg_ids.add(m.id)
+                        sent_ids.append(m.id)
+                    if sent_ids:
+                        threading.Thread(target=save_bot_msg_ids, daemon=True).start()
+            except Exception as e:
+                print(f"[group] reply (含可能的 flex) 失敗：{e}")
             # 新揪團：把報名表 msg_id 存入 announce_msg_ids，才能 +/- 回覆
             if signup_info and sent_ids:
                 ev = signup_info['event']
@@ -3216,6 +3556,257 @@ def group_callback():
     except InvalidSignatureError:
         abort(400)
     return 'OK'
+
+
+# ─── 投票揪團網頁 ─────────────────────────────────────────
+TEAM_POLL_PAGE_HTML = r"""<!doctype html>
+<html lang="zh-Hant"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{ script }} 揪團投票</title>
+<style>
+:root{--green:#2E7D32;--blue:#1976D2;--gold:#FFC107;--bg:#F5F5F5;--card:#fff;--muted:#777}
+*{box-sizing:border-box}
+body{font-family:-apple-system,'Microsoft JhengHei',sans-serif;background:var(--bg);margin:0;padding:16px;color:#222;font-size:15px}
+.container{max-width:520px;margin:0 auto}
+.card{background:var(--card);border-radius:12px;padding:18px;margin-bottom:14px;box-shadow:0 2px 8px rgba(0,0,0,.06)}
+h1{font-size:20px;margin:0 0 4px;color:var(--blue)}
+.meta{font-size:13px;color:var(--muted);margin-bottom:6px}
+.status{font-weight:bold;font-size:14px;margin-top:6px}
+.status.open{color:var(--blue)}
+.status.closed{color:var(--green)}
+label{display:block;margin:8px 0 4px;font-size:13px;font-weight:bold}
+input[type=text]{width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;font-size:15px}
+.dates{margin-top:8px}
+.date-row{background:#FAFAFA;border:1px solid #E0E0E0;border-radius:8px;padding:10px;margin-bottom:8px}
+.date-row.chosen{background:#FFF8E1;border-color:var(--gold)}
+.date-row h3{margin:0 0 4px;font-size:15px}
+.date-row .voters{font-size:12px;color:var(--muted);margin:2px 0}
+.date-row .controls{margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.date-row label.check{display:flex;align-items:center;gap:6px;font-weight:normal;margin:0;font-size:14px}
+.date-row input[type=checkbox]{width:20px;height:20px}
+.date-row input[type=text].note{flex:1;min-width:160px;font-size:13px;padding:6px 8px}
+.notes-list{font-size:12px;color:#555;margin-top:4px}
+.notes-list div{margin:2px 0}
+.actions{display:flex;gap:10px;margin-top:14px}
+button{flex:1;padding:14px;border:none;border-radius:8px;font-size:16px;font-weight:bold;cursor:pointer}
+.btn-primary{background:var(--blue);color:#fff}
+.btn-success{background:var(--green);color:#fff}
+.btn-secondary{background:#E0E0E0;color:#333}
+button:disabled{opacity:.4;cursor:not-allowed}
+.close-section{margin-top:18px;padding:14px;background:#FFF8E1;border:1px dashed var(--gold);border-radius:8px}
+.close-section h3{margin:0 0 8px;font-size:14px;color:#7A6500}
+.close-section select{width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;margin-bottom:8px;font-size:14px}
+.toast{position:fixed;left:50%;bottom:30px;transform:translateX(-50%);background:#333;color:#fff;padding:10px 18px;border-radius:30px;font-size:14px;opacity:0;transition:opacity .3s}
+.toast.show{opacity:1}
+.closed-banner{background:#E8F5E9;border:2px solid var(--green);border-radius:8px;padding:14px;margin-bottom:14px;text-align:center;font-weight:bold;color:var(--green);font-size:16px}
+.reminder{background:#FFF3E0;border-left:4px solid var(--gold);padding:10px 12px;margin-top:10px;font-size:13px;border-radius:0 6px 6px 0}
+</style></head><body>
+<div class="container">
+{% if status == 'closed' %}
+<div class="closed-banner">✅ 已成團於 {{ chosen_date }}</div>
+{% endif %}
+
+<div class="card">
+  <h1>《{{ script }}》</h1>
+  <div class="meta">召集人：{{ organizer_name }}　|　上限 {{ max_people }} 人</div>
+  <div class="status {{ status }}">{% if status=='closed' %}已成團：{{ chosen_date }}{% else %}招募中（已 {{ voted_count }} 人投票）{% endif %}</div>
+</div>
+
+{% if status != 'closed' %}
+<div class="card">
+  <label>你的名字</label>
+  <input type="text" id="voter_name" placeholder="輸入你的名字（之後可以用同名字回來改）">
+</div>
+{% endif %}
+
+<div class="card">
+  <h3 style="margin:0 0 10px">候選日期</h3>
+  <div class="dates">
+    {% for date in dates %}
+    <div class="date-row {% if status=='closed' and date == chosen_date %}chosen{% endif %}" data-date="{{ date }}">
+      <h3>{% if status=='closed' and date == chosen_date %}⭐ {% endif %}{{ date }}</h3>
+      <div class="voters">✅ 可：{{ date_summary[date].yes|join('、') or '（無）' }}</div>
+      {% if date_summary[date].no %}
+      <div class="voters">❌ 不可：{{ date_summary[date].no|join('、') }}</div>
+      {% endif %}
+      {% if date_summary[date].notes %}
+      <div class="notes-list">{% for n in date_summary[date].notes %}<div>📝 {{ n }}</div>{% endfor %}</div>
+      {% endif %}
+      {% if status != 'closed' %}
+      <div class="controls">
+        <label class="check"><input type="checkbox" class="avail" data-date="{{ date }}"> 我可以</label>
+        <input type="text" class="note" data-date="{{ date }}" placeholder="備註（選填，公開）">
+      </div>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+</div>
+
+{% if status != 'closed' %}
+<div class="card">
+  <div class="actions">
+    <button class="btn-primary" id="btn-save">送出/更新我的投票</button>
+  </div>
+  <div class="reminder">💡 任何時候都可以回來編輯——用同一個名字進來，系統會自動同步你的紀錄。</div>
+</div>
+
+<div class="card close-section">
+  <h3>🏁 召集人：成團</h3>
+  <p style="font-size:13px;color:#555;margin:0 0 8px">選一個日期送出成團，這個揪團就會被鎖定不再開放投票。<br><strong>請務必回 LINE 群組點「已投/成團刷新」讓大家看到結果。</strong></p>
+  <select id="chosen_date">
+    <option value="">-- 選一個日期 --</option>
+    {% for date in dates %}<option value="{{ date }}">{{ date }}</option>{% endfor %}
+  </select>
+  <button class="btn-success" id="btn-close">確認成團</button>
+</div>
+{% endif %}
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const POLL_ID = "{{ poll_id }}";
+const DATES = {{ dates_json|safe }};
+
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.classList.add('show');
+  setTimeout(()=>t.classList.remove('show'), 2200);
+}
+
+// 載入：如果使用者重新進來，把他名下的勾選還原
+async function loadMyVotes() {
+  const name = document.getElementById('voter_name')?.value.trim();
+  if (!name) return;
+  try {
+    const r = await fetch(`/team-poll/${POLL_ID}/votes-for?name=${encodeURIComponent(name)}`);
+    const d = await r.json();
+    if (!d.ok) return;
+    for (const v of (d.votes || [])) {
+      const cb = document.querySelector(`.avail[data-date="${CSS.escape(v.date_label)}"]`);
+      const nt = document.querySelector(`.note[data-date="${CSS.escape(v.date_label)}"]`);
+      if (cb) cb.checked = !!v.available;
+      if (nt) nt.value = v.note || '';
+    }
+    toast('已載入你的紀錄');
+  } catch (e) {}
+}
+
+document.getElementById('voter_name')?.addEventListener('change', loadMyVotes);
+
+document.getElementById('btn-save')?.addEventListener('click', async () => {
+  const name = document.getElementById('voter_name').value.trim();
+  if (!name) { toast('請先輸入名字'); return; }
+  const votes = DATES.map(d => ({
+    date_label: d,
+    available: document.querySelector(`.avail[data-date="${CSS.escape(d)}"]`).checked,
+    note: document.querySelector(`.note[data-date="${CSS.escape(d)}"]`).value.trim(),
+  }));
+  const r = await fetch(`/team-poll/${POLL_ID}/vote`, {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({voter_name: name, votes})
+  });
+  const d = await r.json();
+  if (d.ok) {
+    toast('已送出，記得回 LINE 點「已投/成團刷新」');
+    setTimeout(()=>location.reload(), 1200);
+  } else {
+    toast(d.error || '送出失敗');
+  }
+});
+
+document.getElementById('btn-close')?.addEventListener('click', async () => {
+  const date = document.getElementById('chosen_date').value;
+  if (!date) { toast('請選一個日期'); return; }
+  if (!confirm(`確定要把這個揪團成團在「${date}」嗎？\n成團後就鎖定，無法再投票。`)) return;
+  const r = await fetch(`/team-poll/${POLL_ID}/close`, {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({chosen_date: date})
+  });
+  const d = await r.json();
+  if (d.ok) {
+    toast('已成團！記得回 LINE 點「已投/成團刷新」通知大家');
+    setTimeout(()=>location.reload(), 1500);
+  } else {
+    toast(d.error || '成團失敗');
+  }
+});
+</script>
+</body></html>
+"""
+
+from flask import render_template_string, jsonify
+
+@app.route("/team-poll/<poll_id>")
+def team_poll_page(poll_id):
+    poll = team_poll_get(poll_id)
+    if not poll:
+        return "找不到這個揪團", 404
+    votes = team_poll_get_votes(poll_id)
+    date_summary = {d: {'yes': [], 'no': [], 'notes': []} for d in poll['dates']}
+    for v in votes:
+        b = date_summary.get(v['date_label'])
+        if not b:
+            continue
+        if v['available']:
+            b['yes'].append(v['voter_name'])
+        else:
+            b['no'].append(v['voter_name'])
+        if v['note']:
+            b['notes'].append(f"{v['voter_name']}：{v['note']}")
+    voted_count = len({v['voter_name'] for v in votes})
+    return render_template_string(TEAM_POLL_PAGE_HTML,
+        poll_id=poll_id, script=poll['script'], organizer_name=poll['organizer_name'],
+        max_people=poll['max_people'], status=poll['status'], chosen_date=poll['chosen_date'],
+        dates=poll['dates'], date_summary=date_summary, voted_count=voted_count,
+        dates_json=json.dumps(poll['dates'], ensure_ascii=False),
+    )
+
+@app.route("/team-poll/<poll_id>/votes-for")
+def team_poll_votes_for(poll_id):
+    name = (request.args.get('name') or '').strip()
+    if not name:
+        return jsonify({'ok': False, 'error': 'missing name'})
+    votes = team_poll_get_votes(poll_id)
+    mine = [v for v in votes if v['voter_name'] == name]
+    return jsonify({'ok': True, 'votes': mine})
+
+@app.route("/team-poll/<poll_id>/vote", methods=['POST'])
+def team_poll_vote(poll_id):
+    poll = team_poll_get(poll_id)
+    if not poll:
+        return jsonify({'ok': False, 'error': '找不到這個揪團'})
+    if poll['status'] == 'closed':
+        return jsonify({'ok': False, 'error': '揪團已成團，無法再投票'})
+    data = request.get_json() or {}
+    voter_name = (data.get('voter_name') or '').strip()
+    votes_in = data.get('votes') or []
+    if not voter_name:
+        return jsonify({'ok': False, 'error': '請輸入名字'})
+    for v in votes_in:
+        date_label = (v.get('date_label') or '').strip()
+        if date_label not in poll['dates']:
+            continue
+        team_poll_upsert_vote(poll_id, voter_name, date_label,
+                              bool(v.get('available')), (v.get('note') or '').strip())
+    return jsonify({'ok': True})
+
+@app.route("/team-poll/<poll_id>/close", methods=['POST'])
+def team_poll_close_route(poll_id):
+    poll = team_poll_get(poll_id)
+    if not poll:
+        return jsonify({'ok': False, 'error': '找不到這個揪團'})
+    if poll['status'] == 'closed':
+        return jsonify({'ok': False, 'error': '已經成團過了'})
+    data = request.get_json() or {}
+    chosen_date = (data.get('chosen_date') or '').strip()
+    if chosen_date not in poll['dates']:
+        return jsonify({'ok': False, 'error': '不是合法的候選日期'})
+    if team_poll_close(poll_id, chosen_date):
+        return jsonify({'ok': True})
+    return jsonify({'ok': False, 'error': '寫入失敗'})
+
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
