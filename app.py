@@ -2452,6 +2452,35 @@ def execute_group_function(name, args, group_id, pending, uid=None):
             for vr in vrows[1:]:
                 if len(vr) >= 2:
                     voters_by_poll.setdefault(vr[0], set()).add(vr[1])
+
+            # 解析日期字串：'7/1 整天' / '2026-07-01' / '7-15' 抓出 (month, day)
+            import re as _re
+            from datetime import date as _date
+            today = _date.today()
+            def _date_in_future(label):
+                """label 是不是還沒過？解析失敗就當未來（保守不誤砍）"""
+                s = label.strip()
+                # 先試 YYYY-M-D
+                m = _re.search(r'(\d{4})[-/](\d{1,2})[-/](\d{1,2})', s)
+                if m:
+                    try:
+                        return _date(int(m.group(1)), int(m.group(2)), int(m.group(3))) >= today
+                    except Exception:
+                        return True
+                # 再試 M/D 或 M-D（沒年份就假設今年；若已過則視為明年）
+                m = _re.search(r'(\d{1,2})[/\-](\d{1,2})', s)
+                if m:
+                    try:
+                        mm, dd = int(m.group(1)), int(m.group(2))
+                        d_this = _date(today.year, mm, dd)
+                        # 沒給年份的「8/1」如果已過超過 30 天，當明年；否則當今年
+                        if d_this >= today:
+                            return True
+                        return (today - d_this).days <= 30 and False  # 已過就過了
+                    except Exception:
+                        return True
+                return True  # 解析不出來，保守保留
+
             open_list = []
             closed_list = []
             for r in rows[1:]:
@@ -2460,10 +2489,17 @@ def execute_group_function(name, args, group_id, pending, uid=None):
                 poll_id, gid, _ouid, oname, script, dates_csv, mx, status, chosen = r[:9]
                 if gid != group_id or status == 'deleted':
                     continue
+                dates_arr = [d.strip() for d in dates_csv.split('|') if d.strip()]
+                # 招募中但所有候選日都過期 → 跳過
+                if status == 'open' and dates_arr and not any(_date_in_future(d) for d in dates_arr):
+                    continue
+                # 已成團但成團日已過 → 跳過
+                if status == 'closed' and chosen and not _date_in_future(chosen):
+                    continue
                 entry = {
                     "script": script,
                     "organizer": oname,
-                    "dates": [d.strip() for d in dates_csv.split('|') if d.strip()],
+                    "dates": dates_arr,
                     "voted_count": len(voters_by_poll.get(poll_id, set())),
                     "max_people": int(mx) if mx and mx.isdigit() else 0,
                 }
