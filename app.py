@@ -3596,6 +3596,14 @@ if group_handler:
                     group_reply(rtoken, "本總裁剛才走神了，再說一次。")
                     return
 
+            # 紀錄這輪實際執行的動作工具（用來在回覆前加 ✅ 確認列，避免霸總純嘴砲）
+            # 卡片型工具（create_team_poll 走卡片路徑，不在這裡列）、查詢型工具（list_*）不列
+            ACTION_TOOL_NAMES = {
+                'replace_cover', 'update_script_meta', 'update_price', 'update_script',
+                'create_team', 'cancel_team', 'manage_team_members',
+            }
+            executed_actions = []  # [(tool_name, result_message)]
+
             # 最多跑 5 輪工具呼叫
             for _ in range(5):
                 # Gemini 2.5 在 finish_reason=MAX_TOKENS/SAFETY/RECITATION 時 parts 會是 None
@@ -3617,6 +3625,10 @@ if group_handler:
                 for fc in func_calls:
                     res = execute_group_function(fc.name, dict(fc.args), gid, pending, uid)
                     print(f"[group] tool_result {fc.name} -> {str(res)[:300]}")
+                    # 動作型工具成功 → 記下來，等下加 ✅ 確認列
+                    if fc.name in ACTION_TOOL_NAMES and isinstance(res, dict) and res.get('ok'):
+                        msg_txt = res.get('message') or f"{fc.name} 已完成"
+                        executed_actions.append((fc.name, msg_txt))
                     result_parts.append(types.Part.from_function_response(
                         name=fc.name,
                         response={"result": res}
@@ -3636,6 +3648,11 @@ if group_handler:
                     break
 
             ai_text = (response.text or '').strip() if response else ''
+
+            # 動作型工具有跑成功就在前面加 ✅ 確認列，避免霸總純嘴砲讓使用者不確定有沒有改到
+            if executed_actions:
+                confirm_lines = "\n".join(f"✅ {m}" for _, m in executed_actions)
+                ai_text = confirm_lines + ("\n\n" + ai_text if ai_text else "")
 
             # 截掉 session 內部對話歷史，只保留最近 GROUP_HISTORY_KEEP_TURNS 輪，避免 Gemma 16k token/分爆量
             trim_group_session_history(gid)
