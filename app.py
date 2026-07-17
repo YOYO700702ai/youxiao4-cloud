@@ -33,8 +33,9 @@ SHEETS_ENABLED       = bool(GOOGLE_SHEET_ID and _creds_dict)
 GOOGLE_CALENDAR_ID   = os.environ.get('GOOGLE_CALENDAR_ID', 'hankvictor1023@gmail.com')
 NOTION_TOKEN         = os.environ.get('NOTION_TOKEN', '')
 NOTION_DB_ID         = os.environ.get('NOTION_DATABASE_ID', '')
-GITHUB_TOKEN         = os.environ.get('GITHUB_TOKEN', '')
-GITHUB_REPO          = os.environ.get('GITHUB_REPO', 'YOYO700702ai/BGLARPA5')
+GITHUB_TOKEN         = os.environ.get('GITHUB_TOKEN', '').strip()
+GITHUB_REPO          = os.environ.get('GITHUB_REPO', 'YOYO700702ai/BGLARPA5').strip() or 'YOYO700702ai/BGLARPA5'
+GITHUB_BRANCH        = os.environ.get('GITHUB_BRANCH', 'main').strip() or 'main'
 
 # ── Facebook 粉專 ─────────────────────────────────────────
 FB_PAGES = {
@@ -803,22 +804,109 @@ import base64
 
 pending_image = {}  # {user_id: (bytes, timestamp)}
 
+def _raise_github_upload_error(response, action):
+    """把 GitHub API 錯誤轉成群組裡看得懂、可直接處理的訊息。"""
+    status = response.status_code
+    try:
+        detail = str(response.json().get("message", "")).strip()
+    except (ValueError, AttributeError):
+        detail = ""
+    detail_suffix = f"（GitHub：{detail[:160]}）" if detail else ""
+
+    if status == 401:
+        message = (
+            "GitHub 憑證已失效或不正確。請到 Railway → 專案 → Variables，"
+            "把 GITHUB_TOKEN 換成新的 GitHub fine-grained token；Repository access 選 "
+            f"{GITHUB_REPO}，Repository permissions 的 Contents 設為 Read and write。"
+        )
+    elif status == 403:
+        message = (
+            "GitHub 拒絕上傳。請確認 GITHUB_TOKEN 對 "
+            f"{GITHUB_REPO} 有 Contents: Read and write 權限，且 token 尚未過期。"
+        )
+    elif status == 404:
+        message = (
+            f"找不到 GitHub 倉庫或分支（{GITHUB_REPO} / {GITHUB_BRANCH}）。"
+            "請檢查 Railway 的 GITHUB_REPO、GITHUB_BRANCH，以及 token 是否有權存取該倉庫。"
+        )
+    elif status in (409, 422):
+        message = (
+            f"GitHub 無法寫入 {GITHUB_BRANCH} 分支，可能是同名檔案版本衝突或分支設定錯誤，"
+            "請稍後重試；若持續發生，請檢查 Railway 的 GITHUB_BRANCH。"
+        )
+    else:
+        message = f"GitHub 在{action}時發生錯誤（HTTP {status}）。"
+
+    raise RuntimeError(message + detail_suffix)
+
 def upload_image_to_github(image_bytes, filename):
+    from urllib.parse import quote
+
+    if not GITHUB_TOKEN:
+        raise RuntimeError(
+            "Railway 尚未設定 GITHUB_TOKEN。請建立可存取 "
+            f"{GITHUB_REPO}、具 Contents: Read and write 權限的 GitHub fine-grained token，"
+            "再加入 Railway → Variables。"
+        )
+    if not re.fullmatch(r"[^/\s]+/[^/\s]+", GITHUB_REPO):
+        raise RuntimeError("Railway 的 GITHUB_REPO 格式錯誤，請使用 owner/repository，例如 YOYO700702ai/BGLARPA5。")
+    if not image_bytes:
+        raise RuntimeError("封面圖片內容是空的，請重新傳送圖片。")
+
+    filename = os.path.basename(str(filename).strip())
+    if not filename:
+        raise RuntimeError("封面檔名是空的，無法上傳。")
+
     path = f"scraped_covers/{filename}"
-    url  = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
+    encoded_path = quote(path, safe="/")
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{encoded_path}"
     headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json"
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "lu-aotian-line-bot",
     }
-    r = requests.get(url, headers=headers)
-    sha = r.json().get('sha') if r.status_code == 200 else None
-    payload = {"message": f"上架封面：{filename}", "content": base64.b64encode(image_bytes).decode()}
+
+    try:
+        existing = requests.get(
+            url,
+            headers=headers,
+            params={"ref": GITHUB_BRANCH},
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"目前無法連線 GitHub 檢查封面，請稍後重試（{type(exc).__name__}）。") from exc
+
+    sha = None
+    if existing.status_code == 200:
+        try:
+            sha = existing.json().get("sha")
+        except (ValueError, AttributeError):
+            raise RuntimeError("GitHub 回傳的既有封面資料格式不正確，請稍後重試。")
+    elif existing.status_code != 404:
+        _raise_github_upload_error(existing, "檢查既有封面")
+
+    payload = {
+        "message": f"上架封面：{filename}",
+        "content": base64.b64encode(image_bytes).decode("ascii"),
+        "branch": GITHUB_BRANCH,
+    }
     if sha:
         payload["sha"] = sha
-    r = requests.put(url, headers=headers, json=payload)
-    if r.status_code in (200, 201):
-        return f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{path}"
-    raise Exception(f"GitHub 上傳失敗：{r.status_code} {r.text[:200]}")
+
+    try:
+        uploaded = requests.put(url, headers=headers, json=payload, timeout=30)
+    except requests.RequestException as exc:
+        raise RuntimeError(f"目前無法連線 GitHub 上傳封面，請稍後重試（{type(exc).__name__}）。") from exc
+
+    if uploaded.status_code in (200, 201):
+        try:
+            download_url = uploaded.json().get("content", {}).get("download_url")
+        except (ValueError, AttributeError):
+            download_url = None
+        return download_url or f"https://raw.githubusercontent.com/{GITHUB_REPO}/{quote(GITHUB_BRANCH, safe='')}/{encoded_path}"
+
+    _raise_github_upload_error(uploaded, "上傳封面")
 
 def create_notion_script(info, cover_url=None):
     headers = {
