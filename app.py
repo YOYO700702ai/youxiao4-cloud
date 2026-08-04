@@ -2311,6 +2311,57 @@ GROUP_FUNC_DECLS = [
     ),
 ]
 GROUP_TOOLS = [types.Tool(function_declarations=GROUP_FUNC_DECLS)]
+GROUP_TOOL_NAMES = {d.name for d in GROUP_FUNC_DECLS}
+
+# ── Gemma 洩漏型工具呼叫救援 ──────────────────────────────
+# Gemma 系模型不支援原生 function calling，會把呼叫「印」成純文字漏給使用者，
+# 例如：ferramenta_code:update_script(name='惡名昭著', new_duration='3.5小時')
+# 或 ```tool_code\nprint(update_script(...))```。（tool_code 前綴還會被隨機翻譯成其他語言）
+# 這裡從文字裡撈出合法呼叫實際執行，並把那串字從回覆裡砍掉。
+_LEAKED_CALL_RE  = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(([^()]*)\)")
+_LEAKED_KWARG_RE = re.compile(r"(\w+)\s*=\s*(?:'([^']*)'|\"([^\"]*)\"|(-?\d+(?:\.\d+)?))")
+
+def parse_leaked_tool_calls(text):
+    """從模型文字輸出撈出被印成純文字的工具呼叫，回傳 [(name, args_dict)]。
+    只認 GROUP_TOOL_NAMES 裡的名字，其他一律忽略。"""
+    calls, seen = [], set()
+    for m in _LEAKED_CALL_RE.finditer(text or ''):
+        name, argstr = m.group(1), m.group(2)
+        if name not in GROUP_TOOL_NAMES:
+            continue
+        args = {}
+        for am in _LEAKED_KWARG_RE.finditer(argstr):
+            key = am.group(1)
+            if am.group(4) is not None:
+                num = am.group(4)
+                args[key] = float(num) if '.' in num else int(num)
+            else:
+                args[key] = am.group(2) if am.group(2) is not None else am.group(3)
+        if not args:
+            continue
+        sig = (name, tuple(sorted(args.items())))
+        if sig in seen:
+            continue
+        seen.add(sig)
+        calls.append((name, args))
+    return calls
+
+_LEAKED_STRIP_RE = None  # lazy build，因為要用到 GROUP_TOOL_NAMES
+
+def strip_leaked_tool_calls(text):
+    """把洩漏的工具呼叫字樣（含 xxx_code 前綴、print() 包裝、code fence）從回覆中拿掉。"""
+    global _LEAKED_STRIP_RE
+    if not text:
+        return text
+    if _LEAKED_STRIP_RE is None:
+        names = "|".join(re.escape(n) for n in GROUP_TOOL_NAMES)
+        _LEAKED_STRIP_RE = re.compile(
+            r"(?:```[\w]*\s*)?(?:\b\w*_code\s*[:：]\s*)?(?:print\s*\(\s*)?"
+            r"\b(?:" + names + r")\s*\([^()]*\)\s*\)?\s*(?:```)?"
+        )
+    cleaned = _LEAKED_STRIP_RE.sub("", text)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned
 
 group_tool_sessions = {}  # {group_id: chat_session}
 GROUP_HISTORY_KEEP_TURNS = 5   # session 內部對話歷史最多保留幾輪（user 訊息算一輪）
@@ -3691,6 +3742,7 @@ if group_handler:
                 'create_team', 'cancel_team', 'manage_team_members',
             }
             executed_actions = []  # [(tool_name, result_message)]
+            leaked_done = set()    # 已救援執行過的洩漏呼叫，避免模型重複印同一句造成重複執行
 
             # 最多跑 5 輪工具呼叫
             for _ in range(5):
@@ -3708,7 +3760,39 @@ if group_handler:
                     if hasattr(p, 'function_call') and p.function_call and p.function_call.name
                 ]
                 if not func_calls:
-                    break
+                    # Gemma 洩漏型呼叫救援：模型把工具呼叫印成純文字（如 ferramenta_code:update_script(...)）
+                    leaked_text = "".join(getattr(p, 'text', '') or '' for p in _parts)
+                    leaked = parse_leaked_tool_calls(leaked_text)
+                    if not leaked:
+                        break
+                    feedback_lines = []
+                    for lname, largs in leaked:
+                        sig = (lname, tuple(sorted(largs.items())))
+                        if sig in leaked_done:
+                            feedback_lines.append(f"{lname}：剛才已執行過，不要重複呼叫")
+                            continue
+                        leaked_done.add(sig)
+                        res = execute_group_function(lname, largs, gid, pending, uid)
+                        print(f"[group] leaked_tool_call {lname}({largs}) -> {str(res)[:300]}")
+                        if lname in ACTION_TOOL_NAMES and isinstance(res, dict) and res.get('ok'):
+                            executed_actions.append((lname, res.get('message') or f"{lname} 已完成"))
+                        try:
+                            res_str = json.dumps(res, ensure_ascii=False, default=str)[:500]
+                        except Exception:
+                            res_str = str(res)[:500]
+                        feedback_lines.append(f"{lname} 執行結果：{res_str}")
+                    fb = (
+                        "（系統訊息：你剛才把工具呼叫印成了文字而沒有真的呼叫，系統已代為實際執行。"
+                        "結果如下，請直接根據結果用你的語氣回覆使用者，"
+                        "回覆中絕對不要再出現任何工具呼叫或程式碼字樣：\n"
+                        + "\n".join(feedback_lines) + "）"
+                    )
+                    try:
+                        response = session.send_message(fb)
+                        continue
+                    except Exception as e:
+                        print(f"[group] 洩漏呼叫回饋失敗：{e}")
+                        break
                 result_parts = []
                 for fc in func_calls:
                     res = execute_group_function(fc.name, dict(fc.args), gid, pending, uid)
@@ -3736,6 +3820,8 @@ if group_handler:
                     break
 
             ai_text = (response.text or '').strip() if response else ''
+            # 最終保險：就算救援後模型又印了呼叫字樣，也不讓它漏到使用者眼前
+            ai_text = strip_leaked_tool_calls(ai_text)
 
             # 動作型工具有跑成功就在前面加 ✅ 確認列，避免霸總純嘴砲讓使用者不確定有沒有改到
             if executed_actions:
