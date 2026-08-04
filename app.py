@@ -2313,8 +2313,9 @@ GROUP_FUNC_DECLS = [
 GROUP_TOOLS = [types.Tool(function_declarations=GROUP_FUNC_DECLS)]
 GROUP_TOOL_NAMES = {d.name for d in GROUP_FUNC_DECLS}
 
-# ── Gemma 洩漏型工具呼叫救援 ──────────────────────────────
-# Gemma 系模型不支援原生 function calling，會把呼叫「印」成純文字漏給使用者，
+# ── 洩漏型工具呼叫救援 ──────────────────────────────────
+# 模型有時會把工具呼叫「印」成純文字漏給使用者，而不是發出結構化 function_call：
+# Gemini 2.5 是已知偶發 bug（隨 Google 靜默更新時好時壞）；Gemma 系則是根本不支援原生 FC。
 # 例如：ferramenta_code:update_script(name='惡名昭著', new_duration='3.5小時')
 # 或 ```tool_code\nprint(update_script(...))```。（tool_code 前綴還會被隨機翻譯成其他語言）
 # 這裡從文字裡撈出合法呼叫實際執行，並把那串字從回覆裡砍掉。
@@ -3760,7 +3761,7 @@ if group_handler:
                     if hasattr(p, 'function_call') and p.function_call and p.function_call.name
                 ]
                 if not func_calls:
-                    # Gemma 洩漏型呼叫救援：模型把工具呼叫印成純文字（如 ferramenta_code:update_script(...)）
+                    # 洩漏型呼叫救援：模型把工具呼叫印成純文字（如 ferramenta_code:update_script(...)）
                     leaked_text = "".join(getattr(p, 'text', '') or '' for p in _parts)
                     leaked = parse_leaked_tool_calls(leaked_text)
                     if not leaked:
