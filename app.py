@@ -12,6 +12,8 @@ from linebot.v3.messaging import (
 from apscheduler.schedulers.background import BackgroundScheduler
 import os, json, re, time, datetime, threading, random
 import requests
+from notion_scripts import NotionScripts, validate_script_info
+from script_workflow import ScriptWorkflow, SCRIPT_TOOLS, EventGate, result_text
 from bs4 import BeautifulSoup
 from google import genai
 from google.genai import types
@@ -25,7 +27,8 @@ CHANNEL_SECRET       = os.environ['LINE_CHANNEL_SECRET']
 MY_USER_ID           = os.environ['LINE_MY_USER_ID']
 GEMINI_API_KEY       = os.environ['GEMINI_API_KEY']
 GEMMA_MODEL          = os.environ.get('GEMMA_MODEL', 'gemma-4-31b-it')
-GROUP_MODEL          = os.environ.get('GROUP_MODEL', GEMMA_MODEL)  # 小6 群組 bot 專用；沒設就跟小5 一樣
+GROUP_MODEL          = os.environ.get('GROUP_MODEL', 'gemini-3.8-flash').strip() or 'gemini-3.8-flash'
+APP_RELEASE          = '2026-09-15-flash38-flow1'
 GOOGLE_SHEET_ID      = os.environ.get('GOOGLE_SHEET_ID', '')
 _creds_raw           = os.environ.get('GOOGLE_CREDENTIALS_JSON', '')
 _creds_dict          = json.loads(_creds_raw) if _creds_raw else {}
@@ -36,6 +39,40 @@ NOTION_DB_ID         = os.environ.get('NOTION_DATABASE_ID', '')
 GITHUB_TOKEN         = os.environ.get('GITHUB_TOKEN', '').strip()
 GITHUB_REPO          = os.environ.get('GITHUB_REPO', 'YOYO700702ai/BGLARPA5').strip() or 'YOYO700702ai/BGLARPA5'
 GITHUB_BRANCH        = os.environ.get('GITHUB_BRANCH', 'main').strip() or 'main'
+
+notion_scripts = NotionScripts(NOTION_TOKEN, NOTION_DB_ID)
+
+
+def group_generation_config(**overrides):
+    """Shared bounded configuration for every 小六 model request."""
+    settings = {
+        'http_options': types.HttpOptions(timeout=20000,
+                                         retry_options=types.HttpRetryOptions(attempts=1)),
+        'automatic_function_calling': types.AutomaticFunctionCallingConfig(disable=True),
+        'max_output_tokens': 8192,
+    }
+    if GROUP_MODEL == 'gemini-3.8-flash':
+        settings['thinking_config'] = types.ThinkingConfig(thinking_level='low')
+        if overrides.get('tools'):
+            settings['tool_config'] = types.ToolConfig(
+                function_calling_config=types.FunctionCallingConfig(mode='VALIDATED'))
+    settings.update(overrides)
+    return types.GenerateContentConfig(**settings)
+
+
+def function_response_part(call, result):
+    # Keep the original call ID; the SDK chat preserves the model's signatures.
+    return types.Part(function_response=types.FunctionResponse(
+        id=getattr(call, 'id', None), name=call.name, response={'result': result}))
+
+
+def is_script_intent(message):
+    return any(word in message for word in (
+        '上架', '下架', '換封面', '換圖', '重新上傳', '修改劇本',
+        '更新劇本', '價格改', '時長改', '簡介改', '新增劇本',
+        '新增這本', '新增一本', '刪除劇本', '更換封面', '封面換',
+        '改價格', '改時長', '改簡介', '修改價格',
+    ))
 
 # ── Facebook 粉專 ─────────────────────────────────────────
 FB_PAGES = {
@@ -63,6 +100,7 @@ SCOPES = [
 def get_sheet(name):
     creds = Credentials.from_service_account_info(_creds_dict, scopes=SCOPES)
     gc = gspread.authorize(creds)
+    gc.set_timeout((4, 10))
     sh = gc.open_by_key(GOOGLE_SHEET_ID)
     try:
         return sh.worksheet(name)
@@ -872,7 +910,7 @@ def upload_image_to_github(image_bytes, filename):
             url,
             headers=headers,
             params={"ref": GITHUB_BRANCH},
-            timeout=20,
+            timeout=(4, 12),
         )
     except requests.RequestException as exc:
         raise RuntimeError(f"目前無法連線 GitHub 檢查封面，請稍後重試（{type(exc).__name__}）。") from exc
@@ -883,6 +921,10 @@ def upload_image_to_github(image_bytes, filename):
             sha = existing.json().get("sha")
         except (ValueError, AttributeError):
             raise RuntimeError("GitHub 回傳的既有封面資料格式不正確，請稍後重試。")
+        import hashlib
+        content_sha = hashlib.sha1(f'blob {len(image_bytes)}\0'.encode() + image_bytes).hexdigest()
+        if sha == content_sha:
+            return f"https://raw.githubusercontent.com/{GITHUB_REPO}/{quote(GITHUB_BRANCH, safe='')}/{encoded_path}"
     elif existing.status_code != 404:
         _raise_github_upload_error(existing, "檢查既有封面")
 
@@ -895,7 +937,7 @@ def upload_image_to_github(image_bytes, filename):
         payload["sha"] = sha
 
     try:
-        uploaded = requests.put(url, headers=headers, json=payload, timeout=30)
+        uploaded = requests.put(url, headers=headers, json=payload, timeout=(4, 15))
     except requests.RequestException as exc:
         raise RuntimeError(f"目前無法連線 GitHub 上傳封面，請稍後重試（{type(exc).__name__}）。") from exc
 
@@ -909,31 +951,7 @@ def upload_image_to_github(image_bytes, filename):
     _raise_github_upload_error(uploaded, "上傳封面")
 
 def create_notion_script(info, cover_url=None):
-    headers = {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Content-Type": "application/json",
-        "Notion-Version": "2022-06-28"
-    }
-    props = {"劇本名稱": {"title": [{"text": {"content": info.get("名稱", "")}}]}}
-    for field in ["劇情簡介", "類型標籤", "時長"]:
-        key = {"劇情簡介": "簡介"}.get(field, field)
-        if info.get(key):
-            props[field] = {"rich_text": [{"text": {"content": str(info[key])}}]}
-    if info.get("價格") is not None:
-        try: props["價格"] = {"number": int(info["價格"])}
-        except: pass
-    for field, key in [("類型", "類型"), ("人數", "人數"), ("角色", "角色")]:
-        if info.get(key):
-            items = [x.strip() for x in re.split(r'[/、,，\n]', str(info[key])) if x.strip()]
-            props[field] = {"multi_select": [{"name": x} for x in items]}
-    body = {"parent": {"database_id": NOTION_DB_ID}, "properties": props}
-    if cover_url:
-        body["cover"] = {"type": "external", "external": {"url": cover_url}}
-    r = requests.post("https://api.notion.com/v1/pages", headers=headers, json=body)
-    if r.status_code == 200:
-        return True, r.json().get("url", "")
-    print(f"[Notion] 上架失敗 status={r.status_code} body={r.text[:500]}")
-    return False, r.text[:300]
+    return notion_scripts.create(info, cover_url)
 
 def parse_script_info_with_ai(msg):
     prompt = (
@@ -961,154 +979,16 @@ def parse_script_info_with_ai(msg):
         return None
 
 def replace_notion_cover(name, cover_url):
-    page, err = find_notion_script_page(name)
-    if err:
-        return False, err
-    headers = {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Content-Type": "application/json",
-        "Notion-Version": "2022-06-28"
-    }
-    page_id = page["id"]
-    title_prop = page["properties"].get("劇本名稱", {}).get("title", [])
-    real_name = title_prop[0]["plain_text"] if title_prop else name
-    r2 = requests.patch(
-        f"https://api.notion.com/v1/pages/{page_id}",
-        headers=headers,
-        json={"cover": {"type": "external", "external": {"url": cover_url}}}
-    )
-    if r2.status_code == 200:
-        return True, f"《{real_name}》封面已更新。"
-    return False, f"更新失敗：{r2.text[:200]}"
+    return notion_scripts.replace_cover(name, cover_url)
 
 def find_notion_script_page(name):
-    """查 Notion 劇本頁面：精準→contains→列出多筆要求釐清。
-    回傳 (page, error_msg)；page 為 None 時 error_msg 是給使用者看的提示。"""
-    headers = {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Content-Type": "application/json",
-        "Notion-Version": "2022-06-28"
-    }
-    query_url = f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query"
-
-    def _query(filter_obj):
-        r = requests.post(query_url, headers=headers, json={"filter": filter_obj})
-        if r.status_code != 200:
-            return None, f"搜尋失敗：{r.text[:200]}"
-        return r.json().get("results", []), None
-
-    # 1) 精準比對
-    results, err = _query({"property": "劇本名稱", "title": {"equals": name}})
-    if err:
-        return None, err
-    if len(results) == 1:
-        return results[0], None
-    if len(results) > 1:
-        titles = []
-        for p in results[:8]:
-            tp = p["properties"].get("劇本名稱", {}).get("title", [])
-            titles.append("《" + (tp[0]["plain_text"] if tp else "(無名)") + "》")
-        return None, f"剛好有 {len(results)} 本叫「{name}」，請說清楚是哪一本：" + "、".join(titles)
-
-    # 2) 模糊比對 (contains)
-    results, err = _query({"property": "劇本名稱", "title": {"contains": name}})
-    if err:
-        return None, err
-    if not results:
-        return None, f"找不到含「{name}」的劇本，請確認名稱（劇本名要至少對到部分文字）。"
-    if len(results) == 1:
-        return results[0], None
-    titles = []
-    for p in results[:8]:
-        tp = p["properties"].get("劇本名稱", {}).get("title", [])
-        titles.append("《" + (tp[0]["plain_text"] if tp else "(無名)") + "》")
-    suffix = f"（共 {len(results)} 本，只列前 8 本）" if len(results) > 8 else ""
-    return None, f"含「{name}」的劇本有多本，請說清楚是哪一本：" + "、".join(titles) + suffix
+    return notion_scripts.find(name)
 
 def update_notion_script(name, fields):
-    """修改既有劇本的欄位。fields 是 {欄位中文名: 新值}，只更新有給的。multi_select 為覆寫。"""
-    page, err = find_notion_script_page(name)
-    if err:
-        return False, err
-    headers = {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Content-Type": "application/json",
-        "Notion-Version": "2022-06-28"
-    }
-    page_id = page["id"]
-    cur = page["properties"]
-    title_prop = cur.get("劇本名稱", {}).get("title", [])
-    real_name = title_prop[0]["plain_text"] if title_prop else name
-
-    def cur_text(key):
-        v = cur.get(key, {}).get("rich_text", [])
-        return v[0]["plain_text"] if v else ""
-    def cur_number(key):
-        return cur.get(key, {}).get("number")
-    def cur_multi(key):
-        return [x["name"] for x in cur.get(key, {}).get("multi_select", [])]
-
-    patch_props = {}
-    diff_lines = []
-
-    if "價格" in fields and fields["價格"] is not None:
-        try:
-            new = int(fields["價格"])
-            old = cur_number("價格")
-            if new != old:
-                patch_props["價格"] = {"number": new}
-                diff_lines.append(f"價格：{old}→{new}")
-        except Exception:
-            pass
-
-    for key in ("時長", "類型標籤", "劇情簡介"):
-        if key in fields and fields[key]:
-            new = str(fields[key])
-            old = cur_text(key)
-            if new != old:
-                patch_props[key] = {"rich_text": [{"text": {"content": new}}]}
-                diff_lines.append(f"{key}：{old or '(空)'}→{new}")
-
-    for key in ("類型", "人數", "角色"):
-        if key in fields and fields[key]:
-            items = [x.strip() for x in re.split(r'[/、,,\n]', str(fields[key])) if x.strip()]
-            old = cur_multi(key)
-            if items and items != old:
-                patch_props[key] = {"multi_select": [{"name": x} for x in items]}
-                diff_lines.append(f"{key}：{'/'.join(old) or '(空)'}→{'/'.join(items)}")
-
-    if not patch_props:
-        return False, f"《{real_name}》沒有需要更新的欄位（給的值跟現在一樣）。"
-
-    r2 = requests.patch(
-        f"https://api.notion.com/v1/pages/{page_id}",
-        headers=headers,
-        json={"properties": patch_props}
-    )
-    if r2.status_code == 200:
-        return True, f"《{real_name}》已更新：\n" + "\n".join(f"- {x}" for x in diff_lines)
-    return False, f"更新失敗：{r2.text[:200]}"
+    return notion_scripts.update(name, fields)
 
 def archive_notion_script(name):
-    page, err = find_notion_script_page(name)
-    if err:
-        return False, err
-    headers = {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Content-Type": "application/json",
-        "Notion-Version": "2022-06-28"
-    }
-    page_id = page["id"]
-    title_prop = page["properties"].get("劇本名稱", {}).get("title", [])
-    real_name = title_prop[0]["plain_text"] if title_prop else name
-    r2 = requests.patch(
-        f"https://api.notion.com/v1/pages/{page_id}",
-        headers=headers,
-        json={"archived": True}
-    )
-    if r2.status_code == 200:
-        return True, f"《{real_name}》已下架（封存）。"
-    return False, f"下架失敗：{r2.text[:200]}"
+    return notion_scripts.archive(name)
 
 # ── Function 執行器 ────────────────────────────────────────
 def execute_function(name, args, uid=None):
@@ -1222,10 +1102,7 @@ def ask_ai_with_tools(user_msg, uid=None):
         for fc in func_calls:
             res = execute_function(fc.name, dict(fc.args), uid)
             print(f"[TOOL RESULT] {fc.name} -> {str(res)[:300]}")
-            result_parts.append(types.Part.from_function_response(
-                name=fc.name,
-                response={"result": res}
-            ))
+            result_parts.append(function_response_part(fc, res))
         sent = False
         for attempt in range(3):
             try:
@@ -1369,7 +1246,7 @@ configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 
 @app.route("/health")
 def health():
-    return "OK"
+    return "OK", 200, {'X-Group-Model': GROUP_MODEL, 'X-Bot-Release': APP_RELEASE}
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -1474,15 +1351,64 @@ group_chat_log       = {}   # {group_id: [{"name": ..., "text": ...}, ...]}
 GROUP_CHAT_LOG_MAX   = 20
 group_bot_msg_ids    = set()  # 記錄 Bot 發出的訊息 ID，用來偵測 reply
 pending_group_image   = {}   # {(gid, uid): (message_id, timestamp)} 同一使用者最近 30 秒的圖片
-pending_script_upload = {}   # {(gid, uid): (info_dict, timestamp)} 等待封面圖的劇本資料，5分鐘 TTL
-pending_cover_replace = {}   # {(gid, uid): (script_name, timestamp)} 等待新封面圖，5分鐘 TTL
+# 圖片聊天沿用同一個 map；上架待辦統一由 workflow 管理。
+def _download_group_cover(message_id):
+    with ApiClient(group_configuration) as api_client:
+        return MessagingApiBlob(api_client).get_message_content(message_id, _request_timeout=(4, 15))
+
+script_workflow = ScriptWorkflow(
+    images=pending_group_image, validate=validate_script_info,
+    download=_download_group_cover, upload=upload_image_to_github,
+    create=create_notion_script, replace=replace_notion_cover,
+)
+script_event_gate = EventGate()
+
+
+def notify_script_result(gid, reply_token, outcomes):
+    """Send the actual operation receipt; retry delivery never reruns writes."""
+    if isinstance(outcomes, dict):
+        outcomes = [outcomes]
+    text = '\n\n'.join(result_text(r) for r in outcomes)
+    messages = [TextMessage(text=text[i:i+4500]) for i in range(0, len(text), 4500)][:5]
+    return bool(deliver_script_messages(gid, reply_token, messages))
+
+
+def deliver_script_messages(gid, reply_token, messages):
+    """Shared delivery for plain receipts and receipts mixed with team cards."""
+    try:
+        with ApiClient(group_configuration) as api_client:
+            resp = MessagingApi(api_client).reply_message(
+                ReplyMessageRequest(reply_token=reply_token, messages=messages),
+                _request_timeout=(4, 12),
+            )
+            for sent in (resp.sent_messages or []):
+                group_bot_msg_ids.add(sent.id)
+        return [sent.id for sent in (resp.sent_messages or [])]
+    except Exception as exc:
+        # Only a definite expired/invalid token gets a push fallback. A network
+        # timeout may mean LINE already delivered the reply; don't duplicate it.
+        invalid_token = getattr(exc, 'status', None) == 400 and 'reply token' in str(getattr(exc, 'body', '')).lower()
+        print(f'[script] reply error={type(exc).__name__} invalid_token={invalid_token}')
+        if not invalid_token:
+            return []
+    try:
+        with ApiClient(group_configuration) as api_client:
+            resp = MessagingApi(api_client).push_message(
+                PushMessageRequest(to=gid, messages=messages), _request_timeout=(4, 12),
+            )
+            for sent in (resp.sent_messages or []):
+                group_bot_msg_ids.add(sent.id)
+        return [sent.id for sent in (resp.sent_messages or [])]
+    except Exception as exc:
+        print(f'[script] push error={type(exc).__name__}; receipt available via 上架狀態')
+        return []
 
 if GROUP_BOT_TOKEN and GROUP_BOT_SECRET:
     group_handler       = WebhookHandler(GROUP_BOT_SECRET)
     group_configuration = Configuration(access_token=GROUP_BOT_TOKEN)
     try:
         with ApiClient(group_configuration) as _api:
-            GROUP_BOT_USER_ID = MessagingApi(_api).get_bot_info().user_id
+            GROUP_BOT_USER_ID = MessagingApi(_api).get_bot_info(_request_timeout=(4, 8)).user_id
     except:
         GROUP_BOT_USER_ID = None
 else:
@@ -2228,7 +2154,20 @@ GROUP_FUNC_DECLS = [
         parameters=types.Schema(
             type=types.Type.OBJECT,
             properties={
-                "data": types.Schema(type=types.Type.STRING, description="劇本完整資料，包含名稱、類型、人數、時長、價格、角色、簡介等"),
+                "data": types.Schema(
+                    type=types.Type.OBJECT,
+                    description="直接提取使用者提供的劇本欄位，不猜測缺少資料。名稱必填，其餘沒提供就省略。",
+                    properties={
+                        "名稱": types.Schema(type=types.Type.STRING),
+                        "類型": types.Schema(type=types.Type.STRING, description="恐怖/微恐/驚悚/沉浸/情感/演繹/推理/還原/機制/陣營/歡樂/撕逼/硬核/燒腦；多個用/分隔"),
+                        "人數": types.Schema(type=types.Type.STRING, description="5人/6人/7人/8人/9人/10人/11人/浮動人；多個用/分隔"),
+                        "價格": types.Schema(type=types.Type.INTEGER),
+                        "時長": types.Schema(type=types.Type.STRING),
+                        "類型標籤": types.Schema(type=types.Type.STRING),
+                        "角色": types.Schema(type=types.Type.STRING, description="每個角色用/分隔"),
+                        "簡介": types.Schema(type=types.Type.STRING),
+                    }, required=["名稱"],
+                ),
             },
             required=["data"],
         ),
@@ -2238,7 +2177,7 @@ GROUP_FUNC_DECLS = [
         description=(
             "修改 Notion 上既有劇本的欄位（價格、人數、類型、時長、類型標籤、角色、劇情簡介）。"
             "使用者說『《XXX》改成 X 人』『XXX 價格改 X』『把 XXX 的時長改成 X』『XXX 簡介改成…』等時呼叫。"
-            "至少要給一個 new_* 欄位。"
+            "至少要給一個 new_* 欄位。明確要求清空時傳 null；未要求修改的欄位請省略。"
             "【極重要】multi_select 欄位（人數/類型/角色）是『覆寫』，使用者給什麼就完全變成什麼，不是追加；除非使用者明說要保留原本再加。"
             "【極重要】絕對禁止只用文字回覆『改好了』『更新完成』而不實際呼叫此工具。"
         ),
@@ -2246,13 +2185,13 @@ GROUP_FUNC_DECLS = [
             type=types.Type.OBJECT,
             properties={
                 "name":         types.Schema(type=types.Type.STRING, description="要修改的劇本名稱（必填，用來定位 Notion 頁面，請完整準確）"),
-                "new_price":    types.Schema(type=types.Type.INTEGER, description="新價格，純數字（例如 800）"),
-                "new_people":   types.Schema(type=types.Type.STRING, description="新人數，多個用 / 分隔；合法值：5人/6人/7人/8人/9人/10人/11人/浮動人。會覆寫原本的人數設定"),
-                "new_type":     types.Schema(type=types.Type.STRING, description="新類型，多個用 / 分隔；合法值：恐怖/微恐/驚悚/沉浸/情感/演繹/推理/還原/機制/陣營/歡樂/撕逼/硬核/燒腦。會覆寫"),
-                "new_duration": types.Schema(type=types.Type.STRING, description="新時長，例如「3小時」「3.5小時」"),
-                "new_type_tag": types.Schema(type=types.Type.STRING, description="新的類型標籤（封面卡片自訂文字，例如「推理沉浸」「高難度」）"),
-                "new_roles":    types.Schema(type=types.Type.STRING, description="新角色清單，多個用 / 分隔。會覆寫"),
-                "new_summary":  types.Schema(type=types.Type.STRING, description="新的劇情簡介"),
+                "new_price":    types.Schema(type=types.Type.INTEGER, nullable=True, description="新價格，純數字（例如 800）"),
+                "new_people":   types.Schema(type=types.Type.STRING, nullable=True, description="新人數，多個用 / 分隔；合法值：5人/6人/7人/8人/9人/10人/11人/浮動人。會覆寫原本的人數設定"),
+                "new_type":     types.Schema(type=types.Type.STRING, nullable=True, description="新類型，多個用 / 分隔；合法值：恐怖/微恐/驚悚/沉浸/情感/演繹/推理/還原/機制/陣營/歡樂/撕逼/硬核/燒腦。會覆寫"),
+                "new_duration": types.Schema(type=types.Type.STRING, nullable=True, description="新時長，例如「3小時」「3.5小時」"),
+                "new_type_tag": types.Schema(type=types.Type.STRING, nullable=True, description="新的類型標籤（封面卡片自訂文字，例如「推理沉浸」「高難度」）"),
+                "new_roles":    types.Schema(type=types.Type.STRING, nullable=True, description="新角色清單，多個用 / 分隔。會覆寫"),
+                "new_summary":  types.Schema(type=types.Type.STRING, nullable=True, description="新的劇情簡介"),
             },
             required=["name"],
         ),
@@ -2315,7 +2254,7 @@ GROUP_TOOL_NAMES = {d.name for d in GROUP_FUNC_DECLS}
 
 # ── 洩漏型工具呼叫救援 ──────────────────────────────────
 # 模型有時會把工具呼叫「印」成純文字漏給使用者，而不是發出結構化 function_call：
-# Gemini 2.5 是已知偶發 bug（隨 Google 靜默更新時好時壞）；Gemma 系則是根本不支援原生 FC。
+# 以下只為非劇本工具保留舊版相容處理；劇本寫入只能接受原生 function_call。
 # 例如：ferramenta_code:update_script(name='惡名昭著', new_duration='3.5小時')
 # 或 ```tool_code\nprint(update_script(...))```。（tool_code 前綴還會被隨機翻譯成其他語言）
 # 這裡從文字裡撈出合法呼叫實際執行，並把那串字從回覆裡砍掉。
@@ -2324,11 +2263,11 @@ _LEAKED_KWARG_RE = re.compile(r"(\w+)\s*=\s*(?:'([^']*)'|\"([^\"]*)\"|(-?\d+(?:\
 
 def parse_leaked_tool_calls(text):
     """從模型文字輸出撈出被印成純文字的工具呼叫，回傳 [(name, args_dict)]。
-    只認 GROUP_TOOL_NAMES 裡的名字，其他一律忽略。"""
+    只認非劇本工具；普通文字裡的劇本寫入範例不會執行。"""
     calls, seen = [], set()
     for m in _LEAKED_CALL_RE.finditer(text or ''):
         name, argstr = m.group(1), m.group(2)
-        if name not in GROUP_TOOL_NAMES:
+        if name not in GROUP_TOOL_NAMES or name in SCRIPT_TOOLS:
             continue
         args = {}
         for am in _LEAKED_KWARG_RE.finditer(argstr):
@@ -2384,12 +2323,14 @@ def _build_group_sys_prompt(group_id):
             sys_prompt = MASHA_PERSONA + "\n\n" + mem
     return sys_prompt
 
-def new_group_tool_session(group_id=None, initial_history=None):
+def new_group_tool_session(group_id=None, initial_history=None, include_memory=True):
     _gc = group_gemini_client or gemini_client
     return _gc.chats.create(
         model=GROUP_MODEL,
         history=initial_history or [],
-        config=types.GenerateContentConfig(system_instruction=_build_group_sys_prompt(group_id), tools=GROUP_TOOLS),
+        config=group_generation_config(
+            system_instruction=_build_group_sys_prompt(group_id if include_memory else None), tools=GROUP_TOOLS,
+        ),
     )
 
 def get_group_tool_session(group_id):
@@ -2668,42 +2609,10 @@ def execute_group_function(name, args, group_id, pending, uid=None):
             )
 
         if name == 'upload_script':
-            key = (group_id, uid) if uid else None
-            data_str = (args.get('data') or '').strip()
-
-            if not data_str:
-                return {"ok": False, "message": "請提供劇本資料（名稱、類型、人數等）。"}
-
-            info = parse_script_info_with_ai(data_str)
-            if not info or not info.get('名稱'):
-                return "請提供劇本名稱和資料，例如：《XXX》推理 5人 3小時 800元"
-
-            # 檢查使用者自己最近 30 秒是否剛傳了圖
-            img_entry = pending_group_image.pop(key, None) if key else None
-            img_bytes = None
-            if img_entry and (time.time() - img_entry[1]) < 300:
-                try:
-                    with ApiClient(group_configuration) as api_client:
-                        img_bytes = MessagingApiBlob(api_client).get_message_content(img_entry[0])
-                except Exception as e:
-                    print(f"[group] 下載封面圖失敗：{e}")
-
-            if img_bytes:
-                try:
-                    safe_name = re.sub(r'[\\/*?:"<>|]', '_', info['名稱'])
-                    cover_url = upload_image_to_github(img_bytes, f"{safe_name}.jpg")
-                except Exception as e:
-                    return f"封面上傳失敗：{e}"
-                ok, result = create_notion_script(info, cover_url)
-                if ok:
-                    return f"《{info['名稱']}》已新增到 Notion，封面也上傳好了！"
-                return f"上架失敗：{result}"
-
-            # 沒圖→存劇本資料，等使用者傳圖後由圖片 handler 完成上架
-            if key:
-                pending_script_upload[key] = (info, time.time())
-            return {"ok": False, "waiting_image": True,
-                    "message": f"《{info['名稱']}》資料收到了，請在5分鐘內傳封面圖，傳完自動上架。"}
+            data = args.get('data')
+            if not isinstance(data, dict):
+                return {"ok": False, "message": "未收到有效的劇本欄位，尚未上架。請重新傳劇本資料並 @ 小六。"}
+            return script_workflow.start((group_id, uid), 'upload', data)
 
         if name == 'update_script':
             field_map = {
@@ -2715,45 +2624,18 @@ def execute_group_function(name, args, group_id, pending, uid=None):
                 'new_roles':    '角色',
                 'new_summary':  '劇情簡介',
             }
-            fields = {field_map[k]: v for k, v in args.items() if k in field_map and v not in (None, '')}
+            fields = {field_map[k]: v for k, v in args.items() if k in field_map}
             if not fields:
-                return "至少要給一個要改的欄位（價格/人數/類型/時長/類型標籤/角色/簡介）。"
-            _, result = update_notion_script(args['name'], fields)
-            return result
+                return {"ok": False, "message": "至少要給一個要改的欄位（價格/人數/類型/時長/類型標籤/角色/簡介）。"}
+            ok, result = update_notion_script(args.get('name'), fields)
+            return {"ok": ok, "message": result}
 
         if name == 'remove_script':
-            _, result = archive_notion_script(args['name'])
-            return result
+            ok, result = archive_notion_script(args.get('name'))
+            return {"ok": ok, "message": result}
 
         if name == 'replace_cover':
-            key = (group_id, uid) if uid else None
-            script_name = (args.get('name') or '').strip()
-            if not script_name:
-                return "請告訴本總裁要換哪一本的封面。"
-
-            # 檢查使用者最近 5 分鐘是否剛傳了圖
-            img_entry = pending_group_image.pop(key, None) if key else None
-            img_bytes = None
-            if img_entry and (time.time() - img_entry[1]) < 300:
-                try:
-                    with ApiClient(group_configuration) as api_client:
-                        img_bytes = MessagingApiBlob(api_client).get_message_content(img_entry[0])
-                except Exception as e:
-                    print(f"[group] 下載新封面失敗：{e}")
-
-            if img_bytes:
-                try:
-                    safe_name = re.sub(r'[\\/*?:"<>|]', '_', script_name)
-                    cover_url = upload_image_to_github(img_bytes, f"{safe_name}.jpg")
-                except Exception as e:
-                    return f"封面上傳失敗：{e}"
-                ok, result = replace_notion_cover(script_name, cover_url)
-                return result
-
-            # 沒圖→存起來等圖
-            if key:
-                pending_cover_replace[key] = (script_name, time.time())
-            return f"收到，請在5分鐘內傳《{script_name}》的新封面圖，傳完自動更新。"
+            return script_workflow.start((group_id, uid), 'cover', args.get('name'))
 
         if name == 'search_web':
             return search_web(args['query'], int(args.get('max_results', 5)))
@@ -2769,10 +2651,10 @@ def execute_group_function(name, args, group_id, pending, uid=None):
 def get_member_name(group_id, user_id):
     try:
         with ApiClient(group_configuration) as api_client:
-            profile = MessagingApi(api_client).get_group_member_profile(group_id, user_id)
+            profile = MessagingApi(api_client).get_group_member_profile(group_id, user_id, _request_timeout=(4, 8))
             return profile.display_name
     except:
-        return f"成員{user_id[-4:]}"
+        return f"成員{(user_id or '')[-4:]}"
 
 # ── 群組記憶系統 ───────────────────────────────────────────
 def append_chat_buffer(group_id, user_id, name, text):
@@ -2892,7 +2774,8 @@ def compress_group_memory():
                 "若無新資訊可更新，users/events 可為空陣列。"
             )
             try:
-                resp = _gc.models.generate_content(model=GROUP_MODEL, contents=prompt)
+                resp = _gc.models.generate_content(model=GROUP_MODEL, contents=prompt,
+                                                  config=group_generation_config(response_mime_type='application/json'))
                 text = re.sub(r'^```json\s*|^```\s*|\s*```$', '', resp.text.strip(), flags=re.MULTILINE)
                 data = json.loads(text)
             except Exception as e:
@@ -3249,7 +3132,7 @@ def group_chat_ai(msg, history=None, group_id=None, speaker_uid=None, speaker_na
             contents = prompt_text
         resp = _gc.models.generate_content(
             model=GROUP_MODEL,
-            config=types.GenerateContentConfig(safety_settings=_SAFETY_OFF),
+            config=group_generation_config(safety_settings=_SAFETY_OFF),
             contents=contents,
         )
         text = resp.text.strip() if resp.text else ''
@@ -3342,6 +3225,7 @@ if group_handler:
                 print(f"[group] leave_group 失敗：{e}")
 
     @group_handler.add(MessageEvent, message=ImageMessageContent)
+    @script_event_gate.wrap
     def group_handle_image(event):
         if not hasattr(event.source, 'group_id'):
             return
@@ -3350,63 +3234,10 @@ if group_handler:
             return
         uid  = event.source.user_id
         key  = (gid, uid)
-        # 記錄此使用者最近傳的圖，供「先說文字再傳圖」或「先傳圖再說文字」兩種順序使用
-        pending_group_image[key] = (event.message.id, time.time())
-        print(f"[group] 圖片已暫存：gid={gid} uid={uid} msg_id={event.message.id}")
-        print(f"[group] pending_script_upload keys={list(pending_script_upload.keys())}")
-
-        # 若有待換封面的劇本，直接換
-        cover_entry = pending_cover_replace.pop(key, None)
-        if cover_entry and (time.time() - cover_entry[1]) < 300:
-            script_name = cover_entry[0]
-            print(f"[group] 找到待換封面劇本：{script_name}")
-            try:
-                with ApiClient(group_configuration) as api_client:
-                    img_bytes = MessagingApiBlob(api_client).get_message_content(event.message.id)
-                safe_name = re.sub(r'[\\/*?:"<>|]', '_', script_name)
-                cover_url = upload_image_to_github(img_bytes, f"{safe_name}.jpg")
-                ok, result = replace_notion_cover(script_name, cover_url)
-                msg = result
-            except Exception as e:
-                print(f"[group] 換封面時出錯：{e}")
-                msg = f"換封面時出錯：{e}"
-            try:
-                with ApiClient(group_configuration) as api_client:
-                    MessagingApi(api_client).push_message(
-                        PushMessageRequest(to=gid, messages=[TextMessage(text=msg)])
-                    )
-            except Exception as e:
-                print(f"[group] 換封面 push 失敗：{e}")
+        outcome = script_workflow.receive_image(key, event.message.id)
+        if outcome:
+            notify_script_result(gid, event.reply_token, outcome)
             return
-
-        # 若有待上架的劇本資料，直接完成上架
-        script_entry = pending_script_upload.pop(key, None)
-        if script_entry and (time.time() - script_entry[1]) < 300:
-            print(f"[group] 找到待上架資料，開始上架：{script_entry[0].get('名稱')}")
-            info = script_entry[0]
-            try:
-                with ApiClient(group_configuration) as api_client:
-                    img_bytes = MessagingApiBlob(api_client).get_message_content(event.message.id)
-                print(f"[group] 圖片下載成功，大小={len(img_bytes)}")
-                safe_name = re.sub(r'[\\/*?:"<>|]', '_', info['名稱'])
-                cover_url = upload_image_to_github(img_bytes, f"{safe_name}.jpg")
-                print(f"[group] GitHub 上傳完成：{cover_url}")
-                ok, result = create_notion_script(info, cover_url)
-                print(f"[group] Notion 上架結果：ok={ok} result={result}")
-                msg = f"《{info['名稱']}》已上架到 Notion，封面也上傳好了！" if ok else f"上架失敗：{result}"
-            except Exception as e:
-                print(f"[group] 上架時出錯：{e}")
-                msg = f"上架時出錯：{e}"
-            # 用 push 而非 reply，避免上傳耗時導致 reply token 過期
-            try:
-                with ApiClient(group_configuration) as api_client:
-                    MessagingApi(api_client).push_message(
-                        PushMessageRequest(to=gid, messages=[TextMessage(text=msg)])
-                    )
-            except Exception as e:
-                print(f"[group] image handler push 失敗：{e}")
-        else:
-            print(f"[group] 沒有待上架資料（script_entry={script_entry is not None}）")
 
         # ── 2% 機率看圖主動插嘴 ──
         if random.random() < 0.02:
@@ -3476,6 +3307,7 @@ if group_handler:
             return
 
     @group_handler.add(MessageEvent, message=TextMessageContent)
+    @script_event_gate.wrap
     def group_handle_message(event):
         if not hasattr(event.source, 'group_id'):
             uid = event.source.user_id
@@ -3545,13 +3377,24 @@ if group_handler:
         msg = event.message.text.strip()
         rtoken = event.reply_token
 
+        command = msg.strip()
+        if command in ('上架狀態', '重試上架', '取消上架'):
+            method = {'上架狀態': script_workflow.status,
+                      '重試上架': script_workflow.retry,
+                      '取消上架': script_workflow.cancel}[command]
+            notify_script_result(gid, rtoken, method((gid, uid)))
+            return
+
         # ── 記錄訊息到短期上下文 + 落地到 buffer ──
-        sender_name = get_member_name(gid, uid)
+        script_intent = is_script_intent(msg)
+        # Publishing doesn't need remote profile/memory lookups before the tool.
+        sender_name = f"成員{(uid or '')[-4:]}" if script_intent else get_member_name(gid, uid)
         log = group_chat_log.setdefault(gid, [])
         log.append({"name": sender_name, "text": msg})
         if len(log) > GROUP_CHAT_LOG_MAX:
             log.pop(0)
-        append_chat_buffer(gid, uid, sender_name, msg)
+        if not script_intent:
+            append_chat_buffer(gid, uid, sender_name, msg)
 
         # ── 偵測是否被 @ ──
         bot_mentioned = False
@@ -3676,15 +3519,15 @@ if group_handler:
             # 不要被「最近有傳圖→走視覺路線」攔截，否則 AI 看不到工具就會嘴砲說「處理了」。
             TOOL_INTENT_WORDS = ['換封面', '換圖', '換掉', '封面圖', '重新上傳', '上架', '揪團', '組團', '取消揪', '改時間', '改日期', '改人數']
             has_tool_intent = any(w in msg for w in TOOL_INTENT_WORDS)
+            has_tool_intent = has_tool_intent or script_intent
             print(f"[group] bot_mentioned=True, tool_intent={has_tool_intent}, has_pending_img={(gid, uid) in pending_group_image}")
 
             # 若使用者最近 5 分鐘傳過圖、且沒有明顯工具意圖 → 走視覺路線（看圖聊天，不用 function calling）
-            img_entry = pending_group_image.get((gid, uid))
-            if img_entry and (time.time() - img_entry[1]) < 300 and not has_tool_intent:
+            img_entry = script_workflow.take_chat_image((gid, uid)) if not has_tool_intent else None
+            if img_entry:
                 try:
                     with ApiClient(group_configuration) as api_client:
                         img_bytes = MessagingApiBlob(api_client).get_message_content(img_entry[0])
-                    pending_group_image.pop((gid, uid), None)
                     reply = group_chat_ai(
                         msg, history=log, group_id=gid,
                         speaker_uid=uid, speaker_name=sender_name,
@@ -3709,7 +3552,7 @@ if group_handler:
             user_turn = f"現在是 {now_str}。\n{ctx_lines}{sender_name} 對陸傲天說：{msg}"
 
             try:
-                session = get_group_tool_session(gid)
+                session = new_group_tool_session(gid, include_memory=not script_intent)
             except Exception as e:
                 print(f"[group] session 建立失敗：{e}")
                 group_reply(rtoken, "本總裁剛才走神了，再說一次。")
@@ -3718,15 +3561,19 @@ if group_handler:
             pending = {}
             print(f"[group] 送訊息到 session：{user_turn[:50]}")
             response = None
-            for attempt in range(3):
+            initial_attempts = 2 if script_intent else 3
+            for attempt in range(initial_attempts):
                 try:
                     response = session.send_message(user_turn)
                     break
                 except Exception as e:
                     print(f"[group] session.send_message 失敗（第{attempt+1}次）：{e}")
-                    if attempt < 2:
-                        time.sleep(4 * (attempt + 1))
+                    if attempt < initial_attempts - 1:
+                        time.sleep(1 if script_intent else 4 * (attempt + 1))
             if response is None:
+                if script_intent:
+                    group_reply(rtoken, "AI 暫時無法處理指令，這次沒有執行劇本寫入。請稍後重送資料；先前的待辦可傳「上架狀態」查詢。")
+                    return
                 # 三次都失敗，重建 session 再試最後一次
                 try:
                     session = reset_group_tool_session(gid)
@@ -3742,6 +3589,8 @@ if group_handler:
                 'replace_cover', 'update_script_meta', 'update_price', 'update_script',
                 'create_team', 'cancel_team', 'manage_team_members',
             }
+            script_results = []
+            executed_calls = {}
             executed_actions = []  # [(tool_name, result_message)]
             leaked_done = set()    # 已救援執行過的洩漏呼叫，避免模型重複印同一句造成重複執行
 
@@ -3765,6 +3614,8 @@ if group_handler:
                     leaked_text = "".join(getattr(p, 'text', '') or '' for p in _parts)
                     leaked = parse_leaked_tool_calls(leaked_text)
                     if not leaked:
+                        if any(re.search(r'\b' + re.escape(n) + r'\s*\(', leaked_text) for n in SCRIPT_TOOLS):
+                            script_results.append({"ok": False, "message": "模型未送出有效的劇本工具指令，尚未執行。請重新傳資料並 @ 小六。"})
                         break
                     feedback_lines = []
                     for lname, largs in leaked:
@@ -3796,16 +3647,27 @@ if group_handler:
                         break
                 result_parts = []
                 for fc in func_calls:
-                    res = execute_group_function(fc.name, dict(fc.args), gid, pending, uid)
+                    call_args = dict(fc.args or {})
+                    signature = (fc.name, json.dumps(call_args, ensure_ascii=False, sort_keys=True))
+                    if signature not in executed_calls:
+                        executed_calls[signature] = execute_group_function(fc.name, call_args, gid, pending, uid)
+                    res = executed_calls[signature]
+                    if fc.name in SCRIPT_TOOLS:
+                        if not isinstance(res, dict) or 'message' not in res:
+                            res = {"ok": False, "message": "劇本操作未完成，請傳「上架狀態」查詢；未確認前請勿重複新增。"}
+                        if res not in script_results:
+                            script_results.append(res)
+                        script_workflow.remember_result((gid, uid), res)
                     print(f"[group] tool_result {fc.name} -> {str(res)[:300]}")
                     # 動作型工具成功 → 記下來，等下加 ✅ 確認列
                     if fc.name in ACTION_TOOL_NAMES and isinstance(res, dict) and res.get('ok'):
                         msg_txt = res.get('message') or f"{fc.name} 已完成"
                         executed_actions.append((fc.name, msg_txt))
-                    result_parts.append(types.Part.from_function_response(
-                        name=fc.name,
-                        response={"result": res}
-                    ))
+                    result_parts.append(function_response_part(fc, res))
+                if script_results:
+                    # Writes are complete (or waiting/failed). Never ask AI to
+                    # rewrite this receipt or replay the mutation after failure.
+                    break
                 sent = False
                 for attempt in range(3):
                     try:
@@ -3820,9 +3682,17 @@ if group_handler:
                     reset_group_tool_session(gid)
                     break
 
+            if script_intent and not script_results:
+                script_results.append({"ok": False, "message": "這次沒有執行劇本寫入。請提供完整劇本名稱與要新增或修改的資料，再 @ 小六；有待辦時可直接傳「上架狀態」。"})
+            if script_results and not pending:
+                notify_script_result(gid, rtoken, script_results)
+                return
+
             ai_text = (response.text or '').strip() if response else ''
             # 最終保險：就算救援後模型又印了呼叫字樣，也不讓它漏到使用者眼前
             ai_text = strip_leaked_tool_calls(ai_text)
+            if script_results:
+                ai_text = '\n\n'.join(result_text(r) for r in script_results)
 
             # 動作型工具有跑成功就在前面加 ✅ 確認列，避免霸總純嘴砲讓使用者不確定有沒有改到
             if executed_actions:
@@ -3844,7 +3714,7 @@ if group_handler:
                 if tp_poll:
                     tp_votes = team_poll_get_votes(team_poll_info['poll_id'])
                     msgs.append(build_team_poll_card(tp_poll, tp_votes))
-            if ai_text and not msgs:
+            if ai_text and (not msgs or script_results):
                 msgs.append(ai_text)
             if not msgs:
                 return
@@ -3853,9 +3723,17 @@ if group_handler:
             line_messages = []
             for m in msgs[:5]:
                 if isinstance(m, str):
-                    line_messages.append(TextMessage(text=m))
+                    line_messages.extend(TextMessage(text=m[i:i+4500]) for i in range(0, len(m), 4500))
                 else:
                     line_messages.append(m)
+            line_messages = line_messages[:5]
+            if script_results:
+                sent_ids = deliver_script_messages(gid, rtoken, line_messages)
+                if signup_info and sent_ids:
+                    ev = signup_info['event']
+                    ev.setdefault('announce_msg_ids', []).append(sent_ids[0])
+                    save_group_event(signup_info['row_num'], ev)
+                return
             sent_ids = []
             try:
                 with ApiClient(group_configuration) as api_client:
