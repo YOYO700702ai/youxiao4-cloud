@@ -218,35 +218,83 @@ class OfflineStartupTests(unittest.TestCase):
                     'LINE_MY_USER_ID': 'test', 'GEMINI_API_KEY': 'test',
                     'GROUP_BOT_TOKEN': 'test', 'GROUP_BOT_SECRET': 'test',
                     'APPDATA': str(Path(__file__).parent / 'nonexistent-test-config')}
-        with patch.dict(os.environ, fake_env, clear=True), \
-             patch.object(socket.socket, 'connect', side_effect=AssertionError('network forbidden')), \
-             patch.object(BackgroundScheduler, 'start'), patch.object(threading.Thread, 'start'), \
-             patch.object(MessagingApi, 'get_bot_info', return_value=NS(user_id='test')):
-            spec = importlib.util.spec_from_file_location('app_offline_smoke', Path(__file__).parents[1] / 'app.py')
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            self.assertTrue(module.group_handler)
-            self.assertIn('/group/callback', {rule.rule for rule in module.app.url_map.iter_rules()})
-            config = module.new_group_tool_session()._config
-            self.assertEqual(config.http_options.timeout, 20000)
-            self.assertEqual(config.http_options.retry_options.attempts, 1)
-            self.assertTrue(config.tools)
-            self.assertEqual(module.GROUP_MODEL, 'gemini-3.1-pro-preview')
-            self.assertEqual(config.thinking_config.thinking_level, types.ThinkingLevel.LOW)
-            self.assertTrue(config.automatic_function_calling.disable)
-            self.assertEqual(config.tool_config.function_calling_config.mode,
-                             types.FunctionCallingConfigMode.VALIDATED)
-            self.assertEqual(config.max_output_tokens, 8192)
-            self.assertIsNone(config.temperature)
-            self.assertIsNone(config.top_p)
-            self.assertIsNone(config.top_k)
-            response = module.app.test_client().get('/health')
-            self.assertEqual(response.data, b'OK')
-            self.assertEqual(response.headers['X-Group-Model'], 'gemini-3.1-pro-preview')
-            module.gemini_client.close()
+        for model in ('gemini-3.1-pro-preview', 'claude-sonnet-5'):
+            fake_env['GROUP_MODEL'] = model
+            fake_env['GROUP_ANTHROPIC_API_KEY'] = 'test-claude-key'
+            provider = 'anthropic' if model.startswith('claude-') else 'gemini'
+            with self.subTest(model=model), patch.dict(os.environ, fake_env, clear=True), \
+                 patch.object(socket.socket, 'connect', side_effect=AssertionError('network forbidden')), \
+                 patch.object(BackgroundScheduler, 'start'), patch.object(threading.Thread, 'start'), \
+                 patch.object(MessagingApi, 'get_bot_info', return_value=NS(user_id='test')):
+                spec = importlib.util.spec_from_file_location('app_offline_smoke', Path(__file__).parents[1] / 'app.py')
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                self.assertTrue(module.group_handler)
+                self.assertIn('/group/callback', {rule.rule for rule in module.app.url_map.iter_rules()})
+                session = module.new_group_tool_session()
+                config = session._config
+                if isinstance(config, dict):
+                    config = types.GenerateContentConfig(**config)
+                self.assertEqual(config.http_options.timeout, 20000)
+                self.assertEqual(config.http_options.retry_options.attempts, 1)
+                self.assertTrue(config.tools)
+                self.assertEqual(module.GROUP_MODEL, model)
+                self.assertEqual(module.GROUP_PROVIDER, provider)
+                if provider == 'gemini':
+                    self.assertEqual(config.thinking_config.thinking_level, types.ThinkingLevel.LOW)
+                    self.assertEqual(config.tool_config.function_calling_config.mode,
+                                     types.FunctionCallingConfigMode.VALIDATED)
+                else:
+                    self.assertIs(module.get_group_ai_client(), module.group_claude_client)
+                    self.assertIsNone(config.thinking_config)
+                self.assertTrue(config.automatic_function_calling.disable)
+                self.assertEqual(config.max_output_tokens, 8192)
+                self.assertIsNone(config.temperature)
+                self.assertIsNone(config.top_p)
+                self.assertIsNone(config.top_k)
+                response = module.app.test_client().get('/health')
+                self.assertEqual(response.data, b'OK')
+                self.assertEqual(response.headers['X-Group-Model'], model)
+                self.assertEqual(response.headers['X-Group-Provider'], provider)
+                module.gemini_client.close()
+                if module.group_claude_client is not None:
+                    module.group_claude_client.close()
 
 
 class GroupModelMigrationTests(unittest.TestCase):
+    def test_claude_provider_never_silently_falls_back_to_gemini(self):
+        env = {'GROUP_PROVIDER': 'anthropic', 'group_claude_client': None,
+               'group_gemini_client': Mock(), 'gemini_client': Mock()}
+        load_functions(['get_group_ai_client'], env)
+        with self.assertRaises(RuntimeError):
+            env['get_group_ai_client']()
+        client = object()
+        env['group_claude_client'] = client
+        self.assertIs(env['get_group_ai_client'](), client)
+
+    def test_chat_image_and_memory_summary_use_the_selected_client(self):
+        client = Mock()
+        client.models.generate_content.return_value.text = '測試回覆'
+        sheet = Mock()
+        sheet.get_all_values.return_value = [['group', 'user', '測試成員', '測試內容']] * 5
+        env = {'get_group_ai_client': Mock(return_value=client), 'GROUP_MODEL': 'claude-sonnet-5',
+               'group_generation_config': Mock(return_value=object()), 'types': types,
+               'MASHA_PERSONA': '測試設定', '_SAFETY_OFF': [], 'SHEETS_ENABLED': True,
+               'group_configuration': object(), 'get_sheet': Mock(return_value=sheet),
+               'ALLOWED_GROUP_IDS': {'group'}, 'load_group_user_notes': Mock(return_value=[]),
+               'load_group_events_log': Mock(return_value=[]), 'json': json, 're': re,
+               'clear_chat_buffer_for_group': Mock()}
+        load_functions(['group_chat_ai', 'compress_group_memory'], env)
+        self.assertEqual(env['group_chat_ai']('看圖片', image_bytes=b'test-image'), '測試回覆')
+        image_request = client.models.generate_content.call_args.kwargs
+        self.assertEqual(image_request['model'], 'claude-sonnet-5')
+        self.assertEqual(image_request['contents'][0].inline_data.data, b'test-image')
+        client.models.generate_content.return_value.text = '{"users":[],"events":[]}'
+        env['compress_group_memory']()
+        self.assertEqual(client.models.generate_content.call_count, 2)
+        self.assertEqual(client.models.generate_content.call_args.kwargs['model'], 'claude-sonnet-5')
+        env['clear_chat_buffer_for_group'].assert_called_once_with('group')
+
     def test_function_response_retains_call_id_and_name(self):
         env = {'types': types}
         load_functions(['function_response_part'], env)

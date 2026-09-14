@@ -14,6 +14,7 @@ import os, json, re, time, datetime, threading, random
 import requests
 from notion_scripts import NotionScripts, validate_script_info
 from script_workflow import ScriptWorkflow, SCRIPT_TOOLS, EventGate, result_text
+from claude_adapter import ClaudeClient
 from bs4 import BeautifulSoup
 from google import genai
 from google.genai import types
@@ -27,8 +28,9 @@ CHANNEL_SECRET       = os.environ['LINE_CHANNEL_SECRET']
 MY_USER_ID           = os.environ['LINE_MY_USER_ID']
 GEMINI_API_KEY       = os.environ['GEMINI_API_KEY']
 GEMMA_MODEL          = os.environ.get('GEMMA_MODEL', 'gemma-4-31b-it')
-GROUP_MODEL          = os.environ.get('GROUP_MODEL', 'gemini-3.1-pro-preview').strip() or 'gemini-3.1-pro-preview'
-APP_RELEASE          = '2026-09-15-pro31-flow1'
+GROUP_MODEL          = os.environ.get('GROUP_MODEL', 'claude-sonnet-5').strip() or 'claude-sonnet-5'
+GROUP_PROVIDER       = os.environ.get('GROUP_PROVIDER', '').strip().lower() or ('anthropic' if GROUP_MODEL.startswith('claude-') else 'gemini')
+APP_RELEASE          = '2026-09-15-claude-flow1'
 GOOGLE_SHEET_ID      = os.environ.get('GOOGLE_SHEET_ID', '')
 _creds_raw           = os.environ.get('GOOGLE_CREDENTIALS_JSON', '')
 _creds_dict          = json.loads(_creds_raw) if _creds_raw else {}
@@ -1246,7 +1248,8 @@ configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 
 @app.route("/health")
 def health():
-    return "OK", 200, {'X-Group-Model': GROUP_MODEL, 'X-Bot-Release': APP_RELEASE}
+    return "OK", 200, {'X-Group-Model': GROUP_MODEL, 'X-Group-Provider': GROUP_PROVIDER,
+                       'X-Bot-Release': APP_RELEASE}
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -1304,6 +1307,19 @@ GROUP_BOT_SECRET  = os.environ.get('GROUP_BOT_SECRET', '')
 GROUP_GEMINI_KEY  = os.environ.get('GROUP_GEMINI_KEY', '')
 GROUP_OWNER_ID    = os.environ.get('GROUP_OWNER_ID', '')
 group_gemini_client = genai.Client(api_key=GROUP_GEMINI_KEY) if GROUP_GEMINI_KEY else None
+GROUP_ANTHROPIC_API_KEY = (os.environ.get('GROUP_ANTHROPIC_API_KEY') or os.environ.get('ANTHROPIC_API_KEY', '')).strip()
+group_claude_client = (ClaudeClient(api_key=GROUP_ANTHROPIC_API_KEY, model=GROUP_MODEL)
+                      if GROUP_PROVIDER == 'anthropic' and GROUP_ANTHROPIC_API_KEY else None)
+
+
+def get_group_ai_client():
+    if GROUP_PROVIDER == 'anthropic':
+        if group_claude_client is None:
+            raise RuntimeError('小六的 Claude API 尚未設定。')
+        return group_claude_client
+    if GROUP_PROVIDER == 'gemini':
+        return group_gemini_client or gemini_client
+    raise ValueError('小六的 AI 供應商設定不受支援。')
 ALLOWED_GROUP_IDS = set(x.strip() for x in os.environ.get('ALLOWED_GROUP_IDS', '').split(',') if x.strip())
 
 # 群組成員性別對照表（以 LINE 顯示名稱關鍵字比對）
@@ -2324,7 +2340,7 @@ def _build_group_sys_prompt(group_id):
     return sys_prompt
 
 def new_group_tool_session(group_id=None, initial_history=None, include_memory=True):
-    _gc = group_gemini_client or gemini_client
+    _gc = get_group_ai_client()
     return _gc.chats.create(
         model=GROUP_MODEL,
         history=initial_history or [],
@@ -2742,7 +2758,7 @@ def compress_group_memory():
                 continue
             by_group.setdefault(row[0], []).append(row)
 
-        _gc = group_gemini_client or gemini_client
+        _gc = get_group_ai_client()
         for gid, chats in by_group.items():
             if gid not in ALLOWED_GROUP_IDS:
                 continue
@@ -3113,7 +3129,7 @@ def group_chat_ai(msg, history=None, group_id=None, speaker_uid=None, speaker_na
                 memory_ctx += "【最近發生的事】\n" + "\n".join(f"- {e}" for e in events) + "\n\n"
 
         speaker_line = f"發話的是 {speaker_name}。\n" if speaker_name else ""
-        _gc = group_gemini_client or gemini_client
+        _gc = get_group_ai_client()
         prompt_text = (
             MASHA_PERSONA + "\n\n"
             f"{events_ctx}"
