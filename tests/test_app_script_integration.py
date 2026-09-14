@@ -231,7 +231,7 @@ class OfflineStartupTests(unittest.TestCase):
             self.assertEqual(config.http_options.timeout, 20000)
             self.assertEqual(config.http_options.retry_options.attempts, 1)
             self.assertTrue(config.tools)
-            self.assertEqual(module.GROUP_MODEL, 'gemini-3.8-flash')
+            self.assertEqual(module.GROUP_MODEL, 'gemini-3.1-pro-preview')
             self.assertEqual(config.thinking_config.thinking_level, types.ThinkingLevel.LOW)
             self.assertTrue(config.automatic_function_calling.disable)
             self.assertEqual(config.tool_config.function_calling_config.mode,
@@ -242,11 +242,11 @@ class OfflineStartupTests(unittest.TestCase):
             self.assertIsNone(config.top_k)
             response = module.app.test_client().get('/health')
             self.assertEqual(response.data, b'OK')
-            self.assertEqual(response.headers['X-Group-Model'], 'gemini-3.8-flash')
+            self.assertEqual(response.headers['X-Group-Model'], 'gemini-3.1-pro-preview')
             module.gemini_client.close()
 
 
-class FlashMigrationTests(unittest.TestCase):
+class GroupModelMigrationTests(unittest.TestCase):
     def test_function_response_retains_call_id_and_name(self):
         env = {'types': types}
         load_functions(['function_response_part'], env)

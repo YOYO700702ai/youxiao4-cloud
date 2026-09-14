@@ -27,8 +27,8 @@ CHANNEL_SECRET       = os.environ['LINE_CHANNEL_SECRET']
 MY_USER_ID           = os.environ['LINE_MY_USER_ID']
 GEMINI_API_KEY       = os.environ['GEMINI_API_KEY']
 GEMMA_MODEL          = os.environ.get('GEMMA_MODEL', 'gemma-4-31b-it')
-GROUP_MODEL          = os.environ.get('GROUP_MODEL', 'gemini-3.8-flash').strip() or 'gemini-3.8-flash'
-APP_RELEASE          = '2026-09-15-flash38-flow1'
+GROUP_MODEL          = os.environ.get('GROUP_MODEL', 'gemini-3.1-pro-preview').strip() or 'gemini-3.1-pro-preview'
+APP_RELEASE          = '2026-09-15-pro31-flow1'
 GOOGLE_SHEET_ID      = os.environ.get('GOOGLE_SHEET_ID', '')
 _creds_raw           = os.environ.get('GOOGLE_CREDENTIALS_JSON', '')
 _creds_dict          = json.loads(_creds_raw) if _creds_raw else {}
@@ -51,7 +51,7 @@ def group_generation_config(**overrides):
         'automatic_function_calling': types.AutomaticFunctionCallingConfig(disable=True),
         'max_output_tokens': 8192,
     }
-    if GROUP_MODEL == 'gemini-3.8-flash':
+    if GROUP_MODEL in ('gemini-3.8-flash', 'gemini-3.1-pro-preview'):
         settings['thinking_config'] = types.ThinkingConfig(thinking_level='low')
         if overrides.get('tools'):
             settings['tool_config'] = types.ToolConfig(

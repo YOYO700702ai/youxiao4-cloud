@@ -35,7 +35,7 @@ FAKE_TYPES = SimpleNamespace(**{
 })
 
 
-def response(parts=None, text=None, version="gemini-3.8-flash", usage=True):
+def response(parts=None, text=None, version="gemini-3.1-pro-preview", usage=True):
     return record(
         candidates=[record(content=record(parts=parts or []))],
         text=text,
@@ -85,8 +85,8 @@ class GroupAiProbeTests(unittest.TestCase):
     def test_success_uses_one_chat_two_calls_and_preserves_native_id(self):
         result = self.run_mock()
         self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["model_requested"], "gemini-3.8-flash")
-        self.assertEqual(result["model_returned"], ["gemini-3.8-flash"] * 2)
+        self.assertEqual(result["model_requested"], "gemini-3.1-pro-preview")
+        self.assertEqual(result["model_returned"], ["gemini-3.1-pro-preview"] * 2)
         self.assertEqual(result["tokens"][0]["total"], 132)
         self.assertEqual(self.session.send_message.call_count, 2)
         self.client.chats.create.assert_called_once()
@@ -137,7 +137,7 @@ class GroupAiProbeTests(unittest.TestCase):
             response(text="echo_script_probe(...)"),
             response([self.original_part, self.original_part]),
             response([record(function_call=record(id="id", name="write_notion", args={}))]),
-            response([record(function_call=record(id=None, name=self.probe.TOOL_NAME, args=self.probe.EXPECTED_ARGS))]),
+            response([record(function_call=record(id="", name=self.probe.TOOL_NAME, args=self.probe.EXPECTED_ARGS))]),
             response([record(function_call=record(id="id", name=self.probe.TOOL_NAME, args={"title": "wrong"}))]),
         ]
         for invalid in cases:
@@ -147,6 +147,19 @@ class GroupAiProbeTests(unittest.TestCase):
                 result = self.run_mock()
                 self.assertEqual(result["status"], "failed")
                 self.assertEqual(self.session.send_message.call_count, 1)
+
+    def test_pro31_omitted_call_id_is_preserved_without_inventing_one(self):
+        self.call.id = None
+        self.assertEqual(self.run_mock()["status"], "ok")
+        tool_part = self.session.send_message.call_args_list[1].args[0][0]
+        self.assertIsNone(tool_part.function_response.id)
+        self.assertEqual(tool_part.function_response.name, self.probe.TOOL_NAME)
+
+    def test_flash38_still_requires_a_native_call_id(self):
+        self.env["GROUP_MODEL"] = "gemini-3.8-flash"
+        self.call.id = None
+        self.assertEqual(self.run_mock()["status"], "failed")
+        self.assertEqual(self.session.send_message.call_count, 1)
 
     def test_final_ack_required_and_no_extra_native_call_accepted(self):
         for final in (response(text="Done"), response([self.original_part], text="ACK")):

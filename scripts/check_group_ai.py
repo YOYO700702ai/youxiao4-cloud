@@ -15,7 +15,7 @@ import re
 import time
 
 
-DEFAULT_MODEL = "gemini-3.8-flash"
+DEFAULT_MODEL = "gemini-3.1-pro-preview"
 TOOL_NAME = "echo_script_probe"
 EXPECTED_ARGS = {
     "title": "DIAGNOSTIC-FICTION-ALPHA",
@@ -199,13 +199,18 @@ def run_probe(environ=None):
             if any(type(call.args[name]) is not type(value) for name, value in EXPECTED_ARGS.items()):
                 raise ProbeFailure()
             public_failure = "The native function call did not include a usable ID."
-            if not isinstance(call.id, str) or not call.id or len(call.id) > 512:
+            native_id = getattr(call, "id", None)
+            # 3.8 requires a call ID; 3.1 may omit it. Never invent one.
+            requires_id = model.removeprefix("models/") == "gemini-3.8-flash"
+            if (requires_id and native_id is None) or (native_id is not None and (
+                not isinstance(native_id, str) or not native_id or len(native_id) > 512
+            )):
                 raise ProbeFailure()
             # The same SDK chat retains the unmodified model turn and signatures.
             # This is the only local "tool": equality checks plus a fixed echo.
             tool_result = types.Part(
                 function_response=types.FunctionResponse(
-                    id=call.id,
+                    id=native_id,
                     name=call.name,
                     response={"ok": True, "echo": dict(EXPECTED_ARGS)},
                 )
