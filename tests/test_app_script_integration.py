@@ -218,7 +218,7 @@ class OfflineStartupTests(unittest.TestCase):
                     'LINE_MY_USER_ID': 'test', 'GEMINI_API_KEY': 'test',
                     'GROUP_BOT_TOKEN': 'test', 'GROUP_BOT_SECRET': 'test',
                     'APPDATA': str(Path(__file__).parent / 'nonexistent-test-config')}
-        for model in ('gemini-3.1-pro-preview', 'claude-sonnet-5'):
+        for model in ('gemini-3.8-flash', 'gemini-3.1-pro-preview', 'claude-sonnet-5'):
             fake_env['GROUP_MODEL'] = model
             fake_env['GROUP_ANTHROPIC_API_KEY'] = 'test-claude-key'
             provider = 'anthropic' if model.startswith('claude-') else 'gemini'

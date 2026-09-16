@@ -35,7 +35,7 @@ FAKE_TYPES = SimpleNamespace(**{
 })
 
 
-def response(parts=None, text=None, version="gemini-3.1-pro-preview", usage=True):
+def response(parts=None, text=None, version="gemini-3.8-flash", usage=True):
     return record(
         candidates=[record(content=record(parts=parts or []))],
         text=text,
@@ -85,8 +85,8 @@ class GroupAiProbeTests(unittest.TestCase):
     def test_success_uses_one_chat_two_calls_and_preserves_native_id(self):
         result = self.run_mock()
         self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["model_requested"], "gemini-3.1-pro-preview")
-        self.assertEqual(result["model_returned"], ["gemini-3.1-pro-preview"] * 2)
+        self.assertEqual(result["model_requested"], "gemini-3.8-flash")
+        self.assertEqual(result["model_returned"], ["gemini-3.8-flash"] * 2)
         self.assertEqual(result["tokens"][0]["total"], 132)
         self.assertEqual(self.session.send_message.call_count, 2)
         self.client.chats.create.assert_called_once()
@@ -149,6 +149,8 @@ class GroupAiProbeTests(unittest.TestCase):
                 self.assertEqual(self.session.send_message.call_count, 1)
 
     def test_pro31_omitted_call_id_is_preserved_without_inventing_one(self):
+        self.env["GROUP_MODEL"] = "gemini-3.1-pro-preview"
+        self.first.model_version = self.final.model_version = self.env["GROUP_MODEL"]
         self.call.id = None
         self.assertEqual(self.run_mock()["status"], "ok")
         tool_part = self.session.send_message.call_args_list[1].args[0][0]

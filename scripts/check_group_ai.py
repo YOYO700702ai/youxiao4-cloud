@@ -15,7 +15,7 @@ import re
 import time
 
 
-DEFAULT_MODEL = "gemini-3.1-pro-preview"
+DEFAULT_MODEL = "gemini-3.8-flash"
 TOOL_NAME = "echo_script_probe"
 EXPECTED_ARGS = {
     "title": "DIAGNOSTIC-FICTION-ALPHA",
