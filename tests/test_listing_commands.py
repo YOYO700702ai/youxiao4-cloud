@@ -28,6 +28,12 @@ class ListingCommandsTests(unittest.TestCase):
         with self.assertRaises(ListingInputError):
             parse_listing_command('上架《A》\n劇本：B')
 
+    def test_visual_spacing_around_title_keeps_explicit_commands(self):
+        self.assertEqual(parse_listing_command('接下來這 7 張是 《魔女論破》 的角色圖'),
+                         {'action': 'label', 'name': '魔女論破', 'purpose': 'portraits', 'count': 7})
+        self.assertEqual(parse_listing_command('接下來這張是 《魔女論破》 的封面')['purpose'], 'cover')
+        self.assertEqual(parse_listing_command('陸總，補 《魔女論破》 的角色圖')['kind'], 'portraits')
+
     def test_manual_correction_and_existing_portraits(self):
         self.assertEqual(parse_listing_command('配對角色 3：傲慢魔女的親眷')['index'], 3)
         self.assertEqual(parse_listing_command('確認圖片 1 為封面')['action'], 'confirm_cover')

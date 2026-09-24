@@ -92,7 +92,7 @@ def parse_listing_command(message):
         r'(?:接下來(?:這)?\s*(?P<n1>[\d一二三四五六七八九十兩]+)?\s*張|'
         r'下一張|這\s*(?P<n2>[\d一二三四五六七八九十兩]+)\s*張|'
         r'這批(?:\s*(?P<n3>[\d一二三四五六七八九十兩]+)\s*張)?)'
-        r'\s*(?:是|為)\s*(?:《(?P<title>[^》\r\n]+)》(?:的)?)?'
+        r'\s*(?:是|為)\s*(?:《(?P<title>[^》\r\n]+)》\s*(?:的\s*)?)?'
         r'(?P<purpose>封面|角色圖)[。！!]*', text)
     if batch:
         raw = batch['n1'] or batch['n2'] or batch['n3']
@@ -108,7 +108,7 @@ def parse_listing_command(message):
             raise ListingInputError('封面一次只收 1 張。')
         return {'action': 'label', 'name': batch['title'], 'purpose': 'cover', 'count': 1}
 
-    existing = re.fullmatch(r'(?:補上?|新增|更換|更新|替換)\s*《([^》\r\n]+)》(?:的)?(角色圖|封面)[。！!]*', text)
+    existing = re.fullmatch(r'(?:補上?|新增|更換|更新|替換)\s*《([^》\r\n]+)》\s*(?:的\s*)?(角色圖|封面)[。！!]*', text)
     if existing:
         return {'action': 'begin', 'kind': 'portraits' if existing[2] == '角色圖' else 'cover', 'data': {'名稱': existing[1].strip()}}
     if re.match(r'^(?:上架|新增)(?:劇本)?(?:\s|《|[:：]|$)', text):
