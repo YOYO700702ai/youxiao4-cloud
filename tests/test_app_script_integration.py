@@ -3,6 +3,7 @@ import ast
 import base64
 import datetime
 import hashlib
+import hmac
 import importlib.util
 import json
 import os
@@ -349,26 +350,54 @@ class DeliveryAndCoverTests(unittest.TestCase):
 
 class OfflineStartupTests(unittest.TestCase):
     def test_real_sdk_startup_and_group_route_without_network_or_jobs(self):
-        fake_env = {'LINE_CHANNEL_ACCESS_TOKEN': 'test', 'LINE_CHANNEL_SECRET': 'test',
-                    'LINE_MY_USER_ID': 'test', 'GEMINI_API_KEY': 'test',
-                    'GROUP_BOT_TOKEN': 'test', 'GROUP_BOT_SECRET': 'test',
+        base_env = {'GROUP_BOT_TOKEN': 'test', 'GROUP_BOT_SECRET': 'test',
                     'APPDATA': str(Path(__file__).parent / 'nonexistent-test-config')}
         # Keep OS loader paths when clearing credentials: httpcore/trio may
         # lazily resolve system libraries on Windows during real SDK startup.
-        fake_env.update({name: os.environ[name] for name in ('PATH', 'SystemRoot', 'WINDIR') if name in os.environ})
-        for model in ('gemini-3.8-flash', 'gemini-3.1-pro-preview', 'claude-sonnet-5'):
+        base_env.update({name: os.environ[name] for name in ('PATH', 'SystemRoot', 'WINDIR') if name in os.environ})
+        scenarios = (
+            ('gemini-3.8-flash', {'GROUP_GEMINI_KEY': 'test-group'}, 'test-group', ''),
+            ('gemini-3.1-pro-preview', {'GEMINI_API_KEY': 'test-fallback'}, 'test-fallback', ''),
+            ('gemini-3.8-flash', {'GROUP_GEMINI_KEY': 'test-group', 'GEMINI_API_KEY': 'test-fallback',
+                                  'GROUP_OWNER_ID': 'group-owner', 'LINE_MY_USER_ID': 'legacy-owner'},
+             'test-group', 'group-owner'),
+            ('gemini-3.8-flash', {'GROUP_GEMINI_KEY': 'test-group', 'LINE_MY_USER_ID': 'legacy-owner'},
+             'test-group', 'legacy-owner'),
+            ('claude-sonnet-5', {'GROUP_ANTHROPIC_API_KEY': 'test-claude-key'}, '', ''),
+        )
+        for model, settings, expected_key, expected_owner in scenarios:
+            fake_env = {**base_env, **settings}
             fake_env['GROUP_MODEL'] = model
-            fake_env['GROUP_ANTHROPIC_API_KEY'] = 'test-claude-key'
             provider = 'anthropic' if model.startswith('claude-') else 'gemini'
-            with self.subTest(model=model), patch.dict(os.environ, fake_env, clear=True), \
+            with self.subTest(model=model, owner=expected_owner, key=expected_key), \
+                 patch.dict(os.environ, fake_env, clear=True), \
                  patch.object(socket.socket, 'connect', side_effect=AssertionError('network forbidden')), \
-                 patch.object(BackgroundScheduler, 'start'), patch.object(threading.Thread, 'start'), \
+                 patch.object(BackgroundScheduler, 'start') as scheduler_start, \
+                 patch.object(threading.Thread, 'start'), \
                  patch.object(MessagingApi, 'get_bot_info', return_value=NS(user_id='test')):
                 spec = importlib.util.spec_from_file_location('app_offline_smoke', Path(__file__).parents[1] / 'app.py')
                 module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)
                 self.assertTrue(module.group_handler)
-                self.assertIn('/group/callback', {rule.rule for rule in module.app.url_map.iter_rules()})
+                self.assertEqual(module.GROUP_GEMINI_KEY, expected_key)
+                self.assertEqual(module.GROUP_OWNER_ID, expected_owner)
+                routes = {rule.rule for rule in module.app.url_map.iter_rules()}
+                self.assertIn('/group/callback', routes)
+                self.assertIn('/team-poll/<poll_id>', routes)
+                self.assertNotIn('/callback', routes)
+                scheduler_start.assert_called_once()
+                jobs = module.scheduler.get_jobs()
+                self.assertEqual(len(jobs), 2)
+                self.assertEqual({job.func.__name__ for job in jobs},
+                                 {'compress_group_memory', 'check_group_reminders'})
+                client = module.app.test_client()
+                self.assertEqual(client.post('/callback', json={'events': []}).status_code, 404)
+                webhook_body = json.dumps({'destination': 'test', 'events': []})
+                signature = base64.b64encode(hmac.new(b'test', webhook_body.encode(), hashlib.sha256).digest()).decode()
+                self.assertEqual(client.post('/group/callback', data=webhook_body,
+                                             headers={'X-Line-Signature': signature}).status_code, 200)
+                self.assertEqual(client.post('/group/callback', data=webhook_body,
+                                             headers={'X-Line-Signature': 'invalid'}).status_code, 400)
                 session = module.new_group_tool_session()
                 config = session._config
                 if isinstance(config, dict):
@@ -383,6 +412,7 @@ class OfflineStartupTests(unittest.TestCase):
                     self.assertEqual(config.tool_config.function_calling_config.mode,
                                      types.FunctionCallingConfigMode.VALIDATED)
                 else:
+                    self.assertIsNone(module.group_gemini_client)
                     self.assertIs(module.get_group_ai_client(), module.group_claude_client)
                     self.assertIsNone(config.thinking_config)
                 self.assertTrue(config.automatic_function_calling.disable)
@@ -390,24 +420,60 @@ class OfflineStartupTests(unittest.TestCase):
                 self.assertIsNone(config.temperature)
                 self.assertIsNone(config.top_p)
                 self.assertIsNone(config.top_k)
-                response = module.app.test_client().get('/health')
+                response = client.get('/health')
                 self.assertEqual(response.data, b'OK')
                 self.assertEqual(response.headers['X-Group-Model'], model)
                 self.assertEqual(response.headers['X-Group-Provider'], provider)
-                module.gemini_client.close()
+                self.assertEqual(response.headers['X-Bot-Release'], '2026-09-26-retire-xiaowu')
+                if module.group_gemini_client is not None:
+                    module.group_gemini_client.close()
                 if module.group_claude_client is not None:
                     module.group_claude_client.close()
+
+
+class GroupOwnerTests(unittest.TestCase):
+    def test_private_admin_command_only_uses_configured_group_owner(self):
+        for owner, sender, allowed in (('owner', 'owner', True), ('owner', 'other', False),
+                                       ('', 'other', False), ('', '', False)):
+            with self.subTest(owner=owner, sender=sender):
+                api, sheet = Mock(), Mock()
+                sheet.get_all_values.return_value = [['group', 'user', 'Test', '', '', '']]
+                env = {'GROUP_OWNER_ID': owner, 'ApiClient': MagicMock(),
+                       'MessagingApi': Mock(return_value=api), 'group_configuration': object(),
+                       'ReplyMessageRequest': ReplyMessageRequest, 'TextMessage': TextMessage,
+                       'get_sheet': Mock(return_value=sheet), 'group_chat_ai': Mock()}
+                load_functions(['group_handle_message'], env)
+                event = NS(source=NS(user_id=sender), reply_token='reply',
+                           message=NS(text='[批量設性別]\nTest=男'))
+                env['group_handle_message'](event)
+                if allowed:
+                    env['get_sheet'].assert_called_once_with('group_user_notes')
+                    sheet.update_cell.assert_called_once_with(1, 7, '男')
+                    api.reply_message.assert_called_once()
+                else:
+                    env['get_sheet'].assert_not_called()
+                    api.reply_message.assert_not_called()
+                env['group_chat_ai'].assert_not_called()
 
 
 class GroupModelMigrationTests(unittest.TestCase):
     def test_claude_provider_never_silently_falls_back_to_gemini(self):
         env = {'GROUP_PROVIDER': 'anthropic', 'group_claude_client': None,
-               'group_gemini_client': Mock(), 'gemini_client': Mock()}
+               'group_gemini_client': Mock()}
         load_functions(['get_group_ai_client'], env)
         with self.assertRaises(RuntimeError):
             env['get_group_ai_client']()
         client = object()
         env['group_claude_client'] = client
+        self.assertIs(env['get_group_ai_client'](), client)
+
+    def test_gemini_requires_its_group_client_without_private_bot_fallback(self):
+        env = {'GROUP_PROVIDER': 'gemini', 'group_gemini_client': None}
+        load_functions(['get_group_ai_client'], env)
+        with self.assertRaisesRegex(RuntimeError, 'Gemini API'):
+            env['get_group_ai_client']()
+        client = object()
+        env['group_gemini_client'] = client
         self.assertIs(env['get_group_ai_client'](), client)
 
     def test_chat_image_and_memory_summary_use_the_selected_client(self):
