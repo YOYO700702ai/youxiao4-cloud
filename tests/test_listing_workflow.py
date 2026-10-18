@@ -48,6 +48,7 @@ class ListingWorkflowTests(unittest.TestCase):
         self.store = MemoryStore()
         self.backend = Mock()
         self.backend.lookup.return_value = None
+        self.backend.verify_publication.return_value = {'status': 'pending'}
         self.remote_assets = {}
         self.backend.upload_media.side_effect = self.upload
         self.backend.publish.return_value = {'status': 'published',
@@ -391,6 +392,116 @@ class ListingWorkflowTests(unittest.TestCase):
         self.assertFalse(self.workflow.finish(self.KEY)['ok'])
         self.assertEqual(self.backend.publish.call_count, 1)
         self.assertEqual(self.workflow.retry(self.KEY)['status'], 'published')
+
+    def test_status_refresh_completes_exact_saved_operation_without_republishing(self):
+        self.complete_ready_job()
+        self.backend.publish.return_value = {'status': 'pending', 'scriptId': 'this-script', 'versionId': 'this-version'}
+        self.workflow.finish(self.KEY)
+        self.make_workflow()
+        self.backend.verify_publication.return_value = {
+            'status': 'published', 'scriptId': 'this-script', 'versionId': 'this-version',
+            'url': 'https://www.bglarp.com/scripts/test'}
+        self.assertTrue(self.workflow.status(self.KEY)['ok'])
+        self.assertEqual(self.store.get(self.KEY)['stage'], 'published')
+        self.assertEqual(self.backend.verify_publication.call_args.args[0]['publicationTarget'],
+                         {'scriptId': 'this-script', 'versionId': 'this-version'})
+        self.backend.publish.assert_called_once()
+
+    def test_retry_live_job_refresh_does_not_republish_or_reupload(self):
+        self.complete_ready_job()
+        self.backend.publish.return_value = {'status': 'pending', 'scriptId': 'script', 'versionId': 'version'}
+        self.workflow.finish(self.KEY)
+        self.backend.verify_publication.return_value = {'status': 'published'}
+        self.assertEqual(self.workflow.retry(self.KEY)['status'], 'published')
+        self.backend.publish.assert_called_once()
+        self.backend.upload_media.assert_called_once()
+
+    def test_old_pending_job_can_start_next_script_only_after_its_own_verification(self):
+        self.complete_ready_job()
+        self.backend.publish.return_value = {'status': 'pending'}
+        self.workflow.finish(self.KEY)
+        previous = self.store.get(self.KEY)
+        self.assertNotIn('publicationTarget', previous)
+        self.backend.verify_publication.return_value = {'status': 'published'}
+        result = self.workflow.begin(self.KEY, {'名稱': '下一本'})
+        self.assertTrue(result['ok'])
+        self.assertIn(f"《{self.DATA['名稱']}》已上架", result['message'])
+        self.assertIn('《下一本》資料已保留', result['message'])
+        self.assertEqual(self.store.get(self.KEY)['data']['名稱'], '下一本')
+        self.assertNotEqual(self.store.get(self.KEY)['jobId'], previous['jobId'])
+        self.assertEqual(self.backend.verify_publication.call_args.args[0]['jobId'], previous['jobId'])
+        self.backend.publish.assert_called_once()
+
+    def test_new_script_form_can_advance_a_completed_old_pending_job(self):
+        self.complete_ready_job()
+        self.backend.publish.return_value = {'status': 'pending'}
+        self.workflow.finish(self.KEY)
+        self.backend.verify_publication.return_value = {'status': 'published'}
+        self.assertTrue(self.workflow.merge_fields(self.KEY, {'名稱': '下一本', '角色': ['早見凜音']})['ok'])
+        self.assertEqual(self.store.get(self.KEY)['data'], {'名稱': '下一本', '角色': ['早見凜音']})
+
+    def test_new_script_form_after_status_completed_old_job_starts_next_job(self):
+        self.complete_ready_job()
+        self.backend.publish.return_value = {'status': 'pending'}
+        self.workflow.finish(self.KEY)
+        self.backend.verify_publication.return_value = {'status': 'published'}
+        self.assertEqual(self.workflow.status(self.KEY)['status'], 'published')
+        self.assertTrue(self.workflow.merge_fields(self.KEY, {'名稱': '下一本', '角色': ['早見凜音']})['ok'])
+        self.assertEqual(self.store.get(self.KEY)['data'], {'名稱': '下一本', '角色': ['早見凜音']})
+
+    def test_named_form_without_active_job_starts_collection_without_publishing(self):
+        self.assertTrue(self.workflow.merge_fields(self.KEY, {'名稱': '下一本', '角色': ['早見凜音']})['ok'])
+        self.assertEqual(self.store.get(self.KEY)['stage'], 'collecting')
+        self.backend.publish.assert_not_called()
+
+    def test_new_named_image_batch_can_advance_completed_pending_job(self):
+        self.complete_ready_job()
+        self.backend.publish.return_value = {'status': 'pending'}
+        self.workflow.finish(self.KEY)
+        self.backend.verify_publication.return_value = {'status': 'published'}
+        next_data = {**self.DATA, '名稱': '下一本'}
+        self.backend.lookup.return_value = {**self.baseline(), 'content': next_data}
+        self.assertTrue(self.workflow.label_images(self.KEY, '下一本', 'portraits', 1)['ok'])
+        self.assertEqual(self.store.get(self.KEY)['data']['名稱'], '下一本')
+        self.backend.publish.assert_called_once()
+
+    def test_failed_or_conflicting_refresh_preserves_old_job_and_blocks_next(self):
+        for status in ('failed', 'conflict', 'pending'):
+            with self.subTest(status=status):
+                self.setUp()
+                self.complete_ready_job()
+                self.backend.publish.return_value = {'status': 'pending', 'scriptId': 'script', 'versionId': 'original'}
+                self.workflow.finish(self.KEY)
+                prior = self.store.get(self.KEY)
+                self.backend.verify_publication.return_value = {'status': status}
+                self.assertFalse(self.workflow.begin(self.KEY, {'名稱': '下一本'})['ok'])
+                after = self.store.get(self.KEY)
+                self.assertEqual(prior['jobId'], after['jobId'])
+                self.assertEqual(prior['images'], after['images'])
+                self.assertNotEqual(self.workflow.retry(self.KEY)['status'], 'published')
+                if status != 'pending':
+                    self.backend.publish.assert_called_once()
+
+    def test_field_update_closes_own_pending_job_before_superseding_its_version(self):
+        self.complete_ready_job()
+        self.backend.publish.return_value = {'status': 'pending'}
+        self.workflow.finish(self.KEY)
+        self.backend.verify_publication.return_value = {'status': 'published'}
+        self.assertIsNone(self.workflow.prepare_update(self.KEY, ' ' + self.DATA['名稱'] + ' '))
+        self.assertEqual(self.store.get(self.KEY)['stage'], 'published')
+        self.backend.publish.assert_called_once()
+
+    def test_field_update_does_not_bypass_unfinished_same_script_or_touch_other_jobs(self):
+        self.complete_ready_job()
+        self.assertFalse(self.workflow.prepare_update(self.KEY, self.DATA['名稱'])['ok'])
+        self.assertIsNone(self.workflow.prepare_update(self.KEY, '另一本'))
+        self.assertIsNone(self.workflow.prepare_update(self.OTHER_USER, self.DATA['名稱']))
+        self.backend.verify_publication.assert_not_called()
+        self.backend.publish.return_value = {'status': 'pending'}
+        self.workflow.finish(self.KEY)
+        self.backend.verify_publication.return_value = {'status': 'conflict'}
+        self.assertFalse(self.workflow.prepare_update(self.KEY, self.DATA['名稱'])['ok'])
+        self.assertEqual(self.store.get(self.KEY)['stage'], 'publish_failed')
 
     def test_publication_payload_is_frozen_during_retry(self):
         self.complete_ready_job()

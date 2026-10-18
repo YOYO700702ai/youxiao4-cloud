@@ -51,6 +51,7 @@ class AppScriptTests(unittest.TestCase):
         self.workflow.start.return_value = self.outcome
         self.listing = Mock()
         self.listing.lock = threading.RLock()
+        self.listing.prepare_update.return_value = None
         for method in ('begin', 'merge_fields', 'label_images', 'finish', 'retry', 'status',
                        'cancel', 'assign_role', 'confirm_cover', 'receive_image'):
             getattr(self.listing, method).return_value = self.outcome
@@ -64,6 +65,7 @@ class AppScriptTests(unittest.TestCase):
             GROUP_CHAT_LOG_MAX=20, group_chat_log={}, group_bot_msg_ids=set(),
             pending_group_image={}, script_workflow=self.workflow,
             listing_workflow=self.listing, listing_store=self.store,
+            listing_backend=Mock(), update_catalog_script=Mock(),
             parse_listing_command=parse_listing_command,
             ListingInputError=ListingInputError, LISTING_HELP=LISTING_HELP,
             get_member_name=Mock(return_value='測試使用者'), append_chat_buffer=Mock(),
@@ -133,17 +135,36 @@ class AppScriptTests(unittest.TestCase):
         self.assertTrue(any('Notion' in t for t in texts))
 
     def test_update_result_reaches_line_without_model_summary(self):
-        self.env['update_notion_script'] = Mock(return_value=(True, '價格已更新'))
+        self.env['update_notion_script'] = Mock(side_effect=AssertionError('legacy Notion path'))
+        self.env['update_catalog_script'].return_value = {'ok': True, 'message': '價格已更新'}
         self.handle(response_with_calls(('update_script', {'name': '測試劇本', 'new_price': 800})))
-        self.env['update_notion_script'].assert_called_once_with('測試劇本', {'價格': 800})
+        self.env['update_catalog_script'].assert_called_once_with(self.env['listing_backend'], '測試劇本', {'價格': 800})
+        self.env['update_notion_script'].assert_not_called()
+        self.listing.prepare_update.assert_called_once_with(('group', 'user'), '測試劇本')
         outcomes = self.env['notify_script_result'].call_args.args[2]
         self.assertEqual(outcomes, [{'ok': True, 'message': '價格已更新'}])
         self.workflow.remember_result.assert_called_once()
 
-    def test_explicit_empty_update_fields_reach_notion(self):
-        self.env['update_notion_script'] = Mock(return_value=(True, '已清空指定欄位'))
+    def test_explicit_empty_update_fields_reach_catalog(self):
+        self.env['update_catalog_script'].return_value = {'ok': False, 'message': '必要欄位不可清空'}
         self.handle(response_with_calls(('update_script', {'name': '測試劇本', 'new_summary': '', 'new_roles': None})))
-        self.env['update_notion_script'].assert_called_once_with('測試劇本', {'劇情簡介': '', '角色': None})
+        self.env['update_catalog_script'].assert_called_once_with(self.env['listing_backend'], '測試劇本', {'劇情簡介': '', '角色': None})
+
+    def test_append_tag_and_pending_receipt_are_not_summarized_as_success(self):
+        outcome = {'ok': False, 'status': 'pending', 'message': '資料已保存，官網尚未確認更新完成。'}
+        self.env['update_catalog_script'].return_value = outcome
+        self.handle(response_with_calls(('update_script', {'name': '妖魔鬼怪', 'add_type_tag': '新手'})))
+        self.env['update_catalog_script'].assert_called_once_with(self.env['listing_backend'], '妖魔鬼怪', {'新增類型標籤': '新手'})
+        self.assertEqual(self.env['notify_script_result'].call_args.args[2], [outcome])
+        self.assertEqual(self.session.send_message.call_count, 1)
+
+    def test_pending_same_script_listing_blocks_field_update_until_verified(self):
+        blocker = {'ok': False, 'stage': 'publishing_failed', 'message': '先確認原本上架版本，尚未修改標籤。'}
+        self.listing.prepare_update.return_value = blocker
+        self.handle(response_with_calls(('update_script', {'name': '妖魔鬼怪', 'add_type_tag': '新手'})))
+        self.listing.prepare_update.assert_called_once_with(('group', 'user'), '妖魔鬼怪')
+        self.env['update_catalog_script'].assert_not_called()
+        self.assertEqual(self.env['notify_script_result'].call_args.args[2], [blocker])
 
     def test_legacy_string_does_not_call_hidden_gemma_or_write(self):
         self.env['parse_script_info_with_ai'] = Mock(side_effect=AssertionError('unexpected hidden AI'))
@@ -424,7 +445,7 @@ class OfflineStartupTests(unittest.TestCase):
                 self.assertEqual(response.data, b'OK')
                 self.assertEqual(response.headers['X-Group-Model'], model)
                 self.assertEqual(response.headers['X-Group-Provider'], provider)
-                self.assertEqual(response.headers['X-Bot-Release'], '2026-09-26-retire-xiaowu')
+                self.assertEqual(response.headers['X-Bot-Release'], '2026-10-18-catalog-receipts')
                 if module.group_gemini_client is not None:
                     module.group_gemini_client.close()
                 if module.group_claude_client is not None:

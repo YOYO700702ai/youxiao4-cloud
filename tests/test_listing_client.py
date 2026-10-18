@@ -48,6 +48,88 @@ class ListingClientTests(unittest.TestCase):
             client._api = Mock(side_effect=[{'script': {'id': 'script', 'draftVersionId': 'v'}}, {'publication': publication}])
             self.assertEqual(client.publish({'jobId': 'job', 'kind': 'upload', 'data': DATA, 'baseline': {'rawContent': BASE}})['status'], 'pending')
 
+    def test_verify_publication_only_accepts_the_saved_operation_version(self):
+        client = BotCatalogClient(None, 'test')
+        job = {'jobId': 'job', 'publicationTarget': {'scriptId': 'script', 'versionId': 'v1'}}
+        live = {'script': {'id': 'script', 'draftVersionId': 'v1', 'publishedVersionId': 'v1',
+                           'status': 'published', 'syncStatus': 'synced'},
+                'publication': {'state': 'live', 'verified': True, 'url': 'https://www.bglarp.com/scripts/test'}}
+        client._api = Mock(return_value=live)
+        self.assertEqual(client.verify_publication(job)['status'], 'published')
+        client._api.assert_called_once_with('GET', '/script', request_id='job')
+        for patch in ({'id': 'other'}, {'draftVersionId': 'later'}, {'publishedVersionId': 'other'}):
+            client._api.return_value = {**live, 'script': {**live['script'], **patch}}
+            self.assertEqual(client.verify_publication(job)['status'], 'conflict')
+        for patch in ({'publishedVersionId': None}, {'status': 'draft'}, {'syncStatus': 'error'}):
+            client._api.return_value = {**live, 'script': {**live['script'], **patch}}
+            self.assertEqual(client.verify_publication(job)['status'], 'pending')
+        client._api.return_value = {**live, 'publication': {'state': 'live', 'verified': False}}
+        self.assertEqual(client.verify_publication(job)['status'], 'pending')
+
+    def test_verification_of_saved_unpublished_update_can_retry_its_exact_draft(self):
+        client = BotCatalogClient(None, 'test')
+        client._api = Mock(return_value={
+            'script': {'id': 'script', 'draftVersionId': 'v2', 'publishedVersionId': 'v1'},
+            'publication': {'state': 'draft', 'verified': False}})
+        job = {'jobId': 'job', 'expectedVersion': 'v1',
+               'publicationTarget': {'scriptId': 'script', 'versionId': 'v2'}}
+        self.assertEqual(client.verify_publication(job)['status'], 'pending')
+
+    def test_legacy_pending_target_recovery_uses_original_operation_without_publish(self):
+        client = BotCatalogClient(None, 'test')
+        job = {'jobId': 'old-job', 'kind': 'upload', 'data': DATA, 'baseline': {'rawContent': BASE},
+               'publishRequested': True, 'lastPublishStatus': 'pending'}
+        client._api = Mock(side_effect=[
+            {'script': {'id': 'script', 'draftVersionId': 'v1'}, 'operationVersionId': 'v1'},
+            {'script': {'id': 'script', 'draftVersionId': 'v1', 'publishedVersionId': 'v1',
+                        'status': 'published', 'syncStatus': 'synced'},
+             'publication': {'state': 'live', 'verified': True, 'url': 'https://www.bglarp.com/scripts/test'}}])
+        self.assertEqual(client.verify_publication(job)['status'], 'published')
+        create, verify = client._api.call_args_list
+        self.assertEqual(create.args, ('POST', ''))
+        self.assertEqual(create.kwargs['operation'], 'create')
+        self.assertEqual(create.kwargs['request_id'], 'old-job')
+        self.assertEqual(verify.args, ('GET', '/script'))
+        self.assertNotIn('/publish', str(client._api.call_args_list))
+
+    def test_legacy_pending_never_accepts_a_newer_same_name_draft(self):
+        client = BotCatalogClient(None, 'test')
+        client._api = Mock(side_effect=[
+            {'script': {'id': 'script', 'draftVersionId': 'staff-later'}, 'operationVersionId': 'v1'},
+            {'script': {'id': 'script', 'draftVersionId': 'staff-later', 'publishedVersionId': 'staff-later'},
+             'publication': {'state': 'live', 'verified': True}}])
+        job = {'jobId': 'old-job', 'kind': 'upload', 'data': DATA, 'baseline': {'rawContent': BASE},
+               'publishRequested': True, 'lastPublishStatus': 'pending'}
+        result = client.verify_publication(job)
+        self.assertEqual(result['status'], 'conflict')
+        self.assertEqual(result['versionId'], 'v1')
+
+    def test_legacy_pending_requires_original_operation_version_in_replay_response(self):
+        client = BotCatalogClient(None, 'test')
+        client._api = Mock(return_value={'script': {'id': 'script', 'draftVersionId': 'staff-later'}})
+        job = {'jobId': 'old-job', 'kind': 'upload', 'data': DATA, 'baseline': {'rawContent': BASE},
+               'publishRequested': True, 'lastPublishStatus': 'pending'}
+        self.assertEqual(client.verify_publication(job)['status'], 'failed')
+        client._api.assert_called_once()
+
+    def test_unknown_job_is_not_created_by_status_and_network_errors_do_not_publish(self):
+        client = BotCatalogClient(None, 'test')
+        client._api = Mock(side_effect=ListingServiceError('連線失敗'))
+        self.assertEqual(client.verify_publication({'jobId': 'job'})['status'], 'unknown')
+        client._api.assert_not_called()
+        self.assertEqual(client.verify_publication({'jobId': 'job', 'publicationTarget': {
+            'scriptId': 'script', 'versionId': 'v1'}})['status'], 'failed')
+        self.assertEqual(client._api.call_args.args, ('GET', '/script'))
+
+    def test_failed_publish_keeps_operation_target_for_later_readback(self):
+        client = BotCatalogClient(None, 'test')
+        client._api = Mock(side_effect=[{'script': {'id': 'script', 'draftVersionId': 'v1'}},
+                                       ListingServiceError('逾時')])
+        result = client.publish({'jobId': 'job', 'kind': 'upload', 'data': DATA,
+                                 'baseline': {'rawContent': BASE}})
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual((result['scriptId'], result['versionId']), ('script', 'v1'))
+
     def test_errors_do_not_include_request_token(self):
         session = Mock()
         response = Mock(status_code=401)

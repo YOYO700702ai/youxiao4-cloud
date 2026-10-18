@@ -16,6 +16,7 @@ from notion_scripts import NotionScripts, validate_script_info
 from script_workflow import ScriptWorkflow, SCRIPT_TOOLS, EventGate, result_text
 from listing_commands import parse_listing_command, ListingInputError, LISTING_HELP
 from listing_client import BotCatalogClient, RemoteJobStore
+from catalog_updates import update_catalog_script
 from listing_workflow import ListingWorkflow
 from claude_adapter import ClaudeClient
 from bs4 import BeautifulSoup
@@ -28,7 +29,7 @@ from googleapiclient.discovery import build
 # ── 設定（Railway 環境變數）────────────────────────────────
 GROUP_MODEL          = os.environ.get('GROUP_MODEL', 'gemini-3.8-flash').strip() or 'gemini-3.8-flash'
 GROUP_PROVIDER       = os.environ.get('GROUP_PROVIDER', '').strip().lower() or ('anthropic' if GROUP_MODEL.startswith('claude-') else 'gemini')
-APP_RELEASE          = '2026-09-26-retire-xiaowu'
+APP_RELEASE          = '2026-10-18-catalog-receipts'
 GOOGLE_SHEET_ID      = os.environ.get('GOOGLE_SHEET_ID', '')
 _creds_raw           = os.environ.get('GOOGLE_CREDENTIALS_JSON', '')
 _creds_dict          = json.loads(_creds_raw) if _creds_raw else {}
@@ -1242,21 +1243,23 @@ GROUP_FUNC_DECLS = [
     types.FunctionDeclaration(
         name="update_script",
         description=(
-            "修改 Notion 上既有劇本的欄位（價格、人數、類型、時長、類型標籤、角色、劇情簡介）。"
+            "修改官網上既有劇本的欄位（價格、人數、類型、時長、類型標籤、角色、劇情簡介），並發布與確認正式頁面。"
             "使用者說『《XXX》改成 X 人』『XXX 價格改 X』『把 XXX 的時長改成 X』『XXX 簡介改成…』等時呼叫。"
-            "至少要給一個 new_* 欄位。明確要求清空時傳 null；未要求修改的欄位請省略。"
+            "至少要給一個 new_* 或 add_type_tag 欄位。明確要求清空可選欄位時傳 null；未要求修改的欄位請省略。"
+            "使用者說『加上新手標籤』『新增標籤』時用 add_type_tag，會保留既有標籤；new_type_tag 是替換全部自訂標籤，不可同時給兩者。"
             "【極重要】multi_select 欄位（人數/類型/角色）是『覆寫』，使用者給什麼就完全變成什麼，不是追加；除非使用者明說要保留原本再加。"
             "【極重要】絕對禁止只用文字回覆『改好了』『更新完成』而不實際呼叫此工具。"
         ),
         parameters=types.Schema(
             type=types.Type.OBJECT,
             properties={
-                "name":         types.Schema(type=types.Type.STRING, description="要修改的劇本名稱（必填，用來定位 Notion 頁面，請完整準確）"),
+                "name":         types.Schema(type=types.Type.STRING, description="要修改的官網劇本名稱（必填，請完整準確）"),
                 "new_price":    types.Schema(type=types.Type.INTEGER, nullable=True, description="新價格，純數字（例如 800）"),
-                "new_people":   types.Schema(type=types.Type.STRING, nullable=True, description="新人數，多個用 / 分隔；合法值：5人/6人/7人/8人/9人/10人/11人/浮動人。會覆寫原本的人數設定"),
+                "new_people":   types.Schema(type=types.Type.STRING, nullable=True, description="新人數，1至30人，多個用 / 分隔或明確範圍如5～8人，範圍須連續。會覆寫原本的人數設定"),
                 "new_type":     types.Schema(type=types.Type.STRING, nullable=True, description="新類型，多個用 / 分隔；合法值：恐怖/微恐/驚悚/沉浸/情感/演繹/推理/還原/機制/陣營/歡樂/撕逼/硬核/燒腦。會覆寫"),
                 "new_duration": types.Schema(type=types.Type.STRING, nullable=True, description="新時長，例如「3小時」「3.5小時」"),
                 "new_type_tag": types.Schema(type=types.Type.STRING, nullable=True, description="新的類型標籤（封面卡片自訂文字，例如「推理沉浸」「高難度」）"),
+                "add_type_tag": types.Schema(type=types.Type.STRING, description="追加類型標籤並保留原標籤，例如「新手」；多個用 / 分隔，不可同時給 new_type_tag"),
                 "new_roles":    types.Schema(type=types.Type.STRING, nullable=True, description="新角色清單，多個用 / 分隔。會覆寫"),
                 "new_summary":  types.Schema(type=types.Type.STRING, nullable=True, description="新的劇情簡介"),
             },
@@ -1688,14 +1691,18 @@ def execute_group_function(name, args, group_id, pending, uid=None):
                 'new_type':     '類型',
                 'new_duration': '時長',
                 'new_type_tag': '類型標籤',
+                'add_type_tag': '新增類型標籤',
                 'new_roles':    '角色',
                 'new_summary':  '劇情簡介',
             }
             fields = {field_map[k]: v for k, v in args.items() if k in field_map}
             if not fields:
                 return {"ok": False, "message": "至少要給一個要改的欄位（價格/人數/類型/時長/類型標籤/角色/簡介）。"}
-            ok, result = update_notion_script(args.get('name'), fields)
-            return {"ok": ok, "message": result}
+            if uid:
+                blocker = listing_workflow.prepare_update((group_id, uid), args.get('name'))
+                if blocker is not None:
+                    return blocker
+            return update_catalog_script(listing_backend, args.get('name'), fields)
 
         if name == 'remove_script':
             ok, result = archive_notion_script(args.get('name'))

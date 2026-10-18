@@ -211,31 +211,70 @@ class BotCatalogClient:
         except requests.RequestException:
             raise ListingServiceError('圖片讀取暫時失敗，請稍後重試。') from None
 
+    def verify_publication(self, job):
+        """Read back this job's immutable operation version without publishing."""
+        target = job.get('publicationTarget') or {}
+        script_id, version = target.get('scriptId'), target.get('versionId')
+        try:
+            if not script_id or not version:
+                if not (job.get('publishRequested') and job.get('lastPublishStatus') == 'pending'):
+                    return {'status': 'unknown'}
+                # Older persisted jobs discarded their operation version. The
+                # exact original operation key resolves it without publishing.
+                # A name lookup could instead find an unrelated later version.
+                script_id, version = self._save_draft(job, require_operation_version=True)
+                target = {'scriptId': script_id, 'versionId': version}
+            payload = self._api('GET', '/' + quote(script_id, safe=''), request_id=job['jobId'])
+            script = payload.get('script') or {}
+            # A same-name script or a later staff version is never this receipt.
+            if script.get('id') != script_id or script.get('draftVersionId') != version:
+                return {'status': 'conflict', **target}
+            published = script.get('publishedVersionId')
+            if published and published not in (version, job.get('expectedVersion')):
+                return {'status': 'conflict', **target}
+            publication = payload.get('publication') or {}
+            if (published == version and script.get('status') == 'published'
+                    and script.get('syncStatus') == 'synced'
+                    and publication.get('state') == 'live' and publication.get('verified') is True):
+                return {'status': 'published', 'url': publication['url'],
+                        'scriptId': script_id, 'versionId': version}
+            return {'status': 'pending', 'scriptId': script_id, 'versionId': version}
+        except ListingServiceError as exc:
+            return {'status': 'conflict' if exc.status == 409 else 'failed', 'message': str(exc), **target}
+
+    def _save_draft(self, job, *, require_operation_version=False):
+        request_id = job['jobId']
+        content = build_content(job)
+        if job['kind'] == 'upload':
+            payload = self._api('POST', '', body={'content': content}, request_id=request_id, operation='create')
+        else:
+            baseline = job['baseline']
+            payload = self._api('PATCH', '/' + quote(baseline['id'], safe=''),
+                                body={'content': content, 'expectedVersionId': job['expectedVersion']},
+                                request_id=request_id, operation='update')
+        script = payload['script']
+        if require_operation_version and not payload.get('operationVersionId'):
+            raise ListingServiceError('找不到這次操作原本的版本，資料已保留，請管理員確認。')
+        return script['id'], payload.get('operationVersionId') or script['draftVersionId']
+
     def publish(self, job):
+        target = {}
         try:
             request_id = job['jobId']
-            content = build_content(job)
-            if job['kind'] == 'upload':
-                payload = self._api('POST', '', body={'content': content}, request_id=request_id, operation='create')
-            else:
-                baseline = job['baseline']
-                payload = self._api('PATCH', '/' + quote(baseline['id'], safe=''),
-                                    body={'content': content, 'expectedVersionId': job['expectedVersion']},
-                                    request_id=request_id, operation='update')
-            script = payload['script']
-            version = payload.get('operationVersionId') or script['draftVersionId']
-            path = '/' + quote(script['id'], safe='')
+            script_id, version = self._save_draft(job)
+            target = {'scriptId': script_id, 'versionId': version}
+            path = '/' + quote(script_id, safe='')
             outcome = self._api('POST', path + '/publish', body={'expectedVersionId': version},
                                 request_id=request_id, operation='publish')
             publication = outcome.get('publication') or {}
             # The website checks Notion sync and public readback before this flag.
             if publication.get('state') == 'live' and publication.get('verified') is True:
-                return {'status': 'published', 'url': publication['url'], 'scriptId': script['id'],
+                return {'status': 'published', 'url': publication['url'], 'scriptId': script_id,
                         'versionId': version, 'message': '官網已上架完成。'}
-            return {'status': 'pending', 'scriptId': script['id'], 'versionId': version,
+            return {'status': 'pending', 'scriptId': script_id, 'versionId': version,
                     'message': '資料已保存，官網同步尚未確認完成。請稍後傳「重試上架」接續。'}
         except ListingServiceError as exc:
-            return {'status': 'conflict' if exc.status == 409 else 'failed', 'message': str(exc)}
+            return {'status': 'conflict' if exc.status == 409 else 'failed', 'message': str(exc), **target}
 
 
 class RemoteJobStore:

@@ -218,6 +218,15 @@ class ListingWorkflow:
         self._save(key, job)
         return answer
 
+    def _include_completion(self, key, completed, result):
+        if not completed or completed.get('status') != 'published':
+            return result
+        answer = {**result, 'message': completed['message'] + '\n\n' + result['message']}
+        job = self._load(key)
+        job['lastResult'] = answer
+        self._save(key, job)
+        return answer
+
     @staticmethod
     def _blocked(job):
         if not job:
@@ -238,6 +247,7 @@ class ListingWorkflow:
 
     def begin(self, key, data, kind='upload'):
         with _LOCK:
+            completed = None
             if kind not in {'upload', 'cover', 'portraits'}:
                 return _response(False, '不支援這種上架任務。')
             try:
@@ -245,6 +255,11 @@ class ListingWorkflow:
                 current = self._load(key)
             except ValueError as exc:
                 return _response(False, str(exc))
+            if current and current['stage'] not in _TERMINAL and current.get('publishRequested'):
+                result = self._refresh_publication(current)
+                if result:
+                    completed = self._publication_result(key, current, result)
+                    current = self._load(key)
             if current and current['stage'] not in _TERMINAL:
                 if (current['data']['名稱'] == normalized['名稱']
                         and current['kind'] == kind):
@@ -264,7 +279,7 @@ class ListingWorkflow:
                 'publishOperationKey': f'{job_id}:publish', 'lastResult': None,
             }
             self._save(key, job)  # Persist the task BEFORE lookup or any write.
-            return self._initialize(key, job)
+            return self._include_completion(key, completed, self._initialize(key, job))
 
     def _initialize(self, key, job):
         try:
@@ -317,13 +332,25 @@ class ListingWorkflow:
     def merge_fields(self, key, data):
         with _LOCK:
             job = self._load(key)
-            blocked = self._blocked(job)
-            if blocked:
-                return blocked
             try:
                 patch = normalize_listing_data(data, require_name=False)
             except ValueError as exc:
                 return _response(False, str(exc), job=job)
+            if patch.get('名稱') and (not job or job['stage'] == 'cancelled'
+                    or (job['stage'] == 'published' and patch['名稱'] != job['data']['名稱'])):
+                return self.begin(key, patch, kind='upload')
+            if (job and job.get('publishRequested') and job['stage'] not in _TERMINAL
+                    and patch.get('名稱') and patch['名稱'] != job['data']['名稱']):
+                result = self._refresh_publication(job)
+                completed = None
+                if result:
+                    completed = self._publication_result(key, job, result)
+                    job = self._load(key)
+                if job['stage'] == 'published':
+                    return self._include_completion(key, completed, self.begin(key, patch, kind='upload'))
+            blocked = self._blocked(job)
+            if blocked:
+                return blocked
             if '名稱' in patch and patch['名稱'] != job['data']['名稱']:
                 return _response(False, '不能把目前任務改成另一本劇本，請取消後重新開始。', job=job)
             if job['kind'] != 'upload':
@@ -341,6 +368,18 @@ class ListingWorkflow:
     def label_images(self, key, name=None, purpose=None, count=1):
         with _LOCK:
             job = self._load(key)
+            completed = None
+            if (job and name and name != job['data']['名稱'] and job.get('publishRequested')
+                    and job['stage'] not in _TERMINAL):
+                result = self._refresh_publication(job)
+                if result:
+                    completed = self._publication_result(key, job, result)
+                    job = self._load(key)
+                if job['stage'] == 'published':
+                    begun = self.begin(key, {'名稱': name}, kind=purpose)
+                    if not begun.get('ok'):
+                        return self._include_completion(key, completed, begun)
+                    job = self._load(key)
             blocked = self._blocked(job)
             if blocked:
                 return blocked
@@ -371,7 +410,8 @@ class ListingWorkflow:
             job['batches'].append({'batchId': str(uuid4()), 'purpose': purpose,
                                    'expected': count, 'received': 0,
                                    'openedAt': self.clock(), 'closed': False})
-            return self._record(key, job, True, f"接下來只收《{name}》的{'封面' if purpose == 'cover' else '角色圖'} {count} 張；收滿就停止收圖。")
+            result = self._record(key, job, True, f"接下來只收《{name}》的{'封面' if purpose == 'cover' else '角色圖'} {count} 張；收滿就停止收圖。")
+            return self._include_completion(key, completed, result)
 
     def receive_image(self, key, message_id, event_timestamp=None):
         with _LOCK:
@@ -606,8 +646,17 @@ class ListingWorkflow:
             result = self.backend.publish(deepcopy(job))
         except Exception:
             result = {'status': 'failed'}
+        return self._publication_result(key, job, result)
+
+    def _publication_result(self, key, job, result):
         if not isinstance(result, dict):
             result = {'status': 'failed'}
+        target = {field: result[field] for field in ('scriptId', 'versionId')
+                  if isinstance(result.get(field), str) and result[field]}
+        if len(target) == 2:
+            # Only the backend's operation result establishes a target. Never
+            # infer it from a name lookup, which can point at someone else's edit.
+            job['publicationTarget'] = target
         if result.get('status') == 'published':
             job['stage'] = 'published'
             job['publishedResult'] = {field: result[field] for field in ('status', 'url', 'scriptId', 'versionId')
@@ -628,6 +677,15 @@ class ListingWorkflow:
             message = '發布尚未確認成功。資料與圖片已保留，請傳「重試上架」，不用重新傳圖。'
         return self._record(key, job, False, message)
 
+    def _refresh_publication(self, job):
+        if not (job.get('publicationTarget') or job.get('lastPublishStatus') == 'pending'):
+            return None
+        try:
+            result = self.backend.verify_publication(deepcopy(job))
+        except Exception:
+            result = {'status': 'failed'}
+        return result if isinstance(result, dict) else {'status': 'failed'}
+
     def retry(self, key):
         with _LOCK:
             job = self._load(key)
@@ -640,6 +698,9 @@ class ListingWorkflow:
             if job['stage'] == 'conflict':
                 return deepcopy(job['lastResult'])
             if job.get('publishRequested'):
+                result = self._refresh_publication(job)
+                if result and result.get('status') != 'pending':
+                    return self._publication_result(key, job, result)
                 return self._publish(key, job)
             for image in job['images']:
                 if not image.get('asset') or (not image.get('confirmed') and image.get('recognition') is None):
@@ -651,8 +712,14 @@ class ListingWorkflow:
             job = self._load(key)
             if not job:
                 return _response(False, '目前沒有上架任務；請先提供劇本名稱。')
-            if job['stage'] in _TERMINAL or job['stage'] in {'lookup_failed', 'conflict', 'publish_failed'}:
+            if job['stage'] in _TERMINAL or job['stage'] in {'lookup_failed', 'conflict'}:
                 return deepcopy(job['lastResult'])
+            if job.get('publishRequested'):
+                result = self._refresh_publication(job)
+                if result:
+                    return self._publication_result(key, job, result)
+                if job['stage'] == 'publish_failed':
+                    return deepcopy(job['lastResult'])
             if job['stage'] in {'initializing', 'publishing'}:
                 return _response(False, '任務上次處理尚未完成，資料已保留；請傳「重試上架」。', job=job)
             lines = [f"《{job['data']['名稱']}》尚未上架。"]
@@ -672,6 +739,22 @@ class ListingWorkflow:
                                       'stage': image['stage'], 'confirmed': image['confirmed'],
                                       'roleName': image.get('roleName')}
                                      for image in job['images']])
+
+    def prepare_update(self, key, name):
+        """Close this sender's pending listing before a new version supersedes it."""
+        with _LOCK:
+            name = name.strip() if isinstance(name, str) else name
+            job = self._load(key)
+            if not job or job['data']['名稱'] != name or job['stage'] in _TERMINAL:
+                return None
+            if job.get('publishRequested'):
+                result = self._refresh_publication(job)
+                if result:
+                    receipt = self._publication_result(key, job, result)
+                    if job['stage'] == 'published':
+                        return None
+                    return receipt
+            return _response(False, f"《{name}》還有未完成的上架任務，請先傳「上架狀態」確認；這次尚未修改欄位。", job=job)
 
     def cancel(self, key):
         with _LOCK:

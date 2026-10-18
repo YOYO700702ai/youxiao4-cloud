@@ -83,6 +83,8 @@ class ListingContractReviewTests(unittest.TestCase):
         client._api = Mock(side_effect=[
             {'script': {'id': 'script', 'draftVersionId': 'v1'}, 'operationVersionId': 'v1'},
             {'publication': {'state': 'verification_pending', 'verified': False}},
+            {'script': {'id': 'script', 'draftVersionId': 'v1', 'publishedVersionId': 'v1'},
+             'publication': {'state': 'verification_pending', 'verified': False}},
             {'script': {'id': 'script', 'draftVersionId': 'newer-unrelated'}, 'operationVersionId': 'v1'},
             {'publication': {'state': 'live', 'verified': True, 'url': 'https://www.bglarp.com/scripts/test'}},
         ])
@@ -97,7 +99,8 @@ class ListingContractReviewTests(unittest.TestCase):
         self.assertEqual(workflow.finish(key)['status'], 'publish_failed')
         workflow = ListingWorkflow(**arguments)
         self.assertEqual(workflow.retry(key)['status'], 'published')
-        first_create, first_publish, retry_create, retry_publish = client._api.call_args_list
+        first_create, first_publish, retry_verify, retry_create, retry_publish = client._api.call_args_list
+        self.assertEqual(retry_verify.args, ('GET', '/script'))
         self.assertEqual(first_create.kwargs, retry_create.kwargs)
         self.assertEqual(first_publish.kwargs, retry_publish.kwargs)
         self.assertEqual(retry_publish.kwargs['body'], {'expectedVersionId': 'v1'})
