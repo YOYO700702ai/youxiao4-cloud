@@ -2,7 +2,7 @@
 
 from copy import deepcopy
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from listing_client import BotCatalogClient, build_content
 from listing_commands import parse_listing_command
@@ -83,6 +83,12 @@ class ListingContractReviewTests(unittest.TestCase):
         client._api = Mock(side_effect=[
             {'script': {'id': 'script', 'draftVersionId': 'v1'}, 'operationVersionId': 'v1'},
             {'publication': {'state': 'verification_pending', 'verified': False}},
+            {'script': {'id': 'script', 'draftVersionId': 'v1', 'publishedVersionId': 'v1',
+                        'status': 'published', 'syncStatus': 'synced'},
+             'publication': {'state': 'verification_pending', 'verified': False}},
+            {'script': {'id': 'script', 'draftVersionId': 'v1', 'publishedVersionId': 'v1',
+                        'status': 'published', 'syncStatus': 'synced'},
+             'publication': {'state': 'verification_pending', 'verified': False}},
             {'script': {'id': 'script', 'draftVersionId': 'v1', 'publishedVersionId': 'v1'},
              'publication': {'state': 'verification_pending', 'verified': False}},
             {'script': {'id': 'script', 'draftVersionId': 'newer-unrelated'}, 'operationVersionId': 'v1'},
@@ -96,10 +102,13 @@ class ListingContractReviewTests(unittest.TestCase):
         workflow.begin(key, {**DATA, '價格': 800})
         workflow.label_images(key, purpose='cover')
         workflow.receive_image(key, 'line-image')
-        self.assertEqual(workflow.finish(key)['status'], 'publish_failed')
+        with patch('listing_client.time.sleep'):
+            self.assertEqual(workflow.finish(key)['status'], 'publish_failed')
         workflow = ListingWorkflow(**arguments)
         self.assertEqual(workflow.retry(key)['status'], 'published')
-        first_create, first_publish, retry_verify, retry_create, retry_publish = client._api.call_args_list
+        first_create, first_publish, first_read, second_read, retry_verify, retry_create, retry_publish = client._api.call_args_list
+        self.assertEqual(first_read.args, ('GET', '/script'))
+        self.assertEqual(second_read.args, ('GET', '/script'))
         self.assertEqual(retry_verify.args, ('GET', '/script'))
         self.assertEqual(first_create.kwargs, retry_create.kwargs)
         self.assertEqual(first_publish.kwargs, retry_publish.kwargs)

@@ -1,6 +1,6 @@
 import copy
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from listing_client import BotCatalogClient, ListingServiceError, RemoteJobStore, build_content
 
@@ -47,6 +47,102 @@ class ListingClientTests(unittest.TestCase):
             client = BotCatalogClient(None, 'test')
             client._api = Mock(side_effect=[{'script': {'id': 'script', 'draftVersionId': 'v'}}, {'publication': publication}])
             self.assertEqual(client.publish({'jobId': 'job', 'kind': 'upload', 'data': DATA, 'baseline': {'rawContent': BASE}})['status'], 'pending')
+
+    @staticmethod
+    def pending_publish_client(*readbacks):
+        client = BotCatalogClient(None, 'test')
+        client._api = Mock(side_effect=[
+            {'script': {'id': 'script', 'draftVersionId': 'v1'}, 'operationVersionId': 'v1'},
+            {'publication': {'state': 'verification_pending', 'verified': False}},
+            *readbacks])
+        job = {'jobId': 'job', 'kind': 'upload', 'data': DATA, 'baseline': {'rawContent': BASE}}
+        return client, job
+
+    @staticmethod
+    def readback_payload(state='verification_pending', **script_patch):
+        return {'script': {'id': 'script', 'draftVersionId': 'v1', 'publishedVersionId': 'v1',
+                           'status': 'published', 'syncStatus': 'synced', **script_patch},
+                'publication': {'state': state, 'verified': state == 'live',
+                                'url': 'https://www.bglarp.com/scripts/test'}}
+
+    def test_publish_waits_briefly_for_public_readback_without_republishing(self):
+        client, job = self.pending_publish_client(self.readback_payload(), self.readback_payload('live'))
+        with patch('listing_client.time.monotonic', return_value=0), patch('listing_client.time.sleep'):
+            result = client.publish(job)
+        self.assertEqual(result['status'], 'published')
+        self.assertEqual((result['scriptId'], result['versionId']), ('script', 'v1'))
+        self.assertEqual([call.args for call in client._api.call_args_list],
+                         [('POST', ''), ('POST', '/script/publish'), ('GET', '/script'), ('GET', '/script')])
+        for read in client._api.call_args_list[2:]:
+            self.assertEqual(read.kwargs['request_id'], 'job')
+            self.assertEqual(read.kwargs['timeout'], (1, 5))
+            self.assertNotIn('body', read.kwargs)
+
+    def test_public_readback_still_pending_after_two_reads_is_not_completion(self):
+        client, job = self.pending_publish_client(self.readback_payload(), self.readback_payload())
+        with patch('listing_client.time.monotonic', return_value=0), patch('listing_client.time.sleep') as sleep:
+            result = client.publish(job)
+        self.assertEqual(result['status'], 'pending')
+        self.assertEqual(result['versionId'], 'v1')
+        self.assertEqual(client._api.call_count, 4)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_readback_conflict_or_auth_failure_stops_without_another_read_or_write(self):
+        cases = [(self.readback_payload('live', draftVersionId='staff-later'), 'conflict'),
+                 (self.readback_payload('live', publishedVersionId='staff-later'), 'conflict'),
+                 (ListingServiceError('驗證失敗', 401), 'failed'),
+                 (ListingServiceError('禁止存取', 403), 'failed'),
+                 (ListingServiceError('版本衝突', 409), 'conflict')]
+        for readback, expected in cases:
+            with self.subTest(expected=expected, readback=readback):
+                client, job = self.pending_publish_client(readback)
+                with patch('listing_client.time.monotonic', return_value=0), patch('listing_client.time.sleep'):
+                    result = client.publish(job)
+                self.assertEqual(result['status'], expected)
+                self.assertEqual(result['versionId'], 'v1')
+                self.assertEqual(client._api.call_count, 3)
+                self.assertEqual(client._api.call_args.args, ('GET', '/script'))
+
+    def test_unpublished_or_unsynced_readback_does_not_keep_polling(self):
+        for changed in ({'status': 'draft'}, {'syncStatus': 'error'}, {'publishedVersionId': None}):
+            with self.subTest(changed=changed):
+                client, job = self.pending_publish_client(self.readback_payload(**changed))
+                with patch('listing_client.time.monotonic', return_value=0), patch('listing_client.time.sleep'):
+                    self.assertEqual(client.publish(job)['status'], 'pending')
+                self.assertEqual(client._api.call_count, 3)
+
+    def test_short_readback_timeout_preserves_pending_target_and_stops(self):
+        client, job = self.pending_publish_client(ListingServiceError('官網連線逾時'))
+        with patch('listing_client.time.monotonic', return_value=0), patch('listing_client.time.sleep'):
+            result = client.publish(job)
+        self.assertEqual(result['status'], 'pending')
+        self.assertEqual((result['scriptId'], result['versionId']), ('script', 'v1'))
+        self.assertEqual(client._api.call_count, 3)
+
+    def test_slow_initial_publish_does_not_add_readback_waits(self):
+        client, job = self.pending_publish_client()
+        with patch('listing_client.time.monotonic', side_effect=[0, 41, 41]), patch('listing_client.time.sleep') as sleep:
+            self.assertEqual(client.publish(job)['status'], 'pending')
+        self.assertEqual(client._api.call_count, 2)
+        sleep.assert_not_called()
+
+    def test_readback_timeout_shrinks_to_remaining_total_budget(self):
+        client, job = self.pending_publish_client(self.readback_payload(), self.readback_payload())
+        with patch('listing_client.time.monotonic', side_effect=[0, 0, 0, 0.25, 6.5, 7.25]), patch('listing_client.time.sleep'):
+            self.assertEqual(client.publish(job)['status'], 'pending')
+        final_timeout = client._api.call_args.kwargs['timeout']
+        self.assertLessEqual(sum(final_timeout), 0.75)
+        self.assertEqual(client._api.call_count, 4)
+
+    def test_custom_readback_timeout_reaches_transport(self):
+        session = Mock()
+        session.request.return_value = Mock(status_code=200)
+        session.request.return_value.json.return_value = self.readback_payload('live')
+        client = BotCatalogClient(None, 'test', session=session)
+        result = client.verify_publication({'jobId': 'job', 'publicationTarget': {
+            'scriptId': 'script', 'versionId': 'v1'}}, timeout=(0.5, 1.5))
+        self.assertEqual(result['status'], 'published')
+        self.assertEqual(session.request.call_args.kwargs['timeout'], (0.5, 1.5))
 
     def test_verify_publication_only_accepts_the_saved_operation_version(self):
         client = BotCatalogClient(None, 'test')

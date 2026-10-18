@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import threading
+import time
 from urllib.parse import quote, urlsplit
 
 import requests
@@ -109,7 +110,7 @@ class BotCatalogClient:
         self.token = token or ''
         self.session = session or requests.Session()
 
-    def _api(self, method, path, *, body=None, request_id='lookup', operation=None, params=None):
+    def _api(self, method, path, *, body=None, request_id='lookup', operation=None, params=None, timeout=(5, 65)):
         if not self.token:
             raise ListingServiceError('官網上架連線尚未設定，請管理員檢查；這次沒有發布。')
         headers = {'Authorization': f'Bearer {self.token}', 'Accept': 'application/json',
@@ -119,7 +120,7 @@ class BotCatalogClient:
         try:
             response = self.session.request(method, self.base_url + '/api/admin/scripts/bot' + path,
                                             json=body, params=params, headers=headers,
-                                            timeout=(5, 65), allow_redirects=False)
+                                            timeout=timeout, allow_redirects=False)
         except requests.RequestException:
             raise ListingServiceError('官網連線逾時，資料已保留。請傳「重試上架」接續，勿重新建立同名劇本。') from None
         try:
@@ -211,7 +212,7 @@ class BotCatalogClient:
         except requests.RequestException:
             raise ListingServiceError('圖片讀取暫時失敗，請稍後重試。') from None
 
-    def verify_publication(self, job):
+    def verify_publication(self, job, *, timeout=None):
         """Read back this job's immutable operation version without publishing."""
         target = job.get('publicationTarget') or {}
         script_id, version = target.get('scriptId'), target.get('versionId')
@@ -224,7 +225,8 @@ class BotCatalogClient:
                 # A name lookup could instead find an unrelated later version.
                 script_id, version = self._save_draft(job, require_operation_version=True)
                 target = {'scriptId': script_id, 'versionId': version}
-            payload = self._api('GET', '/' + quote(script_id, safe=''), request_id=job['jobId'])
+            read_options = {'timeout': timeout} if timeout is not None else {}
+            payload = self._api('GET', '/' + quote(script_id, safe=''), request_id=job['jobId'], **read_options)
             script = payload.get('script') or {}
             # A same-name script or a later staff version is never this receipt.
             if script.get('id') != script_id or script.get('draftVersionId') != version:
@@ -238,9 +240,37 @@ class BotCatalogClient:
                     and publication.get('state') == 'live' and publication.get('verified') is True):
                 return {'status': 'published', 'url': publication['url'],
                         'scriptId': script_id, 'versionId': version}
-            return {'status': 'pending', 'scriptId': script_id, 'versionId': version}
+            return {'status': 'pending', 'scriptId': script_id, 'versionId': version,
+                    'retryable': (published == version and script.get('status') == 'published'
+                                  and script.get('syncStatus') == 'synced'
+                                  and publication.get('state') == 'verification_pending')}
         except ListingServiceError as exc:
+            if timeout is not None and exc.status == 0:
+                # The publish POST already succeeded. A deliberately short
+                # readback timing out does not turn that receipt into failure.
+                return {'status': 'pending', 'retryable': False, **target}
             return {'status': 'conflict' if exc.status == 409 else 'failed', 'message': str(exc), **target}
+
+    def _read_back_after_publish(self, job, target, started_at):
+        # Route-handler revalidation is flushed after its response. A separate
+        # GET can therefore observe the new public page without another write.
+        # Keep this brief enough to leave time for the original LINE receipt;
+        # a slow save/publish must not acquire another full 65-second timeout.
+        deadline = min(started_at + 40, time.monotonic() + 8)
+        result = {'status': 'pending', **target}
+        for delay in (0.25, 0.75):
+            remaining = deadline - time.monotonic()
+            if remaining <= delay + 0.25:
+                break
+            time.sleep(delay)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.25:
+                break
+            timeout = (min(1, remaining / 4), min(5, remaining * 3 / 4))
+            result = self.verify_publication({**job, 'publicationTarget': target}, timeout=timeout)
+            if result.get('status') != 'pending' or not result.get('retryable'):
+                break
+        return result
 
     def _save_draft(self, job, *, require_operation_version=False):
         request_id = job['jobId']
@@ -259,6 +289,7 @@ class BotCatalogClient:
 
     def publish(self, job):
         target = {}
+        started_at = time.monotonic()
         try:
             request_id = job['jobId']
             script_id, version = self._save_draft(job)
@@ -271,6 +302,10 @@ class BotCatalogClient:
             if publication.get('state') == 'live' and publication.get('verified') is True:
                 return {'status': 'published', 'url': publication['url'], 'scriptId': script_id,
                         'versionId': version, 'message': '官網已上架完成。'}
+            if publication.get('state') == 'verification_pending':
+                readback = self._read_back_after_publish(job, target, started_at)
+                if readback.get('status') != 'pending':
+                    return readback
             return {'status': 'pending', 'scriptId': script_id, 'versionId': version,
                     'message': '資料已保存，官網同步尚未確認完成。請稍後傳「重試上架」接續。'}
         except ListingServiceError as exc:
