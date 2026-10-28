@@ -22,7 +22,7 @@ import time
 
 
 API_URL = "https://api.anthropic.com/v1/messages"
-DEFAULT_MODEL = "claude-sonnet-5"
+DEFAULT_MODEL = "claude-opus-5-5"
 TOOL_NAME = "echo_script_probe"
 EXPECTED_ARGS = {
     "title": "DIAGNOSTIC-FICTION-ALPHA",
@@ -113,14 +113,18 @@ def _tool_definition():
 
 
 def _body(model, messages, *, first):
+    # Opus 5.5 rejects disabled thinking and forced tool/any selection. It
+    # keeps medium effort by default; the fixture is still verified locally.
+    adaptive = model == "claude-opus-5-5"
+    first_choice = ({"type": "auto", "disable_parallel_tool_use": True} if adaptive else
+                    {"type": "tool", "name": TOOL_NAME, "disable_parallel_tool_use": True})
     return {
         "model": model,
         "max_tokens": 2048,
-        "thinking": {"type": "disabled"},
+        "thinking": {"type": "adaptive" if adaptive else "disabled"},
         "system": "Use only the fictional diagnostic echo tool. After its successful result, reply exactly ACK.",
         "tools": [_tool_definition()],
-        "tool_choice": ({"type": "tool", "name": TOOL_NAME, "disable_parallel_tool_use": True}
-                        if first else {"type": "none"}),
+        "tool_choice": first_choice if first else {"type": "none"},
         "messages": messages,
     }
 
@@ -222,7 +226,10 @@ def run_probe(environ=None, session=None, *, live=False):
             ]
             final = _post(transport, headers, _body(model, continuation, first=False))
             _record_response(result, final)
-            content = final["content"]
+            # Adaptive thinking may precede the answer, including empty signed
+            # blocks. Ignore only reasoning for ACK validation, never for replay.
+            content = [block for block in final["content"]
+                       if block.get("type") not in ("thinking", "redacted_thinking")]
             if (final.get("stop_reason") != "end_turn" or len(content) != 1
                     or content[0].get("type") != "text" or content[0].get("text") != "ACK"):
                 raise ProbeFailure("invalid_ack")

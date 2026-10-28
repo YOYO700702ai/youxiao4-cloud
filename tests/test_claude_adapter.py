@@ -39,7 +39,7 @@ class ClaudeAdapterTests(unittest.TestCase):
         self.addCleanup(self.network_guard.stop)
         self.http = Mock()
         self.http.post.return_value = reply()
-        self.client = ClaudeClient('synthetic-key', session=self.http)
+        self.client = ClaudeClient('synthetic-key', model='claude-sonnet-5', session=self.http)
 
     def payload(self):
         return self.http.post.call_args.kwargs['json']
@@ -341,6 +341,48 @@ class ClaudeAdapterTests(unittest.TestCase):
         with self.assertRaises(ClaudeAPIError) as caught:
             self.client.models.generate_content(contents='hi')
         self.assertEqual(str(caught.exception), 'Claude API: invalid_response')
+
+    def test_default_opus55_uses_adaptive_thinking_without_overriding_effort(self):
+        client = ClaudeClient('synthetic-key', session=self.http)
+        self.http.post.return_value = reply(model='claude-opus-5-5')
+        output = client.models.generate_content(contents='hi', config={
+            'thinking_config': {'thinking_level': 'low'}, 'temperature': 0})
+        body = self.payload()
+        self.assertEqual(body['model'], 'claude-opus-5-5')
+        self.assertEqual(body['thinking'], {'type': 'adaptive'})
+        self.assertEqual(body['max_tokens'], 8192)
+        self.assertEqual(output.model_version, 'claude-opus-5-5')
+        for unsupported in ('output_config', 'temperature', 'top_p', 'top_k', 'thinking_config'):
+            self.assertNotIn(unsupported, body)
+
+    def test_opus55_tool_roundtrip_and_history_keep_empty_signed_thinking(self):
+        first = [{'type': 'thinking', 'thinking': '', 'signature': 'opaque-opus-signature'},
+                 {'type': 'redacted_thinking', 'data': 'opaque-opus-data'}, tool()]
+        final = [{'type': 'thinking', 'thinking': '', 'signature': 'opaque-final-signature'},
+                 {'type': 'text', 'text': '完成'}]
+        self.http.post.side_effect = [reply(first, model='claude-opus-5-5', stop_reason='tool_use'),
+                                      reply(final, model='claude-opus-5-5')]
+        chat = self.client.chats.create(model='claude-opus-5-5', config={
+            'tools': [{'function_declarations': [{'name': 'lookup'}]}]})
+        output = chat.send_message('查詢')
+        call = output.candidates[0].content.parts[0].function_call
+        self.assertEqual(call.id, 'tool_test')
+        restored = self.client.chats.create(model='claude-opus-5-5', history=chat.get_history(), config={
+            'tools': [{'function_declarations': [{'name': 'lookup'}]}]})
+        self.assertEqual(restored.send_message(result(call.id)).text, '完成')
+        bodies = [call.kwargs['json'] for call in self.http.post.call_args_list]
+        self.assertEqual(bodies[1]['messages'][1]['content'], first)
+        self.assertEqual(restored.get_history()[-1].blocks, final)
+        for body in bodies:
+            self.assertEqual(body['thinking'], {'type': 'adaptive'})
+            self.assertEqual(body['tool_choice'], {'type': 'auto'})
+            self.assertNotIn('output_config', body)
+
+    def test_legacy_models_keep_disabled_thinking(self):
+        for model in ('claude-sonnet-5', 'claude-opus-5', 'claude-haiku-4-5'):
+            with self.subTest(model=model):
+                self.client.models.generate_content(model=model, contents='hi')
+                self.assertEqual(self.payload()['thinking'], {'type': 'disabled'})
 
 
 if __name__ == '__main__':

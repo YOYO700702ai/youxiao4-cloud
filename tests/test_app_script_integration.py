@@ -385,6 +385,7 @@ class OfflineStartupTests(unittest.TestCase):
             ('gemini-3.8-flash', {'GROUP_GEMINI_KEY': 'test-group', 'LINE_MY_USER_ID': 'legacy-owner'},
              'test-group', 'legacy-owner'),
             ('claude-sonnet-5', {'GROUP_ANTHROPIC_API_KEY': 'test-claude-key'}, '', ''),
+            ('claude-opus-5-5', {'GROUP_ANTHROPIC_API_KEY': 'test-claude-key'}, '', ''),
         )
         for model, settings, expected_key, expected_owner in scenarios:
             fake_env = {**base_env, **settings}
@@ -445,7 +446,7 @@ class OfflineStartupTests(unittest.TestCase):
                 self.assertEqual(response.data, b'OK')
                 self.assertEqual(response.headers['X-Group-Model'], model)
                 self.assertEqual(response.headers['X-Group-Provider'], provider)
-                self.assertEqual(response.headers['X-Bot-Release'], '2026-10-18-catalog-receipts')
+                self.assertEqual(response.headers['X-Bot-Release'], '2026-10-28-opus55')
                 if module.group_gemini_client is not None:
                     module.group_gemini_client.close()
                 if module.group_claude_client is not None:

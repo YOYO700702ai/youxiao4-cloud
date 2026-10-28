@@ -27,9 +27,9 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
 # ── 設定（Railway 環境變數）────────────────────────────────
-GROUP_MODEL          = os.environ.get('GROUP_MODEL', 'gemini-3.8-flash').strip() or 'gemini-3.8-flash'
+GROUP_MODEL          = os.environ.get('GROUP_MODEL', 'claude-opus-5-5').strip() or 'claude-opus-5-5'
 GROUP_PROVIDER       = os.environ.get('GROUP_PROVIDER', '').strip().lower() or ('anthropic' if GROUP_MODEL.startswith('claude-') else 'gemini')
-APP_RELEASE          = '2026-10-18-catalog-receipts'
+APP_RELEASE          = '2026-10-28-opus55'
 GOOGLE_SHEET_ID      = os.environ.get('GOOGLE_SHEET_ID', '')
 _creds_raw           = os.environ.get('GOOGLE_CREDENTIALS_JSON', '')
 _creds_dict          = json.loads(_creds_raw) if _creds_raw else {}
@@ -380,7 +380,9 @@ def identify_listing_image(image_bytes, expected_name, role_names, purpose):
     response = get_group_ai_client().models.generate_content(
         model=GROUP_MODEL,
         contents=[types.Part.from_bytes(data=image_bytes, mime_type=mime), types.Part(text=prompt)],
-        config=group_generation_config(max_output_tokens=512, response_mime_type='application/json'),
+        # Opus 5.5 shares its output budget with always-on adaptive thinking.
+        config=group_generation_config(max_output_tokens=2048 if GROUP_MODEL == 'claude-opus-5-5' else 512,
+                                       response_mime_type='application/json'),
     )
     raw = (response.text or '').strip()
     if raw.startswith('```'):

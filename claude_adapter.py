@@ -14,7 +14,7 @@ from google.genai import types
 
 
 MESSAGES_URL = 'https://api.anthropic.com/v1/messages'
-DEFAULT_MODEL = 'claude-sonnet-5'
+DEFAULT_MODEL = 'claude-opus-5-5'
 
 
 class ClaudeAPIError(RuntimeError):
@@ -325,8 +325,11 @@ class ClaudeClient:
             maximum = 8192
         if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum <= 0:
             raise ClaudeAPIError('invalid_max_tokens')
+        # Opus 5.5 always thinks and rejects disabled/manual thinking. Leave
+        # effort unset to retain its medium default; preserve legacy behavior.
+        # https://platform.claude.com/docs/en/models/opus-5-5/migration-guide
         payload = {'model': model, 'max_tokens': maximum, 'messages': messages,
-                   'thinking': {'type': 'disabled'}}
+                   'thinking': {'type': 'adaptive' if model == 'claude-opus-5-5' else 'disabled'}}
         system = _system(config)
         if system:
             payload['system'] = system

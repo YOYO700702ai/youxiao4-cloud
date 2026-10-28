@@ -33,7 +33,8 @@ def response(data, status=200):
 class ClaudeAiProbeTests(unittest.TestCase):
     def setUp(self):
         self.probe = load_probe()
-        self.env = {"GROUP_ANTHROPIC_API_KEY": "test-group-key", "ANTHROPIC_API_KEY": "test-fallback-key"}
+        self.env = {"GROUP_ANTHROPIC_API_KEY": "test-group-key", "ANTHROPIC_API_KEY": "test-fallback-key",
+                    "GROUP_MODEL": "claude-sonnet-5"}
         self.first = {
             "type": "message", "role": "assistant", "model": "claude-sonnet-5", "stop_reason": "tool_use",
             "content": [{"type": "text", "text": "Fictional probe."},
@@ -263,6 +264,53 @@ class ClaudeAiProbeTests(unittest.TestCase):
         self.assertEqual(result["error_type"], "timeout")
         self.assertEqual(len(result["tokens"]), 1)
         self.assertEqual(self.session.post.call_count, 2)
+
+    def test_default_opus55_auto_probe_preserves_signed_thinking_and_accepts_ack(self):
+        self.env.pop('GROUP_MODEL')
+        self.first['model'] = self.final['model'] = 'claude-opus-5-5'
+        thinking = {'type': 'thinking', 'thinking': '', 'signature': 'opaque-opus-signature'}
+        redacted = {'type': 'redacted_thinking', 'data': 'opaque-opus-data'}
+        self.first['content'] = [thinking, redacted, self.first['content'][-1]]
+        self.final['content'] = [dict(thinking, signature='opaque-final-signature'),
+                                 {'type': 'text', 'text': 'ACK'}]
+        original = copy.deepcopy(self.first['content'])
+        outcome = self.run_mock()
+        self.assertEqual(outcome['status'], 'ok')
+        self.assertEqual(outcome['model_requested'], 'claude-opus-5-5')
+        self.assertEqual(outcome['model_returned'], ['claude-opus-5-5'] * 2)
+        bodies = [call.kwargs['json'] for call in self.session.post.call_args_list]
+        self.assertEqual(bodies[0]['tool_choice'], {'type': 'auto', 'disable_parallel_tool_use': True})
+        self.assertEqual(bodies[1]['tool_choice'], {'type': 'none'})
+        self.assertEqual(bodies[1]['messages'][1]['content'], original)
+        self.assertEqual(self.first['content'], original)
+        for body in bodies:
+            self.assertEqual(body['thinking'], {'type': 'adaptive'})
+            self.assertNotIn('output_config', body)
+
+    def test_opus55_auto_mode_does_not_accept_missing_or_multiple_tools(self):
+        self.env['GROUP_MODEL'] = 'claude-opus-5-5'
+        for blocks, stop in (([{'type': 'text', 'text': 'ACK'}], 'end_turn'),
+                             ([self.first['content'][-1]] * 2, 'tool_use')):
+            with self.subTest(stop=stop):
+                first = {**self.first, 'content': blocks, 'stop_reason': stop}
+                self.session.post.reset_mock()
+                self.session.post.side_effect = [response(first)]
+                outcome = self.run_mock()
+                self.assertEqual(outcome['error_type'], 'invalid_tool_call')
+                self.assertEqual(self.session.post.call_count, 1)
+
+    def test_opus55_reasoning_does_not_relax_exact_ack_or_finish_reason(self):
+        self.env['GROUP_MODEL'] = 'claude-opus-5-5'
+        thinking = {'type': 'thinking', 'thinking': '', 'signature': 'opaque-test'}
+        cases = [([thinking], 'end_turn'),
+                 ([thinking, {'type': 'text', 'text': 'ACK extra'}], 'end_turn'),
+                 ([thinking, {'type': 'text', 'text': 'ACK'}, self.first['content'][-1]], 'end_turn'),
+                 ([thinking, {'type': 'text', 'text': 'ACK'}], 'max_tokens')]
+        for content, stop in cases:
+            with self.subTest(content=content, stop=stop):
+                self.session.post.side_effect = [response(self.first),
+                    response({**self.final, 'content': content, 'stop_reason': stop})]
+                self.assertEqual(self.run_mock()['error_type'], 'invalid_ack')
 
 
 if __name__ == "__main__":
