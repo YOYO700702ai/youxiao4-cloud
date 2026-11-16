@@ -29,7 +29,7 @@ from googleapiclient.discovery import build
 # ── 設定（Railway 環境變數）────────────────────────────────
 GROUP_MODEL          = os.environ.get('GROUP_MODEL', 'claude-opus-5-5').strip() or 'claude-opus-5-5'
 GROUP_PROVIDER       = os.environ.get('GROUP_PROVIDER', '').strip().lower() or ('anthropic' if GROUP_MODEL.startswith('claude-') else 'gemini')
-APP_RELEASE          = '2026-11-16-listing-consent-fix'
+APP_RELEASE          = '2026-11-16-natural-listing'
 GOOGLE_SHEET_ID      = os.environ.get('GOOGLE_SHEET_ID', '')
 _creds_raw           = os.environ.get('GOOGLE_CREDENTIALS_JSON', '')
 _creds_dict          = json.loads(_creds_raw) if _creds_raw else {}
@@ -77,10 +77,10 @@ def is_script_intent(message):
 
 
 def is_bot_addressed(message, mention=None, quoted_id=None):
-    """Only a direct call, actual LINE mention, or reply wakes the bot.
+    """Route a real mention, reply, or opening name to semantic interpretation.
 
-    Names inside quoted instructions and ordinary group conversation do not
-    count. This gate decides who is being addressed, not listing semantics.
+    There is deliberately no required command word or punctuation after the
+    name. The reasoner silences third-person references before chat fallback.
     """
     if quoted_id and quoted_id in group_bot_msg_ids:
         return True
@@ -90,8 +90,7 @@ def is_bot_addressed(message, mention=None, quoted_id=None):
         return True
     return bool(re.match(
         r'^\s*(?:@\s*)?(?:陸傲天|陸總|傲天|小六|小6|小陸)'
-        r'(?!的|說|表示|講|剛才|剛剛|之前)'
-        r'(?=$|[\s，,:：。!！?？]|幫|請|麻煩|把|給|看|你|能|可|來|再|繼續|重試|取消|上架|新增|換|補|查|抽|停|等|先|不|別|確認|整理)',
+        r'(?!的|說|表示|講|剛才|剛剛|之前)',
         message or ''))
 
 # ── Google Sheets ─────────────────────────────────────────

@@ -243,6 +243,7 @@ class AssistantListingWorkflow(ListingWorkflow):
         # Never print arbitrary exception text, model output, URLs or secrets.
         reasons = {
             'invalid action': 'invalid_action',
+            'invalid addressee flag': 'invalid_addressee_flag',
             'invalid kind': 'invalid_kind',
             'invalid capture action': 'invalid_capture_action',
             'invalid questions': 'invalid_questions',
@@ -418,6 +419,8 @@ class AssistantListingWorkflow(ListingWorkflow):
             self._log_analysis_error('closed_intent', error)
             return _response(False, '這則指示尚未判讀成功，既有上架資料與收據都已保留，請再說明一次。',
                              job=previous, status='analysis_failed')
+        if plan['addressedToBot'] is False:
+            return _response(True, '', job=previous, status='ignored')
         with _LOCK:
             current = self._load(key)
             if not current or current['jobId'] != previous['jobId']:
@@ -576,7 +579,18 @@ class AssistantListingWorkflow(ListingWorkflow):
                             'stored': bool(entry.get('asset'))} for entry in job['images']]}
 
     def _validate_plan(self, result, job, phase):
-        if not isinstance(result, dict) or result.get('action') not in {'collect', 'publish', 'organize', 'status', 'retry', 'cancel', 'ignore'}:
+        if not isinstance(result, dict):
+            raise ValueError('invalid action')
+        addressed = result.get('addressedToBot', True)
+        if type(addressed) is not bool:
+            raise ValueError('invalid addressee flag')
+        if addressed is False:
+            # A mention of a name or quoted instructions is not a request to
+            # the bot. Discard every proposed mutation before validating it.
+            return {'addressedToBot': False, 'action': 'ignore', 'captureAction': 'none',
+                    'kind': job['kind'], 'data': {}, 'questions': [], 'reply': '',
+                    'assignments': [], 'consent': deepcopy(job.get('publishConsent', {}))}
+        if result.get('action') not in {'collect', 'publish', 'organize', 'status', 'retry', 'cancel', 'ignore'}:
             raise ValueError('invalid action')
         kind = result.get('kind', job['kind'])
         if kind not in {'upload', 'cover', 'portraits'}:
@@ -634,7 +648,7 @@ class AssistantListingWorkflow(ListingWorkflow):
             required = {entry['index'] for entry in job['images'] if not entry.get('manuallyConfirmed')}
             if not required.issubset(seen):
                 raise ValueError('an image was omitted')
-        return {**result, 'kind': kind, 'data': patch, 'questions': questions,
+        return {**result, 'addressedToBot': addressed, 'kind': kind, 'data': patch, 'questions': questions,
                 'reply': reply, 'consent': consent, 'assignments': assignments}
 
     def _apply_plan(self, key, job, plan, phase):
@@ -814,7 +828,8 @@ class AssistantListingWorkflow(ListingWorkflow):
                             if self.return_chat_image and job['images']:
                                 self.return_chat_image(key, job['images'][-1]['messageId'])
                         self._save(key, job)
-                        return None
+                        return (_response(True, '', job=job, status='ignored')
+                                if plan['addressedToBot'] is False else None)
                     if plan['action'] == 'cancel':
                         return self.cancel(key)
                     try:

@@ -726,6 +726,74 @@ class AssistantListingTests(unittest.TestCase):
         self.assertFalse(consent['publish'])
         self.assertEqual(consent['publishEvidenceMessageId'], 'withdraw')
 
+    def test_false_addressee_discards_publish_or_cancel_and_preserves_active_draft(self):
+        for action in ('publish', 'cancel'):
+            with self.subTest(action=action):
+                self.setUp()
+                self.begin()
+                self.workflow.receive_image(self.KEY, 'cover')
+                before = self.store.get(self.KEY)
+                self.analyze.reset_mock()
+                self.analyze.return_value = self.plan(action, addressedToBot=False, captureAction='open',
+                    data={'價格': 1}, authorization={'publish': True, 'complete': True,
+                                                  'evidenceMessageId': 'not-a-real-source'},
+                    assignments=[{'index': 999, 'purpose': 'ignore'}])
+                result = self.workflow.handle_text(self.KEY, '陸總那個角色剛才說要取消', 'third-person',
+                                                   self.now * 1000, eligible=True)
+                self.assertEqual(result['status'], 'ignored')
+                self.assertEqual(result['message'], '')
+                after = self.store.get(self.KEY)
+                for field in ('data', 'publishConsent', 'captureSession', 'images', 'messages', 'stage', 'lastResult'):
+                    self.assertEqual(after[field], before[field], field)
+                self.analyze.assert_called_once()
+                self.backend.publish.assert_not_called()
+                self.assertTrue(self.workflow.has_active_capture(self.KEY))
+
+    def test_false_addressee_on_pending_task_never_polls_retries_or_cancels(self):
+        for action in ('publish', 'cancel', 'retry', 'status'):
+            with self.subTest(action=action):
+                self.setUp()
+                self.pending_job()
+                before = self.store.get(self.KEY)
+                self.analyze.reset_mock()
+                self.analyze.return_value = self.plan(action, addressedToBot=False)
+                result = self.workflow.handle_text(self.KEY, '陸總說他要取消活動', 'third-person', eligible=True)
+                self.assertEqual(result['status'], 'ignored')
+                self.assertEqual(result['message'], '')
+                self.assertEqual(self.store.get(self.KEY), before)
+                self.backend.verify_publication.assert_not_called()
+                self.backend.publish.assert_called_once()
+                self.analyze.assert_called_once()
+
+    def test_false_addressee_does_not_open_capture_or_capture_candidate_images(self):
+        returned = Mock()
+        self.workflow.return_chat_image = returned
+        def unrelated(context, images):
+            self.workflow.receive_image(self.KEY, 'ordinary-image')
+            return self.plan('publish', addressedToBot=False, captureAction='open', data={'價格': 'invalid'})
+        self.analyze.side_effect = unrelated
+        result = self.workflow.handle_text(self.KEY, '陸總那個角色很有趣', 'third-person', eligible=True)
+        self.assertEqual(result['status'], 'ignored')
+        self.assertFalse(self.workflow.has_active_capture(self.KEY))
+        self.assertEqual(self.store.get(self.KEY)['messages'], [])
+        self.assertEqual(self.store.get(self.KEY)['images'], [])
+        returned.assert_called_once_with(self.KEY, 'ordinary-image')
+        self.download.assert_not_called()
+        self.backend.publish.assert_not_called()
+
+    def test_true_addressee_ignore_still_allows_normal_chat_fallback(self):
+        self.analyze.return_value = self.plan('ignore', addressedToBot=True)
+        self.assertIsNone(self.workflow.handle_text(self.KEY, '陸總，幫我查一下營業時間',
+                                                    'normal-request', eligible=True))
+        self.analyze.assert_called_once()
+
+    def test_addressee_field_must_be_boolean_when_supplied(self):
+        for invalid in ('false', 0, None):
+            with self.subTest(invalid=invalid):
+                job = self.workflow._new_job()
+                with self.assertRaisesRegex(ValueError, 'invalid addressee flag'):
+                    self.workflow._validate_plan(self.plan(addressedToBot=invalid), job, 'intent')
+
 
 if __name__ == '__main__':
     unittest.main()

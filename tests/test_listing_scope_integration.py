@@ -9,11 +9,14 @@ from types import SimpleNamespace as NS
 import unittest
 from unittest.mock import Mock
 
+from linebot.v3.messaging import TextMessage
+
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from listing_assistant import AssistantListingWorkflow
+from script_workflow import result_text
 
 
 class JsonStore:
@@ -33,7 +36,7 @@ class JsonStore:
 
 def load_handlers(env):
     wanted = {'group_handle_message', 'group_handle_image', 'handle_listing_text',
-              'is_bot_addressed', 'is_script_intent'}
+              'is_bot_addressed', 'is_script_intent', 'notify_script_result'}
     tree = ast.parse((ROOT / 'app.py').read_text(encoding='utf-8'))
     selected = []
     for node in ast.walk(tree):
@@ -76,13 +79,15 @@ class ListingScopeIntegrationTests(unittest.TestCase):
             'GROUP_CHAT_LOG_MAX': 20, 'group_chat_log': {}, 'group_bot_msg_ids': set(),
             'pending_group_image': {}, 'listing_workflow': self.workflow,
             'script_workflow': Mock(), 'get_member_name': Mock(return_value='員工'),
-            'append_chat_buffer': Mock(), 'notify_script_result': Mock(),
+            'append_chat_buffer': Mock(), 'TextMessage': TextMessage, 'result_text': result_text,
+            'deliver_script_messages': Mock(return_value=['offline-receipt']),
             'group_reply': Mock(), 'group_chat_ai': Mock(),
             'new_group_tool_session': Mock(side_effect=AssertionError('unexpected group AI call')),
             # The former 2% branches would always execute with this value.
             'random': Mock(random=Mock(return_value=0)),
         }
         load_handlers(self.env)
+        self.env['notify_script_result'] = Mock(wraps=self.env['notify_script_result'])
 
     def event(self, ident, *, text=None, seconds=0):
         self.now = 1700000000.0 + seconds
@@ -150,6 +155,29 @@ class ListingScopeIntegrationTests(unittest.TestCase):
         self.assertEqual(self.store.writes, 0)
         self.assertEqual(self.store.get(self.KEY), before)
 
+    def test_name_first_third_person_statement_is_silently_ignored_by_real_workflow(self):
+        self.analyze.side_effect = None
+        self.analyze.return_value = {
+            'action': 'ignore', 'captureAction': 'none', 'addressedToBot': False,
+        }
+        self.env['group_handle_message'](self.event(
+            'third-person', text='陸總今天說要上架'))
+        self.analyze.assert_called_once()
+        context = self.analyze.call_args.args[0]
+        self.assertEqual(context['messages'][-1]['text'], '陸總今天說要上架')
+        self.assertTrue(context['explicitlyInvoked'])
+        self.assertFalse(self.workflow.has_active_capture(self.KEY))
+        state = self.store.get(self.KEY)
+        self.assertEqual(state['images'], [])
+        self.assertFalse(state['publishRequested'])
+        self.assertFalse(any(m['messageId'] == 'third-person' for m in state['messages']))
+        self.download.assert_not_called()
+        self.backend.publish.assert_not_called()
+        self.env['deliver_script_messages'].assert_not_called()
+        self.env['group_reply'].assert_not_called()
+        self.env['group_chat_ai'].assert_not_called()
+        self.env['new_group_tool_session'].assert_not_called()
+
     def test_explicit_collection_accepts_images_then_stops_after_finish_needs_input(self):
         self.analyze.side_effect = None
         self.analyze.return_value = {
@@ -157,7 +185,7 @@ class ListingScopeIntegrationTests(unittest.TestCase):
             'authorization': {'publish': True, 'evidenceMessageId': 'start'},
         }
         self.env['group_handle_message'](self.event(
-            'start', text='陸總，幫我上架這本，我現在傳資料'))
+            'start', text='陸總我要上架這本，我現在把資料給你'))
         self.assertTrue(self.workflow.has_active_capture(self.KEY))
         for seconds, ident in enumerate(('cover', 'role-a', 'role-b'), start=1):
             self.env['group_handle_image'](self.event(ident, seconds=seconds))
@@ -173,7 +201,9 @@ class ListingScopeIntegrationTests(unittest.TestCase):
                 {'index': 3, 'purpose': 'portraits', 'roleName': '乙'},
             ], 'questions': ['請補每人價格。']},
         ]
-        self.env['group_handle_message'](self.event('done', text='傳完了，直接上架', seconds=4))
+        done = self.event('done', text='好了', seconds=4)
+        done.message.mention = NS(mentionees=[NS(user_id='bot')])
+        self.env['group_handle_message'](done)
         before = self.store.get(self.KEY)
         # A missing field keeps the draft collecting, but must not leave the
         # receiver open to unrelated screenshots sent later in the group.
@@ -182,6 +212,9 @@ class ListingScopeIntegrationTests(unittest.TestCase):
         self.assertFalse(self.workflow.has_active_capture(self.KEY))
         self.assertEqual(len(before['images']), 3)
         self.assertEqual(self.analyze.call_count, 3)
+        finish_intent = self.analyze.call_args_list[1].args[0]
+        self.assertEqual(finish_intent['messages'][-1]['text'], '好了')
+        self.assertTrue(finish_intent['explicitlyInvoked'])
         self.backend.publish.assert_not_called()
         writes = self.store.writes
         notifications = self.env['notify_script_result'].call_count

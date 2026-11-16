@@ -326,7 +326,9 @@ class AppScriptTests(unittest.TestCase):
 
     def test_direct_calls_are_distinct_from_mentions_inside_prose(self):
         positive = ('陸總，幫我上架', '小六幫我處理這本', '小六新增劇本《測試》',
-                    '陸傲天', '@陸總 請幫忙', '小6，繼續', '傲天請看這張圖')
+                    '陸傲天', '@陸總 請幫忙', '小6，繼續', '傲天請看這張圖',
+                    '陸總我要上架一本', '小六這本交給你了', '傲天收到全部資料了',
+                    '小陸好了', '陸總替我處理看看', '小6沒問題就開始吧')
         negative = ('他叫小六來看', '上架資料給陸總', '陸總的說明在這',
                     '陸總表示會處理', '「小六幫我上架」', '陸總之前已經上架',
                     '小六剛才說有收到', '名稱：陸總')
@@ -357,6 +359,40 @@ class AppScriptTests(unittest.TestCase):
         self.listing.handle_text.assert_called_once_with(
             ('group', 'user'), '這份幫我處理一下', message_id='addressed-text',
             event_timestamp=1700000000000, eligible=True)
+
+    def test_direct_name_with_unrestricted_body_reaches_semantic_handler(self):
+        self.listing.handle_text.return_value = self.outcome
+        for text in ('陸總我要新增一本劇本', '小六這份先交給你',
+                     '傲天收到全部資料了', '小陸好了', '小6替我完成這件事'):
+            with self.subTest(text=text):
+                self.event.message.text = text
+                self.env['group_handle_message'](self.event)
+                self.assertEqual(self.listing.handle_text.call_args.args[1], text)
+                self.assertTrue(self.listing.handle_text.call_args.kwargs['eligible'])
+        self.env['new_group_tool_session'].assert_not_called()
+        self.workflow.take_chat_image.assert_not_called()
+
+    def test_real_line_mention_does_not_require_any_body_keyword(self):
+        self.event.message.mention = NS(mentionees=[NS(user_id='bot')])
+        self.listing.handle_text.return_value = self.outcome
+        for text in ('我要交代你一件事情，資料接著給', '好了'):
+            with self.subTest(text=text):
+                self.event.message.text = text
+                self.env['group_handle_message'](self.event)
+                self.assertEqual(self.listing.handle_text.call_args.args[1], text)
+                self.assertTrue(self.listing.handle_text.call_args.kwargs['eligible'])
+        self.env['new_group_tool_session'].assert_not_called()
+        self.workflow.take_chat_image.assert_not_called()
+
+    def test_semantically_ignored_name_first_prose_does_not_fall_into_chat(self):
+        self.event.message.text = '陸總今天說要上架'
+        self.listing.handle_text.return_value = {'ok': False, 'status': 'ignored', 'message': ''}
+        self.env['group_handle_message'](self.event)
+        self.assertTrue(self.listing.handle_text.call_args.kwargs['eligible'])
+        self.env['new_group_tool_session'].assert_not_called()
+        self.env['group_chat_ai'].assert_not_called()
+        self.env['group_reply'].assert_not_called()
+        self.workflow.take_chat_image.assert_not_called()
 
     def test_line_mention_reaches_listing_intent_before_image_chat(self):
         self.event.message.text = '這份幫我處理一下'
@@ -538,6 +574,13 @@ class DeliveryAndCoverTests(unittest.TestCase):
         self.assertTrue(self.notify())
         self.api.push_message.assert_not_called()
 
+    def test_silent_ignored_receipt_never_sends_line_message(self):
+        result = self.env['notify_script_result'](
+            'group', 'reply', {'ok': False, 'status': 'ignored', 'message': ''})
+        self.assertFalse(result)
+        self.api.reply_message.assert_not_called()
+        self.api.push_message.assert_not_called()
+
     def test_deferred_or_ignored_receipts_do_not_send_empty_messages(self):
         for status in ('deferred', 'ignored', 'duplicate'):
             self.assertFalse(self.env['notify_script_result'](
@@ -647,7 +690,7 @@ class OfflineStartupTests(unittest.TestCase):
                 self.assertEqual(response.data, b'OK')
                 self.assertEqual(response.headers['X-Group-Model'], model)
                 self.assertEqual(response.headers['X-Group-Provider'], provider)
-                self.assertEqual(response.headers['X-Bot-Release'], '2026-11-16-listing-consent-fix')
+                self.assertEqual(response.headers['X-Bot-Release'], '2026-11-16-natural-listing')
                 self.assertEqual(response.headers['X-Script-Workflow'], 'assistant-v3-scoped')
                 if module.group_gemini_client is not None:
                     module.group_gemini_client.close()
