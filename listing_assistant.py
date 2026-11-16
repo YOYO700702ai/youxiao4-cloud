@@ -6,6 +6,8 @@ version checks, operation keys, and verified public readback.
 """
 from copy import deepcopy
 from hashlib import sha256
+import logging
+import re
 import time
 from uuid import uuid4
 
@@ -16,6 +18,10 @@ from listing_workflow import (
 
 
 class AssistantListingWorkflow(ListingWorkflow):
+    CAPTURE_VERSION = 1
+    CAPTURE_IDLE_SECONDS = 15 * 60
+    PENDING_INTAKE_SECONDS = 120
+
     def __init__(self, *, analyze, identify=None, clock=time.time,
                  max_image_bytes=MAX_IMAGE_BYTES, return_chat_image=None, **kwargs):
         super().__init__(identify=identify, clock=clock,
@@ -25,6 +31,216 @@ class AssistantListingWorkflow(ListingWorkflow):
         self._running = set()
         self._known_active = set()
         self._inactive_until = {}
+        self._intake_owners = {}
+
+    def _queue_intake(self, key, job, event):
+        pending = job.get('pendingIntake')
+        if (not pending or self._intake_owners.get(tuple(key)) != pending.get('sourceMessageId')
+                or self.clock() - pending.get('lastActivityAt', 0) >= self.PENDING_INTAKE_SECONDS):
+            return None
+        if event['messageId'] not in {item['messageId'] for item in pending['events']}:
+            pending['events'].append(event)
+            pending['lastActivityAt'] = self.clock()
+            self._save(key, job)
+        return _response(True, '', job=job, status='deferred')
+
+    def _start_intake(self, key, job, source):
+        previous = job.get('pendingIntake')
+        if previous and previous.get('events') and previous.get('sourceMessageId') != source['messageId']:
+            job['interruptedIntake'] = deepcopy(previous)
+        self._intake_owners[tuple(key)] = source['messageId']
+        job['pendingIntake'] = {'version': 1, 'sourceMessageId': source['messageId'],
+                                'lastActivityAt': self.clock(), 'events': []}
+
+    def _return_queued_chat_image(self, key, events):
+        latest = next((event for event in reversed(events) if event['type'] == 'image'), None)
+        if latest and self.return_chat_image:
+            self.return_chat_image(tuple(key), latest['messageId'])
+
+    def _drain_intake(self, key, source_id, outcome):
+        """Only confirmed scope consumes queued events; candidate events never
+        enter the opening intent prompt or download media before that decision.
+        """
+        try:
+            while True:
+                with _LOCK:
+                    job = self._load(key)
+                    pending = (job or {}).get('pendingIntake')
+                    if not pending or pending.get('sourceMessageId') != source_id:
+                        return outcome
+                    expired = self.clock() - pending.get('lastActivityAt', 0) >= self.PENDING_INTAKE_SECONDS
+                    failed = outcome and outcome.get('status') in {'analysis_failed', 'media_failed', 'needs_input'}
+                    rejected = job['stage'] == 'cancelled' or (not self._capture_active(job)
+                                and (self._capture(job) or {}).get('closedReason') != 'complete')
+                    if expired or failed or rejected:
+                        events = list(pending['events'])
+                        job.pop('pendingIntake', None)
+                        self._save(key, job)
+                        self._return_queued_chat_image(key, events)
+                        return outcome
+                    if not pending['events']:
+                        job.pop('pendingIntake', None)
+                        self._save(key, job)
+                        return outcome
+                    event = deepcopy(pending['events'][0])
+                    pending['processingMessageId'] = event['messageId']
+                    pending['lastActivityAt'] = self.clock()
+                    self._save(key, job)
+                if event['type'] == 'image':
+                    current = self.receive_image(key, event['messageId'], event.get('timestamp'),
+                                                 event.get('imageSet'), _from_pending=True)
+                    if current.get('status') == 'ignored':
+                        self._return_queued_chat_image(key, [event])
+                else:
+                    current = self.handle_text(key, event['text'], event['messageId'],
+                                               event.get('timestamp'), event.get('eligible', False),
+                                               _from_pending=True)
+                with _LOCK:
+                    updated = self._load(key)
+                    remaining = (updated or {}).get('pendingIntake')
+                    if remaining and remaining.get('sourceMessageId') == source_id:
+                        remaining['events'] = [item for item in remaining['events']
+                                               if item['messageId'] != event['messageId']]
+                        remaining.pop('processingMessageId', None)
+                        self._save(key, updated)
+                if current and current.get('status') not in {'ignored', 'duplicate', 'deferred'}:
+                    outcome = current
+        finally:
+            if self._intake_owners.get(tuple(key)) == source_id:
+                self._intake_owners.pop(tuple(key), None)
+
+    def _pending_actionable_events(self, job):
+        pending = job.get('pendingIntake', {})
+        for event in pending.get('events', []):
+            if event['messageId'] == pending.get('processingMessageId'):
+                continue
+            if event['type'] == 'image':
+                if (event['messageId'] not in job['processedEvents'] and
+                        self._late_image_allowed(job, event.get('timestamp'), event.get('imageSet'))):
+                    return True
+            elif (event.get('eligible') or self._late_image_allowed(job, event.get('timestamp'), None)):
+                # A direct stop/cancel can arrive after "finished sending".
+                # Interpret it before publication, without letting later
+                # ordinary group chatter enter the task.
+                return True
+        return False
+
+    def _capture(self, job):
+        capture = (job or {}).get('captureSession')
+        return capture if isinstance(capture, dict) and capture.get('version') == self.CAPTURE_VERSION else None
+
+    def _capture_active(self, job):
+        capture = self._capture(job)
+        return bool(capture and capture.get('active') and
+                    self.clock() - capture.get('lastActivityAt', 0) < self.CAPTURE_IDLE_SECONDS
+                    and job['stage'] not in _TERMINAL and not job.get('publishRequested'))
+
+    def has_active_capture(self, key):
+        """Read-only evidence for whether an image-error receipt is appropriate."""
+        try:
+            with _LOCK:
+                return self._capture_active(self._load(key))
+        except (WorkflowStorageError, ValueError):
+            return False
+
+    def _close_capture(self, job, reason, *, completed_at=None, allow_late=False):
+        capture = self._capture(job)
+        if not capture:
+            return
+        was_active = capture.get('active', False)
+        capture.update(active=False, closedReason=reason, closedAt=self.clock())
+        if allow_late and was_active:
+            capture['completedAt'] = completed_at
+            capture['allowedImageSets'] = {
+                ident: group['total'] for ident, group in job.get('imageSets', {}).items()
+                if group.get('captureSessionId') == capture['id'] and len(group['indices']) < group['total']}
+        elif not allow_late:
+            capture['completedAt'] = None
+            capture['allowedImageSets'] = {}
+
+    def _expire_capture(self, key, job):
+        capture = self._capture(job)
+        expired = bool(capture and ((capture.get('active') and not self._capture_active(job)) or
+                       (capture.get('closedReason') == 'complete' and
+                        self.clock() - capture.get('closedAt', 0) >= self.CAPTURE_IDLE_SECONDS)))
+        if expired:
+            self._close_capture(job, 'idle')
+            job['analysisPending'] = False
+            self._known_active.discard(tuple(key))
+            try:
+                self._save(key, job)
+            except WorkflowStorageError:
+                # Expiry still excludes this unsolicited event when the store
+                # is unavailable; do not turn it into a group error message.
+                pass
+
+    def _open_capture(self, key, job, source):
+        if self._capture_active(job):
+            job['captureSession']['lastActivityAt'] = self.clock()
+            self._known_active.add(tuple(key))
+            return
+        job['captureSession'] = {
+            'version': self.CAPTURE_VERSION, 'id': str(uuid4()), 'active': True,
+            'openedAt': self.clock(), 'lastActivityAt': self.clock(),
+            'startedAt': source.get('timestamp'), 'startMessageId': source['messageId'],
+            'completedAt': None, 'allowedImageSets': {}, 'closedReason': None,
+        }
+        # Resuming a draft starts a new collection round, not an automatic
+        # continuation of a previous "everything has been sent" instruction.
+        job.setdefault('publishConsent', {})['complete'] = False
+        job['publishConsent'].pop('completionEvidenceMessageId', None)
+        job['analysisPending'] = False
+        self._known_active.add(tuple(key))
+
+    @staticmethod
+    def _image_set_values(image_set):
+        if not image_set:
+            return None
+        if not isinstance(image_set, dict):
+            image_set = {field: getattr(image_set, field, None) for field in ('id', 'index', 'total')}
+        ident, index, total = (image_set.get(field) for field in ('id', 'index', 'total'))
+        if not isinstance(ident, str) or not ident or type(index) is not int or type(total) is not int or not 1 <= index <= total <= 100:
+            return None
+        return ident, index, total
+
+    def _late_image_allowed(self, job, event_timestamp, image_set):
+        capture = self._capture(job)
+        if not capture or capture.get('active') or capture.get('closedReason') != 'complete':
+            return False
+        if self.clock() - capture.get('closedAt', 0) >= self.CAPTURE_IDLE_SECONDS:
+            return False
+        values = self._image_set_values(image_set)
+        timestamp = _seconds(event_timestamp)
+        start, completed = capture.get('startedAt'), capture.get('completedAt')
+        if timestamp is None or start is None or completed is None or not start <= timestamp <= completed:
+            return False
+        if values:
+            ident, index, total = values
+            allowed_total = capture.get('allowedImageSets', {}).get(ident)
+            group = job.get('imageSets', {}).get(ident, {})
+            # A known album member is tied to this exact collection round.
+            return (allowed_total == total and index not in group.get('indices', [])
+                    and group.get('captureSessionId') == capture['id'])
+        # A standalone delayed event can only be attributed when its LINE
+        # timestamp is bounded by this round's explicit start and finish.
+        return image_set is None
+
+    def _seal_for_analysis(self, job):
+        if not self._capture_active(job):
+            return
+        consent = job.get('publishConsent', {})
+        source = next((message for message in job.get('messages', [])
+                       if message['messageId'] == consent.get('completionEvidenceMessageId')), {})
+        complete = bool(consent.get('complete'))
+        self._close_capture(job, 'complete' if complete else 'organize',
+                            completed_at=source.get('timestamp'), allow_late=complete)
+
+    @staticmethod
+    def _log_analysis_error(phase, error):
+        error_type = getattr(error, 'error_type', '')
+        safe_type = error_type if isinstance(error_type, str) and re.fullmatch(r'[A-Za-z_]{1,64}', error_type) else ''
+        logging.getLogger(__name__).warning('listing_analysis_failed phase=%s class=%s type=%s',
+                                           phase, type(error).__name__[:80], safe_type)
 
     def _new_job(self, data=None, kind='upload'):
         data = deepcopy(data or {})
@@ -84,23 +300,34 @@ class AssistantListingWorkflow(ListingWorkflow):
                 job = current
             else:
                 job = self._new_job(normalized, kind)
-            self._known_active.add(tuple(key))
             self._inactive_until.pop(tuple(key), None)
-            return self._record(key, job, True, '可以直接貼上劇本資料和全部圖片；傳完後告訴我即可。')
+            return self._record(key, job, True, '草稿已保留；叫我開始或繼續收件後，再傳文字和圖片。')
 
-    def handle_text(self, key, text, message_id=None, event_timestamp=None, eligible=False):
+    def handle_text(self, key, text, message_id=None, event_timestamp=None, eligible=False, *, _from_pending=False):
         if not isinstance(text, str) or not text.strip():
             return None
         key = tuple(key)
+        message_id = message_id or str(uuid4())
         with _LOCK:
             if not eligible and self._inactive_until.get(key, 0) > self.clock():
                 return None
             try:
                 job = self._load(key)
             except WorkflowStorageError:
-                if not eligible and key not in self._known_active:
+                if not eligible:
                     return None
                 raise
+            if job and not _from_pending:
+                queued = self._queue_intake(key, job, {'type': 'text', 'messageId': message_id or str(uuid4()),
+                                                      'text': text, 'timestamp': _seconds(event_timestamp),
+                                                      'eligible': bool(eligible)})
+                if queued:
+                    return queued
+            if job:
+                self._expire_capture(key, job)
+            late_text = bool(_from_pending and self._late_image_allowed(job, event_timestamp, None))
+            if not eligible and not self._capture_active(job) and not late_text:
+                return None
             if job and message_id and any(m['messageId'] == message_id for m in job.get('messages', [])):
                 return deepcopy(job['lastResult']) or _response(True, '這則資料已收到。', job=job)
             created = job is None
@@ -113,7 +340,9 @@ class AssistantListingWorkflow(ListingWorkflow):
             if closed_job is not None:
                 # Interpret the new message before deciding whether this is a
                 # status query, an explicit retry, or a genuinely new task.
-                pass
+                if not _from_pending:
+                    self._start_intake(key, job, {'messageId': message_id})
+                    self._save(key, job)
             elif not job:
                 if not eligible:
                     self._inactive_until[key] = self.clock() + 30
@@ -122,15 +351,24 @@ class AssistantListingWorkflow(ListingWorkflow):
             else:
                 job = self._migrate(key, job)
             if closed_job is None:
-                self._known_active.add(key)
                 self._inactive_until.pop(key, None)
-                job['messages'].append({'role': 'user', 'messageId': message_id or str(uuid4()),
-                                        'text': text, 'timestamp': _seconds(event_timestamp)})
+                source = {'role': 'user', 'messageId': message_id or str(uuid4()),
+                          'text': text, 'timestamp': _seconds(event_timestamp), 'addressed': bool(eligible)}
+                job['messages'].append(source)
                 job['inputRevision'] += 1
+                if not _from_pending:
+                    self._start_intake(key, job, source)
                 self._save(key, job)
         if closed_job is not None:
-            return self._route_closed_text(key, closed_job, text, message_id, event_timestamp)
-        return self._analyze(key, phase='intent', new_candidate=created)
+            outcome = self._route_closed_text(key, closed_job, text, message_id, event_timestamp)
+            return outcome if _from_pending else self._drain_intake(key, message_id, outcome)
+        try:
+            outcome = self._analyze(key, phase='intent', new_candidate=created, source_message_id=source['messageId'])
+        except Exception:
+            if not _from_pending:
+                self._intake_owners.pop(key, None)
+            raise
+        return outcome if _from_pending else self._drain_intake(key, source['messageId'], outcome)
 
     def _route_closed_text(self, key, previous, text, message_id, event_timestamp):
         """A published receipt and a frozen publication never become blank jobs
@@ -143,7 +381,7 @@ class AssistantListingWorkflow(ListingWorkflow):
         if not terminal:
             context_job.setdefault('nameKnown', True)
         latest = {'role': 'user', 'messageId': message_id or str(uuid4()),
-                  'text': text, 'timestamp': _seconds(event_timestamp)}
+                  'text': text, 'timestamp': _seconds(event_timestamp), 'addressed': True}
         context_job['messages'].append(latest)
         context = self._context(context_job, 'intent', active_task=not terminal)
         context['priorTask'] = {field: deepcopy(previous.get(field)) for field in
@@ -151,7 +389,8 @@ class AssistantListingWorkflow(ListingWorkflow):
         context['priorTask']['name'] = previous['data']['名稱']
         try:
             plan = self._validate_plan(self.analyze(context, []), context_job, 'intent')
-        except Exception:
+        except Exception as error:
+            self._log_analysis_error('closed_intent', error)
             return _response(False, '這則指示尚未判讀成功，既有上架資料與收據都已保留，請再說明一次。',
                              job=previous, status='analysis_failed')
         with _LOCK:
@@ -160,7 +399,7 @@ class AssistantListingWorkflow(ListingWorkflow):
                 return _response(False, '目前任務已變更，這則指示沒有套用；請確認目前上架狀態。', job=current)
             action = plan['action']
             if action == 'cancel':
-                return super().cancel(key)
+                return self.cancel(key)
             if action == 'retry':
                 return super().retry(key)
             if action == 'status':
@@ -179,13 +418,18 @@ class AssistantListingWorkflow(ListingWorkflow):
             job = self._new_job()
             job['messages'] = [latest]
             job['inputRevision'] = 1
+            if current.get('pendingIntake'):
+                job['pendingIntake'] = deepcopy(current['pendingIntake'])
             self._apply_plan(key, job, plan, 'intent')
-            self._known_active.add(key)
+            if action == 'collect' and plan.get('captureAction') == 'open':
+                self._open_capture(key, job, latest)
             self._inactive_until.pop(key, None)
             organize = (action == 'publish' or plan.get('needsImages') is True
                         or job['publishConsent'].get('complete'))
             if not organize:
-                return self._record(key, job, True, '新上架資料已保存，可以直接傳文字和圖片。', status='collecting')
+                message = ('已開始這輪收件，可以直接傳文字和圖片。' if self._capture_active(job)
+                           else '新上架資料已保存；需要繼續傳圖時請叫我開始收件。')
+                return self._record(key, job, True, message, status='collecting')
         return self._analyze(key, phase='organize')
 
     def _save_image(self, key, job, entry):
@@ -218,28 +462,53 @@ class AssistantListingWorkflow(ListingWorkflow):
     def _add_image_set(self, job, entry, image_set):
         if not image_set:
             return
-        if not isinstance(image_set, dict):
-            image_set = {field: getattr(image_set, field, None) for field in ('id', 'index', 'total')}
-        ident, index, total = (image_set.get(field) for field in ('id', 'index', 'total'))
-        if not isinstance(ident, str) or not ident or type(index) is not int or type(total) is not int or not 1 <= index <= total <= 100:
+        values = self._image_set_values(image_set)
+        if not values:
             job['imageSetIssues'].append('LINE 相簿張數資訊不完整，請確認這批圖片是否已全部傳完。')
             return
+        ident, index, total = values
         entry['imageSet'] = {'id': ident, 'index': index, 'total': total}
-        group = job['imageSets'].setdefault(ident, {'total': total, 'indices': []})
+        group = job['imageSets'].setdefault(ident, {'total': total, 'indices': [],
+                                                  'captureSessionId': entry['captureSessionId']})
         if group['total'] != total or index in group['indices']:
             job['imageSetIssues'].append('LINE 相簿張數有衝突，圖片已保留，請確認實際張數。')
         else:
             group['indices'].append(index)
 
     def _waiting_sets(self, job):
-        return sum(group['total'] - len(group['indices']) for group in job.get('imageSets', {}).values())
+        capture = self._capture(job)
+        if not capture or (not self._capture_active(job) and capture.get('closedReason') != 'complete'):
+            return 0
+        return sum(group['total'] - len(group['indices']) for group in job.get('imageSets', {}).values()
+                   if group.get('captureSessionId') == capture['id'])
 
-    def receive_image(self, key, message_id, event_timestamp=None, image_set=None):
+    def receive_image(self, key, message_id, event_timestamp=None, image_set=None, *, _from_pending=False):
         key = tuple(key)
         with _LOCK:
-            job = self._load(key)
+            try:
+                job = self._load(key)
+            except WorkflowStorageError:
+                return _response(False, '', status='ignored')
+            if job and not _from_pending:
+                metadata = ({field: image_set.get(field) for field in ('id', 'index', 'total')}
+                            if isinstance(image_set, dict) else
+                            {field: getattr(image_set, field, None) for field in ('id', 'index', 'total')}
+                            if image_set is not None else None)
+                queued = self._queue_intake(key, job, {'type': 'image', 'messageId': message_id,
+                                                      'timestamp': _seconds(event_timestamp), 'imageSet': metadata})
+                if queued:
+                    return queued
             if not job or job['stage'] in _TERMINAL or job.get('publishRequested'):
                 return _response(False, '目前沒有正在收件的上架任務。', job=job, status='ignored')
+            self._expire_capture(key, job)
+            active = self._capture_active(job)
+            late = self._late_image_allowed(job, event_timestamp, image_set)
+            if not active and not late:
+                return _response(False, '這張圖片不屬於目前明確開啟的收件範圍。', job=job, status='ignored')
+            start = job['captureSession'].get('startedAt')
+            timestamp = _seconds(event_timestamp)
+            if active and start is not None and timestamp is not None and timestamp < start:
+                return _response(False, '這張圖片早於本輪收件開始。', job=job, status='ignored')
             job = self._migrate(key, job)
             if not isinstance(message_id, str) or not message_id:
                 return _response(False, '圖片訊息無法識別，請再傳一次。', job=job, status='media_failed')
@@ -250,16 +519,20 @@ class AssistantListingWorkflow(ListingWorkflow):
                      'roleName': None, 'confirmed': False, 'recognition': None,
                      'stage': 'received', 'asset': None, 'error': None,
                      'mediaKind': 'character',
+                     'captureSessionId': job['captureSession']['id'],
                      'operationKey': f"{job['jobId']}:media:{message_id}"}
             self._add_image_set(job, entry, image_set)
             job['images'].append(entry)
             job['processedEvents'].append(message_id)
             job['inputRevision'] += 1
+            job['captureSession']['lastActivityAt'] = self.clock()
             self._save(key, job)
             self._save_image(key, job, entry)
-            resume = bool(job.get('analysisPending') or job.get('publishConsent', {}).get('complete'))
+            resume = bool(late and (job.get('analysisPending') or job.get('publishConsent', {}).get('complete')))
             waiting = self._waiting_sets(job)
             if not entry.get('asset'):
+                self._close_capture(job, 'media_failed')
+                job['analysisPending'] = False
                 return self._record(key, job, False, f"第 {entry['index']} 張圖片尚未保存成功；訊息編號已保留，可以請我重試。", status='media_failed')
             if not resume or waiting:
                 suffix = f'，這批還在接收 {waiting} 張' if waiting else ''
@@ -268,6 +541,8 @@ class AssistantListingWorkflow(ListingWorkflow):
 
     def _context(self, job, phase, active_task=True):
         return {'phase': phase, 'activeTask': active_task, 'messages': deepcopy(job['messages']),
+                'explicitlyInvoked': bool(job['messages'] and job['messages'][-1].get('addressed')),
+                'captureSession': deepcopy(self._capture(job)),
                 'data': deepcopy(job['data']), 'nameKnown': job.get('nameKnown', False),
                 'kind': job['kind'], 'authorization': deepcopy(job.get('publishConsent', {})),
                 'questions': deepcopy(job.get('questions', [])),
@@ -281,6 +556,8 @@ class AssistantListingWorkflow(ListingWorkflow):
         kind = result.get('kind', job['kind'])
         if kind not in {'upload', 'cover', 'portraits'}:
             raise ValueError('invalid kind')
+        if result.get('captureAction', 'none') not in {'open', 'none'}:
+            raise ValueError('invalid capture action')
         patch = result.get('data') or {}
         patch = normalize_listing_data(patch, require_name=False) if patch else {}
         questions = result.get('questions') or []
@@ -337,6 +614,8 @@ class AssistantListingWorkflow(ListingWorkflow):
         job['kind'] = plan['kind']
         job['publishConsent'] = plan['consent']
         job['questions'] = plan['questions']
+        if phase == 'intent' and plan['action'] in {'collect', 'publish', 'organize', 'retry'} and self._capture_active(job):
+            job['captureSession']['lastActivityAt'] = self.clock()
         if phase == 'organize':
             assignments = {a['index']: a for a in plan['assignments']}
             message_order = {message['messageId']: index for index, message in enumerate(job['messages'])}
@@ -398,23 +677,27 @@ class AssistantListingWorkflow(ListingWorkflow):
 
     def _complete(self, key, job):
         consent = job.get('publishConsent', {})
-        job['analysisPending'] = bool(consent.get('complete'))
+        job['analysisPending'] = False
         blocked = self._ensure_identity(key, job)
         if blocked:
             return blocked
         issues = self._issues(job)
         if issues:
-            return self._record(key, job, False, '資料與圖片已保留。\n' + '\n'.join(issues), status='needs_input')
+            self._close_capture(job, 'needs_input')
+            return self._record(key, job, False, '資料與圖片已保留。\n' + '\n'.join(issues)
+                                + '\n補答或繼續傳圖時，請先叫我接續這本。', status='needs_input')
         if not (consent.get('publish') and consent.get('complete')):
             job['analysisPending'] = False
+            self._close_capture(job, 'ready')
             return self._record(key, job, True, '資料和圖片已整理好；確定全部傳完並要上架時告訴我即可。', status='ready')
         job['analysisPending'] = False
+        self._close_capture(job, 'publishing')
         job['publishRequested'] = True
         job['stage'] = 'publishing'
         self._save(key, job)
         return self._publish(key, job)
 
-    def _analyze(self, key, phase='organize', new_candidate=False):
+    def _analyze(self, key, phase='organize', new_candidate=False, source_message_id=None):
         key = tuple(key)
         with _LOCK:
             if key in self._running:
@@ -435,6 +718,13 @@ class AssistantListingWorkflow(ListingWorkflow):
                     if job.get('publishRequested'):
                         return super().status(key)
                     job = self._migrate(key, job)
+                    if phase == 'organize':
+                        self._seal_for_analysis(job)
+                        self._save(key, job)
+                        if self._pending_actionable_events(job):
+                            job['analysisPending'] = True
+                            self._save(key, job)
+                            return _response(True, '', job=job, status='deferred')
                     if phase == 'organize' and job['kind'] in {'cover', 'portraits'}:
                         blocked = self._ensure_identity(key, job)
                         if blocked:
@@ -455,13 +745,16 @@ class AssistantListingWorkflow(ListingWorkflow):
                             images.append({'index': entry['index'], 'bytes': raw, 'asset': deepcopy(entry['asset'])})
                     result = self.analyze(self._context(snapshot, phase, active_task=not new_candidate or phase == 'organize'), images)
                     plan = self._validate_plan(result, snapshot, phase)
-                except Exception:
+                except Exception as error:
+                    self._log_analysis_error(phase, error)
                     with _LOCK:
                         job = self._load(key)
                         if not job or job['stage'] in _TERMINAL or job.get('publishRequested'):
                             return super().status(key)
-                        job['analysisPending'] = True
-                        return self._record(key, job, False, '這次整理尚未成功，原文與圖片都已保留。請告訴我重試即可，不用重新傳圖。', status='analysis_failed')
+                        job['analysisPending'] = False
+                        self._close_capture(job, 'analysis_failed')
+                        self._known_active.discard(key)
+                        return self._record(key, job, False, '這次整理尚未成功，原文與圖片都已保留。請叫我重試即可，不用重新傳圖。', status='analysis_failed')
                 with _LOCK:
                     job = self._load(key)
                     if not job or job['stage'] in _TERMINAL or job.get('publishRequested'):
@@ -471,24 +764,39 @@ class AssistantListingWorkflow(ListingWorkflow):
                     if job['inputRevision'] != snapshot['inputRevision']:
                         phase = 'intent' if phase == 'intent' else 'organize'
                         continue
+                    if phase == 'organize' and self._pending_actionable_events(job):
+                        job['analysisPending'] = True
+                        self._save(key, job)
+                        return _response(True, '', job=job, status='deferred')
                     for entry, analyzed in zip(job['images'], snapshot['images']):
                         if analyzed.get('checksum'):
                             entry['checksum'] = analyzed['checksum']
                     if plan['action'] == 'ignore':
+                        ignored_id = snapshot['messages'][-1]['messageId'] if phase == 'intent' and snapshot['messages'] else source_message_id
+                        job['messages'] = [message for message in job['messages'] if message['messageId'] != ignored_id]
+                        job['inputRevision'] += 1
                         if new_candidate:
                             job['stage'] = 'cancelled'
-                            self._save(key, job)
+                            self._close_capture(job, 'ignored')
                             self._known_active.discard(key)
                             if self.return_chat_image and job['images']:
                                 self.return_chat_image(key, job['images'][-1]['messageId'])
+                        self._save(key, job)
                         return None
                     if plan['action'] == 'cancel':
-                        return super().cancel(key)
+                        return self.cancel(key)
                     try:
                         self._apply_plan(key, job, plan, phase)
                     except ValueError:
+                        self._close_capture(job, 'needs_input')
+                        job['analysisPending'] = False
                         return self._record(key, job, False, '整理結果與目前劇本資料有衝突，原資料和圖片已保留，請說明要修改的內容。', status='needs_input')
                     if phase == 'intent':
+                        latest = snapshot['messages'][-1] if snapshot['messages'] else {}
+                        if (plan['action'] == 'collect' and plan.get('captureAction') == 'open'
+                                and latest.get('addressed')):
+                            self._open_capture(key, job, latest)
+                            self._save(key, job)
                         if plan['action'] == 'status':
                             return self.status(key)
                         if plan['action'] == 'retry':
@@ -505,13 +813,18 @@ class AssistantListingWorkflow(ListingWorkflow):
                             job['analysisPending'] = True
                             self._save(key, job)
                             continue
-                        return self._record(key, job, True, '資料已保存，可以繼續傳文字和圖片。', status='collecting')
+                        message = ('資料已保存，這輪可以繼續傳文字和圖片。' if self._capture_active(job)
+                                   else '資料已保存；需要繼續傳圖時請叫我開始收件。')
+                        if job.get('interruptedIntake', {}).get('events'):
+                            message += '\n上一輪還有未處理完成的收件記錄，已保留；這些內容尚未加入上架資料。'
+                        return self._record(key, job, True, message, status='collecting')
                     return self._complete(key, job)
             with _LOCK:
                 job = self._load(key)
                 if not job or job['stage'] in _TERMINAL or job.get('publishRequested'):
                     return super().status(key)
-                job['analysisPending'] = True
+                job['analysisPending'] = False
+                self._close_capture(job, 'analysis_interrupted')
                 return self._record(key, job, True, '新資料仍在加入，內容都已保存；傳完後再告訴我一次即可。', status='collecting')
         finally:
             with _LOCK:
@@ -528,10 +841,23 @@ class AssistantListingWorkflow(ListingWorkflow):
             if not job or job['stage'] in _TERMINAL or job.get('publishRequested'):
                 return super().retry(key)
             job = self._migrate(key, job)
+            self._close_capture(job, 'retry')
+            job['analysisPending'] = False
+            self._save(key, job)
             for entry in job['images']:
                 entry.setdefault('mediaKind', 'cover' if entry['purpose'] == 'cover' else 'character')
                 self._save_image(key, job, entry)
         return self._analyze(key, phase='organize')
+
+    def cancel(self, key):
+        with _LOCK:
+            job = self._load(key)
+            if job and job['stage'] not in _TERMINAL:
+                self._close_capture(job, 'cancelled')
+                job['analysisPending'] = False
+                self._known_active.discard(tuple(key))
+                self._save(key, job)
+            return super().cancel(key)
 
     def status(self, key):
         with _LOCK:

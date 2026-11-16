@@ -53,6 +53,7 @@ class AppScriptTests(unittest.TestCase):
         self.listing.lock = threading.RLock()
         self.listing.prepare_update.return_value = None
         self.listing.handle_text.return_value = None
+        self.listing.has_active_capture.return_value = False
         for method in ('begin', 'merge_fields', 'label_images', 'finish', 'retry', 'status',
                        'cancel', 'assign_role', 'confirm_cover', 'receive_image'):
             getattr(self.listing, method).return_value = self.outcome
@@ -71,12 +72,13 @@ class AppScriptTests(unittest.TestCase):
             ListingInputError=ListingInputError, LISTING_HELP=LISTING_HELP,
             get_member_name=Mock(return_value='測試使用者'), append_chat_buffer=Mock(),
             new_group_tool_session=Mock(return_value=self.session),
-            group_reply=Mock(), notify_script_result=Mock(),
+            group_reply=Mock(), group_chat_ai=Mock(), notify_script_result=Mock(),
             parse_leaked_tool_calls=Mock(return_value=[]),
             result_text=result_text, random=Mock(random=Mock(return_value=0.5)),
         )
         load_functions(['execute_group_function', 'group_handle_message', 'group_handle_image',
-                        'function_response_part', 'is_script_intent', 'handle_listing_text'], self.env)
+                        'function_response_part', 'is_script_intent', 'is_bot_addressed',
+                        'handle_listing_text'], self.env)
         self.event = NS(source=NS(group_id='group', user_id='user'), reply_token='reply',
                         message=NS(text='小六幫忙看看上架需求', id='message'), timestamp=1700000000000)
 
@@ -217,13 +219,13 @@ class AppScriptTests(unittest.TestCase):
         self.workflow.start.assert_not_called()
         self.assertIn('沒有執行劇本寫入', self.env['group_reply'].call_args.args[1])
 
-    def test_status_request_reaches_listing_without_group_chat_or_sheets(self):
+    def test_status_followup_reaches_active_listing_without_opening_another_task(self):
         self.event.message.text = '上架狀態'
         self.listing.handle_text.return_value = self.outcome
         self.env['group_handle_message'](self.event)
         self.listing.handle_text.assert_called_once_with(
             ('group', 'user'), '上架狀態', message_id='message',
-            event_timestamp=1700000000000, eligible=True)
+            event_timestamp=1700000000000, eligible=False)
         self.workflow.status.assert_not_called()
         self.env['new_group_tool_session'].assert_not_called()
         self.env['append_chat_buffer'].assert_not_called()
@@ -234,6 +236,16 @@ class AppScriptTests(unittest.TestCase):
             ('group', 'user'), 'message', event_timestamp=1700000000000, image_set=None)
         self.workflow.receive_image.assert_not_called()
         self.env['notify_script_result'].assert_called_once_with('group', 'reply', self.outcome)
+
+    def test_pending_intent_keeps_deferred_text_and_image_silent(self):
+        deferred = {'ok': True, 'status': 'deferred', 'message': ''}
+        self.listing.handle_text.return_value = deferred
+        self.listing.receive_image.return_value = deferred
+        self.env['group_handle_message'](self.event)
+        self.env['group_handle_image'](self.event)
+        self.env['notify_script_result'].assert_not_called()
+        self.env['group_reply'].assert_not_called()
+        self.env['new_group_tool_session'].assert_not_called()
 
     def test_native_cover_tool_delegates_original_request(self):
         self.listing.handle_text.side_effect = [None, self.outcome]
@@ -289,6 +301,52 @@ class AppScriptTests(unittest.TestCase):
         self.listing.handle_text.assert_called_once_with(
             ('group', 'user'), '今天下午見', message_id='ordinary-text',
             event_timestamp=1700000000000, eligible=False)
+
+    def test_unaddressed_listing_topics_and_instruction_quotes_stay_silent(self):
+        self.env['random'].random.return_value = 0
+        texts = (
+            '這本要上架了', '上架資料', '官網資料在這裡', '網站目前都正常',
+            '名稱：測試劇本', '上架說明', '上架教學',
+            '他說陸總會自己處理', '範例：「陸總，上架這本」',
+            '「陸總，上架這本」是使用說明', '陸總說明天再處理',
+            '陸總剛剛說會上架', '```text\n陸總，上架這本\n```',
+        )
+        for index, text in enumerate(texts):
+            with self.subTest(text=text):
+                self.event.message.text = text
+                self.event.message.id = f'ordinary-{index}'
+                self.env['group_handle_message'](self.event)
+                self.assertFalse(self.listing.handle_text.call_args.kwargs['eligible'])
+        self.env['notify_script_result'].assert_not_called()
+        self.env['group_reply'].assert_not_called()
+        self.env['group_chat_ai'].assert_not_called()
+        self.env['new_group_tool_session'].assert_not_called()
+        self.workflow.take_chat_image.assert_not_called()
+        self.env['random'].random.assert_not_called()
+
+    def test_direct_calls_are_distinct_from_mentions_inside_prose(self):
+        positive = ('陸總，幫我上架', '小六幫我處理這本', '小六新增劇本《測試》',
+                    '陸傲天', '@陸總 請幫忙', '小6，繼續', '傲天請看這張圖')
+        negative = ('他叫小六來看', '上架資料給陸總', '陸總的說明在這',
+                    '陸總表示會處理', '「小六幫我上架」', '陸總之前已經上架',
+                    '小六剛才說有收到', '名稱：陸總')
+        for text in positive:
+            with self.subTest(text=text):
+                self.assertTrue(self.env['is_bot_addressed'](text))
+        for text in negative:
+            with self.subTest(text=text):
+                self.assertFalse(self.env['is_bot_addressed'](text))
+
+    def test_unknown_quoted_message_does_not_wake_bot(self):
+        self.event.message.text = '上架資料在這裡'
+        self.event.message.quoted_message_id = 'someone-elses-message'
+        self.env['random'].random.return_value = 0
+        self.env['group_handle_message'](self.event)
+        self.assertFalse(self.listing.handle_text.call_args.kwargs['eligible'])
+        self.env['notify_script_result'].assert_not_called()
+        self.env['group_reply'].assert_not_called()
+        self.env['group_chat_ai'].assert_not_called()
+        self.env['new_group_tool_session'].assert_not_called()
 
     def test_directly_addressed_message_can_reach_intent_model_without_keywords(self):
         self.listing.handle_text.return_value = self.outcome
@@ -394,6 +452,7 @@ class AppScriptTests(unittest.TestCase):
         self.workflow.start.assert_not_called()
 
     def test_image_store_failure_returns_safe_receipt_without_chat(self):
+        self.listing.has_active_capture.return_value = True
         self.listing.receive_image.side_effect = RuntimeError('private-token-value')
         self.env['group_handle_image'](self.event)
         result = self.env['notify_script_result'].call_args.args[2]
@@ -401,10 +460,46 @@ class AppScriptTests(unittest.TestCase):
         self.assertNotIn('private-token-value', result['message'])
         self.assertEqual(self.env['pending_group_image'], {})
 
+    def test_image_store_error_outside_capture_is_silent(self):
+        self.listing.receive_image.side_effect = RuntimeError('private-token-value')
+        self.env['random'].random.return_value = 0
+        self.env['group_handle_image'](self.event)
+        self.listing.has_active_capture.assert_called_once_with(('group', 'user'))
+        self.env['notify_script_result'].assert_not_called()
+        self.env['group_reply'].assert_not_called()
+        self.env['group_chat_ai'].assert_not_called()
+        self.assertEqual(self.env['pending_group_image'][('group', 'user')][0], 'message')
+        self.env['random'].random.assert_not_called()
+
+    def test_text_store_error_outside_capture_does_not_interrupt_group_chat(self):
+        self.event.message.text = '這張是操作說明，大家參考'
+        self.listing.handle_text.side_effect = RuntimeError('private-token-value')
+        self.env['random'].random.return_value = 0
+        self.env['group_handle_message'](self.event)
+        self.listing.has_active_capture.assert_called_once_with(('group', 'user'))
+        self.env['notify_script_result'].assert_not_called()
+        self.env['group_reply'].assert_not_called()
+        self.env['group_chat_ai'].assert_not_called()
+        self.env['new_group_tool_session'].assert_not_called()
+
+    def test_text_store_error_inside_capture_returns_safe_receipt(self):
+        self.event.message.text = '這是接著補的資料'
+        self.listing.handle_text.side_effect = RuntimeError('private-token-value')
+        self.listing.has_active_capture.return_value = True
+        self.env['group_handle_message'](self.event)
+        result = self.env['notify_script_result'].call_args.args[2]
+        self.assertFalse(result['ok'])
+        self.assertNotIn('private-token-value', result['message'])
+        self.env['new_group_tool_session'].assert_not_called()
+
     def test_unlabelled_image_is_kept_only_for_chat_without_listing_receipt(self):
         self.listing.receive_image.return_value = {'ok': False, 'status': 'ignored', 'message': 'ignored'}
+        self.env['random'].random.return_value = 0
         self.env['group_handle_image'](self.event)
         self.env['notify_script_result'].assert_not_called()
+        self.env['group_reply'].assert_not_called()
+        self.env['group_chat_ai'].assert_not_called()
+        self.env['random'].random.assert_not_called()
         self.assertEqual(self.env['pending_group_image'][('group', 'user')][0], 'message')
 
     def test_duplicate_image_does_not_send_duplicate_receipt_or_enter_chat(self):
@@ -441,6 +536,13 @@ class DeliveryAndCoverTests(unittest.TestCase):
     def test_reply_success_does_not_use_paid_push(self):
         self.api.reply_message.return_value = NS(sent_messages=[NS(id='sent')])
         self.assertTrue(self.notify())
+        self.api.push_message.assert_not_called()
+
+    def test_deferred_or_ignored_receipts_do_not_send_empty_messages(self):
+        for status in ('deferred', 'ignored', 'duplicate'):
+            self.assertFalse(self.env['notify_script_result'](
+                'group', 'reply', {'ok': True, 'status': status, 'message': ''}))
+        self.api.reply_message.assert_not_called()
         self.api.push_message.assert_not_called()
 
     def test_expired_reply_token_falls_back_to_push(self):
@@ -545,7 +647,8 @@ class OfflineStartupTests(unittest.TestCase):
                 self.assertEqual(response.data, b'OK')
                 self.assertEqual(response.headers['X-Group-Model'], model)
                 self.assertEqual(response.headers['X-Group-Provider'], provider)
-                self.assertEqual(response.headers['X-Bot-Release'], '2026-11-16-listing-assistant')
+                self.assertEqual(response.headers['X-Bot-Release'], '2026-11-16-scoped-listing')
+                self.assertEqual(response.headers['X-Script-Workflow'], 'assistant-v3-scoped')
                 if module.group_gemini_client is not None:
                     module.group_gemini_client.close()
                 if module.group_claude_client is not None:

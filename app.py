@@ -29,7 +29,7 @@ from googleapiclient.discovery import build
 # ── 設定（Railway 環境變數）────────────────────────────────
 GROUP_MODEL          = os.environ.get('GROUP_MODEL', 'claude-opus-5-5').strip() or 'claude-opus-5-5'
 GROUP_PROVIDER       = os.environ.get('GROUP_PROVIDER', '').strip().lower() or ('anthropic' if GROUP_MODEL.startswith('claude-') else 'gemini')
-APP_RELEASE          = '2026-11-16-listing-assistant'
+APP_RELEASE          = '2026-11-16-scoped-listing'
 GOOGLE_SHEET_ID      = os.environ.get('GOOGLE_SHEET_ID', '')
 _creds_raw           = os.environ.get('GOOGLE_CREDENTIALS_JSON', '')
 _creds_dict          = json.loads(_creds_raw) if _creds_raw else {}
@@ -74,6 +74,25 @@ def is_script_intent(message):
         '新增這本', '新增一本', '刪除劇本', '更換封面', '封面換',
         '改價格', '改時長', '改簡介', '修改價格',
     ))
+
+
+def is_bot_addressed(message, mention=None, quoted_id=None):
+    """Only a direct call, actual LINE mention, or reply wakes the bot.
+
+    Names inside quoted instructions and ordinary group conversation do not
+    count. This gate decides who is being addressed, not listing semantics.
+    """
+    if quoted_id and quoted_id in group_bot_msg_ids:
+        return True
+    if GROUP_BOT_USER_ID and any(
+            getattr(item, 'user_id', None) == GROUP_BOT_USER_ID
+            for item in (getattr(mention, 'mentionees', None) or [])):
+        return True
+    return bool(re.match(
+        r'^\s*(?:@\s*)?(?:陸傲天|陸總|傲天|小六|小6|小陸)'
+        r'(?!的|說|表示|講|剛才|剛剛|之前)'
+        r'(?=$|[\s，,:：。!！?？]|幫|請|麻煩|把|給|看|你|能|可|來|再|繼續|重試|取消|上架|新增|換|補|查|抽|停|等|先|不|別|確認|整理)',
+        message or ''))
 
 # ── Google Sheets ─────────────────────────────────────────
 SCOPES = [
@@ -278,7 +297,7 @@ app           = Flask(__name__)
 def health():
     return "OK", 200, {'X-Group-Model': GROUP_MODEL, 'X-Group-Provider': GROUP_PROVIDER,
                        'X-Bot-Release': APP_RELEASE,
-                       'X-Script-Workflow': 'assistant-v2',
+                       'X-Script-Workflow': 'assistant-v3-scoped',
                        'X-Script-Configured': 'yes' if os.environ.get('BGLARP_BOT_TOKEN') else 'no'}
 
 # ── 揪團 Bot ──────────────────────────────────────────────
@@ -382,30 +401,27 @@ listing_workflow = AssistantListingWorkflow(store=listing_store, backend=listing
 
 
 def handle_listing_text(key, message, message_id=None, event_timestamp=None, addressed=False):
-    """Route possible work to the assistant; the model interprets the request.
-
-    Active tasks receive every follow-up from the same sender. This broad hint
-    only avoids opening a task for ordinary chat; it never authorizes a write.
-    """
+    """A direct invocation or the current collection session owns the message."""
     try:
-        if message.strip() in ('上架說明', '上架教學'):
-            return {'ok': True, 'message': '告訴我要上架哪本，直接貼劇本文字和全部圖片，傳完再告訴我即可。\n不用先標記用途或張數；我會自行整理，有缺資料才問你。'}
-        eligible = addressed or bool(re.search(
-            r'上架|新增.{0,12}(?:劇本|這本|一本)|(?:補|換|更換|更新|替換).{0,40}(?:封面|角色圖)|'
-            r'(?:封面|角色圖).{0,20}(?:換|補|更新)|(?:放|加|刊登).{0,15}(?:官網|網站)|'
-            r'^(?:劇本|劇本名稱|名稱)\s*[:：]|官網|網站|陸傲天|陸總|傲天|小六|小6|小陸', message, re.S))
+        eligible = bool(addressed or is_bot_addressed(message))
         return listing_workflow.handle_text(
             key, message, message_id=message_id, event_timestamp=event_timestamp,
             eligible=eligible)
     except Exception as exc:
         print(f'[listing] text error={type(exc).__name__}')
-        return {'ok': False, 'message': '上架服務暫時無法完成這一步，已保存的資料與圖片仍保留。稍後跟我說「再試一次」即可。'}
+        if not (addressed or is_bot_addressed(message)) and not listing_workflow.has_active_capture(key):
+            return None
+        return {'ok': False, 'message': '這一步暫時無法完成，已保存的資料與圖片仍保留。請叫我接續或回覆這則訊息重試。'}
 
 
 def notify_script_result(gid, reply_token, outcomes):
     """Send the actual operation receipt; retry delivery never reruns writes."""
     if isinstance(outcomes, dict):
         outcomes = [outcomes]
+    outcomes = [item for item in outcomes
+                if item.get('status') not in {'deferred', 'ignored', 'duplicate'}]
+    if not outcomes:
+        return False
     text = '\n\n'.join(result_text(r) for r in outcomes)
     messages = [TextMessage(text=text[i:i+4500]) for i in range(0, len(text), 4500)][:5]
     return bool(deliver_script_messages(gid, reply_token, messages))
@@ -2293,9 +2309,11 @@ if group_handler:
                                                       image_set=getattr(event.message, 'image_set', None))
         except Exception as exc:
             print(f'[listing] image error={type(exc).__name__}')
-            notify_script_result(gid, event.reply_token, {'ok': False, 'message': '圖片這次還沒確認收妥。請先傳「上架狀態」查看；已保存資料仍保留。'})
-            return
-        if outcome and outcome.get('status') == 'duplicate':
+            if listing_workflow.has_active_capture(key):
+                notify_script_result(gid, event.reply_token, {'ok': False, 'message': '這次收件的圖片尚未確認存好，先前資料仍保留。請叫我接續確認。'})
+                return
+            outcome = None
+        if outcome and outcome.get('status') in {'duplicate', 'deferred'}:
             return
         if outcome and outcome.get('status') != 'ignored':
             notify_script_result(gid, event.reply_token, outcome)
@@ -2303,22 +2321,7 @@ if group_handler:
         # Images outside a listing task remain available to ordinary chat.
         pending_group_image[key] = (event.message.id, time.time())
 
-        # ── 2% 機率看圖主動插嘴 ──
-        if random.random() < 0.02:
-            try:
-                with ApiClient(group_configuration) as api_client:
-                    img_bytes = MessagingApiBlob(api_client).get_message_content(event.message.id)
-                sender_name = get_member_name(gid, uid)
-                log = group_chat_log.get(gid, [])
-                reply = group_chat_ai(
-                    "（對方傳了一張圖，沒說話）", history=log, group_id=gid,
-                    speaker_uid=uid, speaker_name=sender_name,
-                    image_bytes=img_bytes,
-                )
-                if reply:
-                    group_reply(event.reply_token, reply)
-            except Exception as e:
-                print(f"[group] 圖片插嘴失敗：{e}")
+        # Ordinary images stay silent until their sender explicitly asks about them.
 
     @group_handler.add(PostbackEvent)
     def group_handle_postback(event):
@@ -2441,18 +2444,16 @@ if group_handler:
         msg = event.message.text.strip()
         rtoken = event.reply_token
 
-        listing_mention = getattr(event.message, 'mention', None)
-        listing_addressed = bool(
-            getattr(event.message, 'quoted_message_id', None) in group_bot_msg_ids
-            or (GROUP_BOT_USER_ID and any(
-                getattr(item, 'user_id', None) == GROUP_BOT_USER_ID
-                for item in (getattr(listing_mention, 'mentionees', None) or []))))
+        listing_addressed = is_bot_addressed(
+            msg, getattr(event.message, 'mention', None),
+            getattr(event.message, 'quoted_message_id', None))
         listing_result = handle_listing_text((gid, uid), msg,
                                             message_id=getattr(event.message, 'id', None),
                                             event_timestamp=getattr(event, 'timestamp', None),
                                             addressed=listing_addressed)
         if listing_result is not None:
-            notify_script_result(gid, rtoken, listing_result)
+            if listing_result.get('status') != 'deferred':
+                notify_script_result(gid, rtoken, listing_result)
             return
 
         # ── 記錄訊息到短期上下文 + 落地到 buffer ──
@@ -2466,25 +2467,8 @@ if group_handler:
         if not script_intent:
             append_chat_buffer(gid, uid, sender_name, msg)
 
-        # ── 偵測是否被 @ ──
-        bot_mentioned = False
-        mention = getattr(event.message, 'mention', None)
-        if mention and GROUP_BOT_USER_ID:
-            for m in getattr(mention, 'mentionees', []):
-                if getattr(m, 'user_id', None) == GROUP_BOT_USER_ID:
-                    bot_mentioned = True
-                    break
-
-        # ── 偵測是否 reply Bot 的訊息 ──
-        quoted_id = getattr(event.message, 'quoted_message_id', None)
-        print(f"[group] quoted_id={quoted_id} | in_bot_ids={quoted_id in group_bot_msg_ids if quoted_id else 'N/A'} | bot_ids_count={len(group_bot_msg_ids)}")
-        if quoted_id and quoted_id in group_bot_msg_ids:
-            bot_mentioned = True
-
-        # ── 關鍵字觸發：workaround LINE @ 選單限制 ──
-        BOT_TRIGGER_WORDS = ['陸傲天', '傲天', '陸總', '小六', '小6', '小陸']
-        if not bot_mentioned and any(w in msg for w in BOT_TRIGGER_WORDS):
-            bot_mentioned = True
+        # Use the same direct-address rule for ordinary chat and task dispatch.
+        bot_mentioned = listing_addressed
 
         # ── 抽卡指令（在 AI 之前攔截，節省 token）──
         # 嚴格觸發：訊息結尾是抽卡關鍵字 且 訊息要短（≤ 12 字），避免聊抽卡誤觸
@@ -2827,10 +2811,7 @@ if group_handler:
                 save_group_event(signup_info['row_num'], ev)
             return
 
-        # ── 2% 機率主動插嘴 ──
-        if random.random() < 0.02:
-            reply = group_chat_ai(msg, history=log, group_id=gid, speaker_uid=uid, speaker_name=sender_name)
-            group_reply(rtoken, reply)
+        # No unsolicited replies to ordinary group conversation.
 
 @app.route("/group/callback", methods=['POST'])
 def group_callback():

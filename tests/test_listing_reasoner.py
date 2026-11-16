@@ -88,6 +88,8 @@ class ListingReasonerTests(unittest.TestCase):
     def test_schema_accepts_separate_sources_and_unknown_images(self):
         schema = decision_tool().function_declarations[0].parameters_json_schema
         props = schema['properties']
+        self.assertIn('captureAction', schema['required'])
+        self.assertEqual(props['captureAction']['enum'], ['open', 'none'])
         self.assertIn('completionEvidenceMessageId', props['authorization']['properties'])
         self.assertIn('unknown', props['assignments']['items']['properties']['purpose']['enum'])
 
