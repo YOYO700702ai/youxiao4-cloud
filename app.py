@@ -29,7 +29,7 @@ from googleapiclient.discovery import build
 # ── 設定（Railway 環境變數）────────────────────────────────
 GROUP_MODEL          = os.environ.get('GROUP_MODEL', 'claude-opus-5-5').strip() or 'claude-opus-5-5'
 GROUP_PROVIDER       = os.environ.get('GROUP_PROVIDER', '').strip().lower() or ('anthropic' if GROUP_MODEL.startswith('claude-') else 'gemini')
-APP_RELEASE          = '2026-11-16-scoped-listing'
+APP_RELEASE          = '2026-11-16-listing-consent-fix'
 GOOGLE_SHEET_ID      = os.environ.get('GOOGLE_SHEET_ID', '')
 _creds_raw           = os.environ.get('GOOGLE_CREDENTIALS_JSON', '')
 _creds_dict          = json.loads(_creds_raw) if _creds_raw else {}

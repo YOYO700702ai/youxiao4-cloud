@@ -674,6 +674,58 @@ class AssistantListingTests(unittest.TestCase):
         self.backend.publish.assert_not_called()
         self.assertFalse(self.workflow.has_active_capture(self.KEY))
 
+    def test_real_production_opening_response_accepts_uncited_false_complete(self):
+        # Exact structured decision observed from the production provider for
+        # "陸總，這本幫我上架"; a false default does not grant any permission.
+        self.analyze.return_value = {
+            'action': 'collect', 'captureAction': 'open', 'kind': 'upload',
+            'authorization': {'publish': True, 'complete': False,
+                              'publishEvidenceMessageId': 'diagnostic-start'},
+            'reply': '好的，請把這本的文字資料和圖片直接傳給我。',
+        }
+        result = self.workflow.handle_text(self.KEY, '陸總，這本幫我上架', 'diagnostic-start',
+                                           self.now * 1000, eligible=True)
+        self.assertEqual(result['status'], 'collecting')
+        self.assertTrue(self.workflow.has_active_capture(self.KEY))
+        consent = self.store.get(self.KEY)['publishConsent']
+        self.assertTrue(consent['publish'])
+        self.assertFalse(consent['complete'])
+        self.assertEqual(consent['publishEvidenceMessageId'], 'diagnostic-start')
+        self.assertNotIn('completionEvidenceMessageId', consent)
+        self.backend.publish.assert_not_called()
+
+    def test_uncited_false_revokes_permission_without_fabricating_user_evidence(self):
+        self.begin()
+        self.analyze.return_value = self.plan(authorization={'publish': False})
+        self.workflow.handle_text(self.KEY, '先整理給我看就好', 'reconsider', self.now * 1000)
+        consent = self.store.get(self.KEY)['publishConsent']
+        self.assertFalse(consent['publish'])
+        self.assertNotIn('publishEvidenceMessageId', consent)
+        self.backend.publish.assert_not_called()
+
+    def test_true_permission_still_requires_real_user_text_evidence(self):
+        for source in (None, 'image-id', 'nonexistent'):
+            with self.subTest(source=source):
+                self.setUp()
+                evidence = {} if source is None else {'publishEvidenceMessageId': source}
+                self.analyze.return_value = self.plan(captureAction='open', authorization={
+                    'publish': True, 'complete': False, **evidence})
+                with self.assertLogs('listing_assistant', level='WARNING') as logged:
+                    result = self.workflow.handle_text(self.KEY, '陸總，開始上架', 'real-text', eligible=True)
+                self.assertEqual(result['status'], 'analysis_failed')
+                self.assertIn('reason=invalid_consent_evidence', str(logged.output))
+                self.assertFalse(self.workflow.has_active_capture(self.KEY))
+                self.backend.publish.assert_not_called()
+
+    def test_valid_evidence_for_false_is_preserved(self):
+        self.begin()
+        self.analyze.return_value = self.plan(authorization={
+            'publish': False, 'publishEvidenceMessageId': 'withdraw'})
+        self.workflow.handle_text(self.KEY, '先別上架', 'withdraw', self.now * 1000)
+        consent = self.store.get(self.KEY)['publishConsent']
+        self.assertFalse(consent['publish'])
+        self.assertEqual(consent['publishEvidenceMessageId'], 'withdraw')
+
 
 if __name__ == '__main__':
     unittest.main()

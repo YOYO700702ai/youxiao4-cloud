@@ -239,8 +239,33 @@ class AssistantListingWorkflow(ListingWorkflow):
     def _log_analysis_error(phase, error):
         error_type = getattr(error, 'error_type', '')
         safe_type = error_type if isinstance(error_type, str) and re.fullmatch(r'[A-Za-z_]{1,64}', error_type) else ''
-        logging.getLogger(__name__).warning('listing_analysis_failed phase=%s class=%s type=%s',
-                                           phase, type(error).__name__[:80], safe_type)
+        # Only these application-owned messages may select a diagnostic code.
+        # Never print arbitrary exception text, model output, URLs or secrets.
+        reasons = {
+            'invalid action': 'invalid_action',
+            'invalid kind': 'invalid_kind',
+            'invalid capture action': 'invalid_capture_action',
+            'invalid questions': 'invalid_questions',
+            'invalid reply': 'invalid_reply',
+            'invalid consent': 'invalid_consent',
+            'invalid consent flag': 'invalid_consent_flag',
+            'consent must cite a real user text message': 'invalid_consent_evidence',
+            'invalid assignments': 'invalid_assignments',
+            'invalid assignment': 'invalid_assignment',
+            'invalid image index or purpose': 'invalid_image_assignment',
+            'invalid role': 'invalid_role',
+            'image correction must cite real user text': 'invalid_correction_evidence',
+            'an image was omitted': 'omitted_image',
+            'ambiguous listing decisions': 'ambiguous_decision',
+            'invalid listing decision': 'invalid_decision',
+            'image storage incomplete': 'image_storage_incomplete',
+        }
+        try:
+            reason = reasons.get(str(error), 'unknown') if type(error) is ValueError else 'unknown'
+        except Exception:
+            reason = 'unknown'
+        logging.getLogger(__name__).warning('listing_analysis_failed phase=%s class=%s type=%s reason=%s',
+                                           phase, type(error).__name__[:80], safe_type, reason)
 
     def _new_job(self, data=None, kind='upload'):
         data = deepcopy(data or {})
@@ -576,10 +601,17 @@ class AssistantListingWorkflow(ListingWorkflow):
                 raise ValueError('invalid consent flag')
             if flag in given:
                 evidence = given.get(evidence_field) or given.get('evidenceMessageId')
-                if evidence not in message_ids:
+                if given[flag] and evidence not in message_ids:
                     raise ValueError('consent must cite a real user text message')
                 consent[flag] = given[flag]
-                consent[evidence_field] = evidence
+                if evidence in message_ids:
+                    consent[evidence_field] = evidence
+                else:
+                    # False cannot authorize publication or declare completion.
+                    # Provider output often includes an uncited false default;
+                    # accept the conservative reduction without inventing a
+                    # user citation or retaining evidence for an earlier true.
+                    consent.pop(evidence_field, None)
         assignments = result.get('assignments') or []
         if phase == 'organize':
             if not isinstance(assignments, list):
