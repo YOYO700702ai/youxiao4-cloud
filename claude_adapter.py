@@ -8,6 +8,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 import json
 import threading
+from urllib.parse import urlsplit
 
 import requests
 from google.genai import types
@@ -131,6 +132,17 @@ def _parts(parts):
             blocks.append({'type': 'text', 'text': _value(part, 'text')})
         elif _value(part, 'inline_data') is not None:
             blocks.append(_image(_value(part, 'inline_data')))
+        elif _value(part, 'file_data') is not None:
+            # Saved listing assets can be supplied as HTTPS images without
+            # repeating megabytes of base64 for an entire album.
+            file_data = _value(part, 'file_data')
+            uri = _value(file_data, 'file_uri')
+            parsed = urlsplit(uri) if isinstance(uri, str) else None
+            if (not parsed or parsed.scheme != 'https' or not parsed.hostname
+                    or parsed.username or parsed.password
+                    or _value(file_data, 'mime_type') not in ('image/jpeg', 'image/png', 'image/webp', 'image/gif')):
+                raise ClaudeAPIError('invalid_image_url')
+            blocks.append({'type': 'image', 'source': {'type': 'url', 'url': uri}})
         elif _value(part, 'function_response') is not None:
             response = _value(part, 'function_response')
             identifier = _value(response, 'id')
@@ -337,11 +349,14 @@ class ClaudeClient:
         if tools:
             payload['tools'] = tools
             payload['tool_choice'] = {'type': 'auto'}
+        configured_timeout = _value(_value(config, 'http_options', {}), 'timeout', 20000)
+        read_timeout = (min(55, max(1, configured_timeout / 1000))
+                        if type(configured_timeout) in (int, float) else 20)
         try:
             http_response = self._session.post(
                 MESSAGES_URL, headers={'x-api-key': self._api_key,
                     'anthropic-version': '2023-06-01', 'content-type': 'application/json'},
-                json=payload, timeout=(4, 20), allow_redirects=False)
+                json=payload, timeout=(4, read_timeout), allow_redirects=False)
         except requests.Timeout:
             raise ClaudeAPIError('timeout') from None
         except Exception:

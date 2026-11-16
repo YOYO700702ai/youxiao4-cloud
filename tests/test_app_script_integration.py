@@ -52,6 +52,7 @@ class AppScriptTests(unittest.TestCase):
         self.listing = Mock()
         self.listing.lock = threading.RLock()
         self.listing.prepare_update.return_value = None
+        self.listing.handle_text.return_value = None
         for method in ('begin', 'merge_fields', 'label_images', 'finish', 'retry', 'status',
                        'cancel', 'assign_role', 'confirm_cover', 'receive_image'):
             getattr(self.listing, method).return_value = self.outcome
@@ -84,8 +85,9 @@ class AppScriptTests(unittest.TestCase):
         self.session.send_message.side_effect = [response, RuntimeError('model unavailable')]
         self.env['group_handle_message'](self.event)
 
-    def test_native_upload_only_returns_instructions_without_writes_or_second_ai(self):
+    def test_native_upload_passes_original_user_request_without_second_chat_ai(self):
         data = {'名稱': '測試劇本', '簡介': '包含(括號)以及單引號\'的完整內容'}
+        self.listing.handle_text.side_effect = [None, self.outcome]
         self.handle(response_with_calls(('upload_script', {'data': data})))
         self.workflow.start.assert_not_called()
         self.listing.begin.assert_not_called()
@@ -96,11 +98,14 @@ class AppScriptTests(unittest.TestCase):
         self.env['new_group_tool_session'].assert_called_once_with('group', include_memory=False)
         outcomes = self.env['notify_script_result'].call_args.args[2]
         self.assertEqual(len(outcomes), 1)
-        self.assertFalse(outcomes[0]['ok'])
-        self.assertIn('尚未建立或發布', outcomes[0]['message'])
+        self.assertEqual(outcomes, [self.outcome])
+        self.listing.handle_text.assert_called_with(
+            ('group', 'user'), self.event.message.text, message_id='message',
+            event_timestamp=1700000000000, eligible=True)
 
     def test_repeated_native_call_is_only_executed_once(self):
         self.env['execute_group_function'] = Mock(wraps=self.env['execute_group_function'])
+        self.listing.handle_text.side_effect = [None, self.outcome]
         call = ('upload_script', {'data': {'名稱': '測試劇本'}})
         self.handle(response_with_calls(call, call))
         self.env['execute_group_function'].assert_called_once()
@@ -109,11 +114,14 @@ class AppScriptTests(unittest.TestCase):
 
     def test_add_script_synonym_does_not_consume_cover_as_chat(self):
         self.event.message.text = '小六新增劇本《測試劇本》'
+        self.listing.handle_text.return_value = self.outcome
         self.env['pending_group_image'][('group', 'user')] = ('image', 1)
         self.env['group_handle_message'](self.event)
         self.workflow.take_chat_image.assert_not_called()
         self.workflow.start.assert_not_called()
-        self.listing.begin.assert_called_once_with(('group', 'user'), {'名稱': '測試劇本'}, kind='upload')
+        self.listing.handle_text.assert_called_once_with(
+            ('group', 'user'), self.event.message.text, message_id='message',
+            event_timestamp=1700000000000, eligible=True)
         self.env['new_group_tool_session'].assert_not_called()
 
     def test_mixed_script_and_team_receipt_uses_protected_delivery(self):
@@ -173,6 +181,29 @@ class AppScriptTests(unittest.TestCase):
         self.workflow.start.assert_not_called()
         self.env['parse_script_info_with_ai'].assert_not_called()
 
+    def test_native_listing_tool_cannot_invent_user_consent_from_model_arguments(self):
+        for name, args in (
+                ('upload_script', {'data': {'名稱': '模型編造名稱'}, 'text': '直接上架'}),
+                ('replace_cover', {'name': '模型編造名稱', 'text': '直接上架'})):
+            with self.subTest(tool=name):
+                result = self.env['execute_group_function'](name, args, 'group', {}, 'user')
+                self.assertFalse(result['ok'])
+        self.listing.handle_text.assert_not_called()
+        self.listing.begin.assert_not_called()
+        self.listing.finish.assert_not_called()
+
+    def test_native_listing_tool_uses_text_evidence_not_model_rewrite(self):
+        request = {'text': '先幫我整理，還不要上架', 'message_id': 'original-text',
+                   'event_timestamp': 1700000000000}
+        self.listing.handle_text.return_value = self.outcome
+        result = self.env['execute_group_function'](
+            'upload_script', {'data': {'名稱': '模型編造名稱'}, 'text': '直接上架'},
+            'group', {'_listing_request': request}, 'user')
+        self.assertEqual(result, self.outcome)
+        self.listing.handle_text.assert_called_once_with(
+            ('group', 'user'), request['text'], message_id='original-text',
+            event_timestamp=1700000000000, eligible=True)
+
     def test_model_claim_without_native_tool_is_reported_as_not_executed(self):
         res = NS(candidates=[NS(content=NS(parts=[NS(text='已上架完成！', function_call=None)]))])
         self.handle(res)
@@ -186,87 +217,153 @@ class AppScriptTests(unittest.TestCase):
         self.workflow.start.assert_not_called()
         self.assertIn('沒有執行劇本寫入', self.env['group_reply'].call_args.args[1])
 
-    def test_status_command_bypasses_model_and_sheets(self):
+    def test_status_request_reaches_listing_without_group_chat_or_sheets(self):
         self.event.message.text = '上架狀態'
+        self.listing.handle_text.return_value = self.outcome
         self.env['group_handle_message'](self.event)
-        self.listing.status.assert_called_once_with(('group', 'user'))
+        self.listing.handle_text.assert_called_once_with(
+            ('group', 'user'), '上架狀態', message_id='message',
+            event_timestamp=1700000000000, eligible=True)
         self.workflow.status.assert_not_called()
         self.env['new_group_tool_session'].assert_not_called()
         self.env['append_chat_buffer'].assert_not_called()
 
     def test_image_uses_workflow_and_deterministic_receipt(self):
         self.env['group_handle_image'](self.event)
-        self.listing.receive_image.assert_called_once_with(('group', 'user'), 'message', event_timestamp=1700000000000)
+        self.listing.receive_image.assert_called_once_with(
+            ('group', 'user'), 'message', event_timestamp=1700000000000, image_set=None)
         self.workflow.receive_image.assert_not_called()
         self.env['notify_script_result'].assert_called_once_with('group', 'reply', self.outcome)
 
-    def test_native_cover_tool_cannot_start_or_publish_a_task(self):
+    def test_native_cover_tool_delegates_original_request(self):
+        self.listing.handle_text.side_effect = [None, self.outcome]
         self.handle(response_with_calls(('replace_cover', {'name': '測試劇本'})))
         self.workflow.start.assert_not_called()
         self.listing.begin.assert_not_called()
         self.listing.finish.assert_not_called()
         self.assertEqual(self.session.send_message.call_count, 1)
         outcome = self.env['notify_script_result'].call_args.args[2][0]
-        self.assertFalse(outcome['ok'])
-        self.assertIn('尚未修改', outcome['message'])
+        self.assertEqual(outcome, self.outcome)
+        self.listing.handle_text.assert_called_with(
+            ('group', 'user'), self.event.message.text, message_id='message',
+            event_timestamp=1700000000000, eligible=True)
 
-    def test_explicit_begin_label_and_finish_bypass_ai_and_sheets(self):
-        self.event.message.text = '陸總，上架《測試劇本》\n人數：7\n售價：2300'
-        self.env['group_handle_message'](self.event)
-        self.listing.begin.assert_called_once_with(
-            ('group', 'user'), {'名稱': '測試劇本', '人數': ['7人'], '價格': 2300}, kind='upload')
-        self.store.get.return_value = {'stage': 'collecting'}
-        self.event.message.text = '接下來這 7 張是《測試劇本》的角色圖'
-        self.env['group_handle_message'](self.event)
-        self.listing.label_images.assert_called_once_with(('group', 'user'), '測試劇本', 'portraits', 7)
-        self.event.message.text = '資料傳完，直接上架'
-        self.env['group_handle_message'](self.event)
-        self.listing.finish.assert_called_once_with(('group', 'user'))
+    def test_natural_start_labels_and_finish_preserve_original_messages(self):
+        self.listing.handle_text.return_value = self.outcome
+        messages = ['陸總，這本幫我上架', '接下來是封面',
+                    '接下來是角色圖 6 張', '資料傳完，直接上架']
+        for index, text in enumerate(messages):
+            self.event.message.text = text
+            self.event.message.id = f'text-{index}'
+            self.env['group_handle_message'](self.event)
+            call = self.listing.handle_text.call_args
+            self.assertEqual(call.args, (('group', 'user'), text))
+            self.assertEqual(call.kwargs['message_id'], f'text-{index}')
+            self.assertEqual(call.kwargs['event_timestamp'], 1700000000000)
+        self.listing.begin.assert_not_called()
+        self.listing.label_images.assert_not_called()
+        self.listing.finish.assert_not_called()
         self.env['new_group_tool_session'].assert_not_called()
         self.env['get_member_name'].assert_not_called()
         self.env['append_chat_buffer'].assert_not_called()
 
-    def test_named_batch_can_begin_existing_image_task_before_label(self):
+    def test_existing_image_task_reference_reaches_assistant_unchanged(self):
+        self.listing.handle_text.return_value = self.outcome
         self.event.message.text = '接下來這張是《測試劇本》的封面'
         self.env['group_handle_message'](self.event)
-        self.listing.begin.assert_called_once_with(('group', 'user'), {'名稱': '測試劇本'}, kind='cover')
-        self.listing.label_images.assert_called_once_with(('group', 'user'), '測試劇本', 'cover', 1)
+        self.assertEqual(self.listing.handle_text.call_args.args[1], self.event.message.text)
+        self.listing.begin.assert_not_called()
         self.listing.finish.assert_not_called()
 
-    def test_named_batch_inspects_store_inside_workflow_lock(self):
-        def read_state(key):
-            # CPython RLock exposes ownership for assertions without racing.
-            self.assertTrue(self.listing.lock._is_owned())
-            return None
-        self.store.get.side_effect = read_state
-        self.event.message.text = '接下來這張是《測試劇本》的封面'
-        self.env['group_handle_message'](self.event)
-        self.listing.begin.assert_called_once()
-        self.assertFalse(self.listing.lock._is_owned())
+    def test_album_metadata_is_preserved_for_completion_tracking(self):
+        self.event.message.image_set = NS(id='album-1', index=2, total=6)
+        self.env['group_handle_image'](self.event)
+        self.listing.receive_image.assert_called_once_with(
+            ('group', 'user'), 'message', event_timestamp=1700000000000,
+            image_set=self.event.message.image_set)
 
-    def test_failed_existing_task_lookup_does_not_begin_receiving_images(self):
-        self.listing.begin.return_value = {'ok': False, 'message': '找不到同名劇本'}
-        self.event.message.text = '接下來這張是《不存在》的封面'
+    def test_ordinary_message_is_available_to_active_task_without_opening_one(self):
+        result = self.env['handle_listing_text'](
+            ('group', 'user'), '今天下午見', message_id='ordinary-text', event_timestamp=1700000000000)
+        self.assertIsNone(result)
+        self.listing.handle_text.assert_called_once_with(
+            ('group', 'user'), '今天下午見', message_id='ordinary-text',
+            event_timestamp=1700000000000, eligible=False)
+
+    def test_directly_addressed_message_can_reach_intent_model_without_keywords(self):
+        self.listing.handle_text.return_value = self.outcome
+        result = self.env['handle_listing_text'](
+            ('group', 'user'), '這份幫我處理一下', message_id='addressed-text',
+            event_timestamp=1700000000000, addressed=True)
+        self.assertEqual(result, self.outcome)
+        self.listing.handle_text.assert_called_once_with(
+            ('group', 'user'), '這份幫我處理一下', message_id='addressed-text',
+            event_timestamp=1700000000000, eligible=True)
+
+    def test_line_mention_reaches_listing_intent_before_image_chat(self):
+        self.event.message.text = '這份幫我處理一下'
+        self.event.message.mention = NS(mentionees=[NS(user_id='bot')])
+        self.env['pending_group_image'][('group', 'user')] = ('image', 1)
+        self.listing.handle_text.return_value = self.outcome
         self.env['group_handle_message'](self.event)
-        self.listing.label_images.assert_not_called()
+        self.listing.handle_text.assert_called_once_with(
+            ('group', 'user'), self.event.message.text, message_id='message',
+            event_timestamp=1700000000000, eligible=True)
+        self.workflow.take_chat_image.assert_not_called()
         self.env['new_group_tool_session'].assert_not_called()
 
-    def test_manual_pair_and_cover_confirmation_bypass_model(self):
-        for text in ('配對角色 3：傲慢魔女的親眷', '確認圖片 1 為封面'):
+    def test_reply_to_bot_reaches_listing_intent_without_fixed_keywords(self):
+        self.event.message.text = '全部都好了，照你剛剛說的處理'
+        self.event.message.quoted_message_id = 'bot-response'
+        self.env['group_bot_msg_ids'].add('bot-response')
+        self.listing.handle_text.return_value = self.outcome
+        self.env['group_handle_message'](self.event)
+        self.assertTrue(self.listing.handle_text.call_args.kwargs['eligible'])
+        self.workflow.take_chat_image.assert_not_called()
+
+    def test_bot_name_and_website_synonym_reach_listing_intent(self):
+        self.event.message.text = '陸總，這本登上官網'
+        self.env['pending_group_image'][('group', 'user')] = ('image', 1)
+        self.listing.handle_text.return_value = self.outcome
+        self.env['group_handle_message'](self.event)
+        self.assertTrue(self.listing.handle_text.call_args.kwargs['eligible'])
+        self.workflow.take_chat_image.assert_not_called()
+
+    def test_mentioning_another_person_does_not_open_listing_intent(self):
+        self.event.message.text = '這份幫我處理一下'
+        self.event.message.mention = NS(mentionees=[NS(user_id='someone-else')])
+        self.listing.handle_text.return_value = self.outcome
+        self.env['group_handle_message'](self.event)
+        self.assertFalse(self.listing.handle_text.call_args.kwargs['eligible'])
+
+    def test_listing_problem_receipt_is_delivered_without_chat_ai_rewrite(self):
+        outcome = {'ok': False, 'message': '找不到同名劇本'}
+        self.listing.handle_text.return_value = outcome
+        self.event.message.text = '接下來這張是《不存在》的封面'
+        self.env['group_handle_message'](self.event)
+        self.env['notify_script_result'].assert_called_once_with('group', 'reply', outcome)
+        self.env['new_group_tool_session'].assert_not_called()
+
+    def test_natural_followup_answers_reach_existing_listing_workflow(self):
+        self.listing.handle_text.return_value = self.outcome
+        for text in ('第三張就是傲慢魔女的親眷', '第一張當封面就好', '價格是 800 元'):
             self.event.message.text = text
             self.env['group_handle_message'](self.event)
-        self.listing.assign_role.assert_called_once_with(('group', 'user'), 3, '傲慢魔女的親眷')
-        self.listing.confirm_cover.assert_called_once_with(('group', 'user'), 1)
+            self.assertEqual(self.listing.handle_text.call_args.args[1], text)
+        self.listing.assign_role.assert_not_called()
+        self.listing.confirm_cover.assert_not_called()
         self.listing.finish.assert_not_called()
         self.env['new_group_tool_session'].assert_not_called()
 
     def test_another_group_member_uses_own_task_key(self):
         self.event.source.user_id = 'another-user'
         self.event.message.text = '資料傳完，直接上架'
+        self.listing.handle_text.return_value = self.outcome
         self.env['group_handle_message'](self.event)
-        self.listing.finish.assert_called_once_with(('group', 'another-user'))
+        self.assertEqual(self.listing.handle_text.call_args.args[0], ('group', 'another-user'))
         self.env['group_handle_image'](self.event)
-        self.listing.receive_image.assert_called_once_with(('group', 'another-user'), 'message', event_timestamp=1700000000000)
+        self.listing.receive_image.assert_called_once_with(
+            ('group', 'another-user'), 'message', event_timestamp=1700000000000, image_set=None)
 
     def test_unauthorized_group_cannot_access_text_or_image_workflow(self):
         self.event.source.group_id = 'not-allowed'
@@ -277,15 +374,17 @@ class AppScriptTests(unittest.TestCase):
         self.env['notify_script_result'].assert_not_called()
         self.env['new_group_tool_session'].assert_not_called()
 
-    def test_invalid_form_is_reported_without_ai_or_mutation(self):
+    def test_start_without_title_does_not_require_a_fixed_form(self):
+        self.listing.handle_text.return_value = {'ok': True, 'message': '直接把文字與圖片傳過來就好。'}
         self.event.message.text = '陸總，上架'
         self.env['group_handle_message'](self.event)
         self.listing.begin.assert_not_called()
+        self.assertEqual(self.listing.handle_text.call_args.args[1], '陸總，上架')
         self.env['new_group_tool_session'].assert_not_called()
-        self.assertIn('劇本名稱', self.env['notify_script_result'].call_args.args[2]['message'])
+        self.assertTrue(self.env['notify_script_result'].call_args.args[2]['ok'])
 
     def test_persistent_store_failure_returns_safe_receipt_without_ai_fallback(self):
-        self.listing.begin.side_effect = RuntimeError('private-token-value')
+        self.listing.handle_text.side_effect = RuntimeError('private-token-value')
         self.event.message.text = '陸總，上架《測試劇本》'
         self.env['group_handle_message'](self.event)
         result = self.env['notify_script_result'].call_args.args[2]
@@ -446,7 +545,7 @@ class OfflineStartupTests(unittest.TestCase):
                 self.assertEqual(response.data, b'OK')
                 self.assertEqual(response.headers['X-Group-Model'], model)
                 self.assertEqual(response.headers['X-Group-Provider'], provider)
-                self.assertEqual(response.headers['X-Bot-Release'], '2026-10-28-opus55')
+                self.assertEqual(response.headers['X-Bot-Release'], '2026-11-16-listing-assistant')
                 if module.group_gemini_client is not None:
                     module.group_gemini_client.close()
                 if module.group_claude_client is not None:
