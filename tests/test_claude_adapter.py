@@ -289,12 +289,17 @@ class ClaudeAdapterTests(unittest.TestCase):
             and any(isinstance(target, ast.Name) and target.id == 'GROUP_FUNC_DECLS' for target in node.targets))
         scope = {'types': types}
         exec(compile(ast.Module(body=[declaration], type_ignores=[]), '<group-schema>', 'exec'), scope)
-        functions = scope['GROUP_FUNC_DECLS']
+        from direct_catalog_tools import catalog_tool_declarations
+        functions = scope['GROUP_FUNC_DECLS'] + catalog_tool_declarations()
         config = types.GenerateContentConfig(tools=[types.Tool(function_declarations=functions)])
         self.client.models.generate_content(contents='查詢', config=config)
         self.assertEqual(len(self.payload()['tools']), len(functions))
         self.assertTrue(all(item['input_schema']['type'] == 'object' for item in self.payload()['tools']))
-        self.assertIn('upload_script', {item['name'] for item in self.payload()['tools']})
+        names = {item['name'] for item in self.payload()['tools']}
+        self.assertIn('catalog_publish', names)
+        self.assertFalse(names & {'upload_script', 'update_script', 'remove_script', 'replace_cover'})
+        publish = next(item for item in self.payload()['tools'] if item['name'] == 'catalog_publish')
+        self.assertIn('sourceMessageIds', publish['input_schema']['properties'])
 
     def test_same_chat_concurrent_requests_serialize_and_keep_history(self):
         entered, release, second_started = threading.Event(), threading.Event(), threading.Event()

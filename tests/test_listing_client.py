@@ -2,6 +2,8 @@ import copy
 import unittest
 from unittest.mock import Mock, patch
 
+import requests
+
 from listing_client import BotCatalogClient, ListingServiceError, RemoteJobStore, build_content
 
 
@@ -265,6 +267,205 @@ class ListingClientTests(unittest.TestCase):
         client.read_media = Mock(return_value=data)
         self.assertEqual(client.upload_media(data, 'a.jpg', 'job:media:1')['url'], url)
         client.session.put.assert_not_called()
+
+
+class MediaTransportTests(unittest.TestCase):
+    DATA = b'\xff\xd8\xffsame-immutable-image'
+    URL = 'https://rnipzotldpbdlzxjnoip.supabase.co/storage/v1/object/public/script-covers/bot/job/character/a.jpg'
+    SIGNED = 'https://rnipzotldpbdlzxjnoip.supabase.co/storage/v1/object/upload/sign/script-covers/bot/job/character/a.jpg?token=private-signed-value'
+
+    def setUp(self):
+        self.http = Mock()
+        self.client = BotCatalogClient(None, 'private-api-value', session=self.http)
+        self.grant = {'upload': {'publicUrl': self.URL, 'path': 'bot/job/character/a.jpg',
+                                 'signedUrl': self.SIGNED, 'alreadyUploaded': False}}
+        self.http.request.return_value = self.response(200, payload=self.grant)
+        self.http.put.return_value = self.response(200)
+        self.http.get.return_value = self.response(200, data=self.DATA)
+        pause = patch('listing_client.time.sleep')
+        self.sleep = pause.start()
+        self.addCleanup(pause.stop)
+
+    @staticmethod
+    def response(status, *, payload=None, data=b''):
+        result = Mock(status_code=status)
+        result.json.return_value = payload
+        result.iter_content.return_value = [data]
+        return result
+
+    def upload(self):
+        return self.client.upload_media(self.DATA, 'unused.jpg', 'job:media:line-1', kind='character')
+
+    def test_success_uses_bounded_timeouts_and_closes_responses(self):
+        self.assertEqual(self.upload()['url'], self.URL)
+        self.assertEqual(self.http.request.call_args.kwargs['timeout'], (2, 6))
+        self.assertEqual(self.http.put.call_args.kwargs['timeout'], (2, 8))
+        self.assertEqual(self.http.get.call_args.kwargs['timeout'], (2, 6))
+        for operation in (self.http.request, self.http.put, self.http.get):
+            operation.assert_called_once()
+            operation.return_value.close.assert_called_once()
+
+    def test_transient_grant_retries_identical_operation_only_once(self):
+        for failure in (self.response(503, payload={'error': 'private-response'}),
+                        requests.Timeout('private-signed-value')):
+            with self.subTest(failure=type(failure).__name__):
+                self.http.reset_mock()
+                self.http.request.side_effect = [failure, self.response(200, payload=self.grant)]
+                self.assertEqual(self.upload()['url'], self.URL)
+                self.assertEqual(self.http.request.call_count, 2)
+                first, second = self.http.request.call_args_list
+                self.assertEqual(first.kwargs['headers'], second.kwargs['headers'])
+                self.assertEqual(first.kwargs['json'], second.kwargs['json'])
+
+    def test_grant_four_xx_never_retries_or_leaks_response(self):
+        for status in (400, 401, 403, 404, 409, 429):
+            with self.subTest(status=status):
+                self.http.reset_mock()
+                self.http.request.return_value = self.response(status, payload={'error': self.SIGNED})
+                with self.assertRaises(ListingServiceError) as caught:
+                    self.upload()
+                error = caught.exception
+                self.assertEqual((error.phase, error.code, error.status), ('media_grant', 'http_error', status))
+                self.assertNotIn('private', str(error))
+                self.assertFalse(error.retryable)
+                self.http.request.assert_called_once()
+                self.http.put.assert_not_called()
+                self.http.get.assert_not_called()
+
+    def test_grant_retry_stops_after_second_failure(self):
+        self.http.request.side_effect = requests.ConnectionError('private-api-value')
+        with self.assertRaises(ListingServiceError) as caught:
+            self.upload()
+        self.assertEqual(self.http.request.call_count, 2)
+        self.assertEqual((caught.exception.phase, caught.exception.code), ('media_grant', 'connection_error'))
+        self.http.put.assert_not_called()
+
+    def test_ambiguous_put_recovers_from_existing_identical_bytes(self):
+        for failure in (requests.Timeout(self.SIGNED), self.response(503)):
+            with self.subTest(failure=type(failure).__name__):
+                self.http.reset_mock()
+                self.http.put.side_effect = [failure]
+                self.assertEqual(self.upload()['url'], self.URL)
+                self.http.put.assert_called_once()
+                self.http.get.assert_called_once()
+
+    def test_failed_put_checks_storage_before_one_idempotent_retry(self):
+        order = []
+        def put(*args, **kwargs):
+            order.append('put')
+            if len(order) == 1:
+                raise requests.Timeout(self.SIGNED)
+            return self.response(200)
+        def get(*args, **kwargs):
+            order.append('get')
+            return self.response(404) if len(order) == 2 else self.response(200, data=self.DATA)
+        self.http.put.side_effect = put
+        self.http.get.side_effect = get
+        self.assertEqual(self.upload()['url'], self.URL)
+        self.assertEqual(order, ['put', 'get', 'put', 'get'])
+        first, second = self.http.put.call_args_list
+        self.assertEqual(first.args, second.args)
+        self.assertEqual(first.kwargs['data'], second.kwargs['data'])
+
+    def test_second_ambiguous_put_does_not_loop_when_object_is_absent(self):
+        self.http.put.side_effect = requests.Timeout(self.SIGNED)
+        self.http.get.return_value = self.response(404)
+        with self.assertRaises(ListingServiceError) as caught:
+            self.upload()
+        self.assertEqual((caught.exception.phase, caught.exception.code), ('storage_put', 'timeout'))
+        self.assertEqual((self.http.put.call_count, self.http.get.call_count), (2, 2))
+        self.assertNotIn('private', str(caught.exception))
+
+    def test_put_auth_and_other_non_conflict_four_xx_stop_immediately(self):
+        for status in (401, 403, 413, 429):
+            with self.subTest(status=status):
+                self.http.reset_mock()
+                self.http.put.return_value = self.response(status)
+                with self.assertRaises(ListingServiceError) as caught:
+                    self.upload()
+                self.assertEqual((caught.exception.phase, caught.exception.status), ('storage_put', status))
+                self.http.put.assert_called_once()
+                self.http.get.assert_not_called()
+
+    def test_immutable_conflict_is_verified_without_repeating_put(self):
+        for status in (400, 409):
+            with self.subTest(status=status):
+                self.http.reset_mock()
+                self.http.put.return_value = self.response(status)
+                self.assertEqual(self.upload()['url'], self.URL)
+                self.http.put.assert_called_once()
+                self.http.get.assert_called_once()
+
+    def test_successful_put_retries_only_transient_readback_without_reupload(self):
+        self.http.get.side_effect = [self.response(503), self.response(200, data=self.DATA)]
+        self.assertEqual(self.upload()['url'], self.URL)
+        self.http.put.assert_called_once()
+        self.assertEqual(self.http.get.call_count, 2)
+        self.sleep.assert_called_once_with(0.2)
+
+    def test_readback_four_xx_and_hash_mismatch_do_not_retry(self):
+        for status in (401, 403, 404, 429):
+            with self.subTest(status=status):
+                self.http.reset_mock()
+                self.http.get.return_value = self.response(status)
+                with self.assertRaises(ListingServiceError) as caught:
+                    self.upload()
+                self.assertEqual((caught.exception.phase, caught.exception.status), ('storage_readback', status))
+                self.http.get.assert_called_once()
+                self.http.get.return_value.close.assert_called_once()
+        self.http.reset_mock()
+        self.http.get.return_value = self.response(200, data=b'other bytes')
+        with self.assertRaises(ListingServiceError) as caught:
+            self.upload()
+        self.assertEqual((caught.exception.phase, caught.exception.code), ('hash_check', 'hash_mismatch'))
+        self.http.get.assert_called_once()
+
+    def test_standalone_stream_timeout_retries_once_and_closes_each_response(self):
+        responses = [self.response(200), self.response(200)]
+        for response in responses:
+            response.iter_content.side_effect = requests.Timeout(self.SIGNED)
+        self.http.get.side_effect = responses
+        with self.assertRaises(ListingServiceError) as caught:
+            self.client.read_media({'url': self.URL})
+        self.assertEqual((caught.exception.phase, caught.exception.code, caught.exception.status),
+                         ('storage_readback', 'timeout', 0))
+        self.assertEqual(self.http.get.call_count, 2)
+        for response in responses:
+            response.close.assert_called_once()
+        self.assertNotIn('private', str(caught.exception))
+
+    def test_exhausted_total_budget_does_not_start_put_or_readback(self):
+        clock = [0]
+        def grant(*args, **kwargs):
+            clock[0] = 25
+            return self.response(200, payload=self.grant)
+        self.http.request.side_effect = grant
+        with patch('listing_client.time.monotonic', side_effect=lambda: clock[0]):
+            with self.assertRaises(ListingServiceError) as caught:
+                self.upload()
+        self.assertEqual((caught.exception.phase, caught.exception.code), ('storage_put', 'budget_exhausted'))
+        self.http.put.assert_not_called()
+        self.http.get.assert_not_called()
+
+    def test_remaining_total_budget_clamps_later_request_timeouts(self):
+        clock = [0]
+        def grant(*args, **kwargs):
+            clock[0] = 23
+            return self.response(200, payload=self.grant)
+        self.http.request.side_effect = grant
+        with patch('listing_client.time.monotonic', side_effect=lambda: clock[0]):
+            self.upload()
+        self.assertEqual(self.http.put.call_args.kwargs['timeout'], (0.5, 1.5))
+        self.assertEqual(self.http.get.call_args.kwargs['timeout'], (0.5, 1.5))
+
+    def test_job_errors_expose_safe_stage_but_are_not_automatically_retried(self):
+        self.http.request.return_value = self.response(503, payload={'error': 'backend unavailable'})
+        with self.assertRaises(ListingServiceError) as caught:
+            self.client._api('PUT', '/jobs/opaque', body={'state': {}}, operation='save')
+        self.assertEqual((caught.exception.phase, caught.exception.code, caught.exception.status),
+                         ('job_save', 'http_error', 503))
+        self.http.request.assert_called_once()
+        self.sleep.assert_not_called()
 
 
 if __name__ == '__main__':

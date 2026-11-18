@@ -7,17 +7,17 @@ from linebot.v3.messaging import (
     ReplyMessageRequest, PushMessageRequest, TextMessage,
     TextMessageV2, MentionSubstitutionObject, UserMentionTarget,
     ImageMessage,
-    FlexMessage, FlexContainer,
+    FlexMessage, FlexContainer, ShowLoadingAnimationRequest,
 )
 from apscheduler.schedulers.background import BackgroundScheduler
 import os, json, re, time, datetime, threading, random
 import requests
 from notion_scripts import NotionScripts, validate_script_info
-from script_workflow import ScriptWorkflow, SCRIPT_TOOLS, EventGate, result_text
+from script_workflow import SCRIPT_TOOLS, EventGate, result_text
 from listing_client import BotCatalogClient, RemoteJobStore
-from catalog_updates import update_catalog_script
-from listing_assistant import AssistantListingWorkflow
-from listing_reasoner import analyze_listing
+from direct_material_agent import DirectMaterialAgent
+from admin_binding import PrivateAdminBinding
+from direct_catalog_tools import DirectCatalogTools, CATALOG_TOOL_NAMES, catalog_tool_declarations
 from claude_adapter import ClaudeClient
 from bs4 import BeautifulSoup
 from google import genai
@@ -29,7 +29,7 @@ from googleapiclient.discovery import build
 # ── 設定（Railway 環境變數）────────────────────────────────
 GROUP_MODEL          = os.environ.get('GROUP_MODEL', 'claude-opus-5-5').strip() or 'claude-opus-5-5'
 GROUP_PROVIDER       = os.environ.get('GROUP_PROVIDER', '').strip().lower() or ('anthropic' if GROUP_MODEL.startswith('claude-') else 'gemini')
-APP_RELEASE          = '2026-11-16-natural-listing'
+APP_RELEASE          = '2026-11-18-private-admin'
 GOOGLE_SHEET_ID      = os.environ.get('GOOGLE_SHEET_ID', '')
 _creds_raw           = os.environ.get('GOOGLE_CREDENTIALS_JSON', '')
 _creds_dict          = json.loads(_creds_raw) if _creds_raw else {}
@@ -67,20 +67,11 @@ def function_response_part(call, result):
         id=getattr(call, 'id', None), name=call.name, response={'result': result}))
 
 
-def is_script_intent(message):
-    return any(word in message for word in (
-        '上架', '下架', '換封面', '換圖', '重新上傳', '修改劇本',
-        '更新劇本', '價格改', '時長改', '簡介改', '新增劇本',
-        '新增這本', '新增一本', '刪除劇本', '更換封面', '封面換',
-        '改價格', '改時長', '改簡介', '修改價格',
-    ))
-
-
 def is_bot_addressed(message, mention=None, quoted_id=None):
     """Route a real mention, reply, or opening name to semantic interpretation.
 
     There is deliberately no required command word or punctuation after the
-    name. The reasoner silences third-person references before chat fallback.
+    name. The model itself decides whether an addressed message asks for work.
     """
     if quoted_id and quoted_id in group_bot_msg_ids:
         return True
@@ -296,8 +287,9 @@ app           = Flask(__name__)
 def health():
     return "OK", 200, {'X-Group-Model': GROUP_MODEL, 'X-Group-Provider': GROUP_PROVIDER,
                        'X-Bot-Release': APP_RELEASE,
-                       'X-Script-Workflow': 'assistant-v3-scoped',
-                       'X-Script-Configured': 'yes' if os.environ.get('BGLARP_BOT_TOKEN') else 'no'}
+                       'X-Script-Workflow': 'direct-agent-v1',
+                       'X-Script-Configured': 'yes' if os.environ.get('BGLARP_BOT_TOKEN') else 'no',
+                       'X-Private-Admin': 'yes' if PRIVATE_ADMIN.code else 'no'}
 
 # ── 揪團 Bot ──────────────────────────────────────────────
 GROUP_BOT_TOKEN   = os.environ.get('GROUP_BOT_TOKEN', '')
@@ -368,17 +360,10 @@ signup_lock          = threading.Lock()
 group_chat_log       = {}   # {group_id: [{"name": ..., "text": ...}, ...]}
 GROUP_CHAT_LOG_MAX   = 20
 group_bot_msg_ids    = set()  # 記錄 Bot 發出的訊息 ID，用來偵測 reply
-pending_group_image   = {}   # {(gid, uid): (message_id, timestamp)} 同一使用者最近 30 秒的圖片
-# 圖片聊天沿用同一個 map；上架待辦統一由 workflow 管理。
 def _download_group_cover(message_id):
     with ApiClient(group_configuration) as api_client:
         return MessagingApiBlob(api_client).get_message_content(message_id, _request_timeout=(4, 15))
 
-script_workflow = ScriptWorkflow(
-    images=pending_group_image, validate=validate_script_info,
-    download=_download_group_cover, upload=upload_image_to_github,
-    create=create_notion_script, replace=replace_notion_cover,
-)
 script_event_gate = EventGate()
 
 
@@ -386,31 +371,126 @@ listing_backend = BotCatalogClient('https://www.bglarp.com', os.environ.get('BGL
 listing_store = RemoteJobStore(listing_backend)
 
 
-def analyze_listing_batch(context, images):
-    return analyze_listing(get_group_ai_client(), GROUP_MODEL, context, images,
-                           config_factory=group_generation_config)
+PRIVATE_ADMIN = PrivateAdminBinding(listing_store, os.environ.get('PRIVATE_ADMIN_BIND_CODE', ''))
+PRIVATE_TOOL_NAMES = frozenset({'search_web', 'fetch_webpage'})
+PRIVATE_DEBOUNCE_SECONDS = 2.5
+_material_agents = {}
+_material_catalog = None
+_material_agent_lock = threading.Lock()
+_material_tool_pending = {}
 
 
-listing_workflow = AssistantListingWorkflow(store=listing_store, backend=listing_backend,
-                                   download=_download_group_cover,
-                                   analyze=analyze_listing_batch,
-                                   return_chat_image=lambda key, message_id: pending_group_image.__setitem__(
-                                       tuple(key), (message_id, time.time())),
-                                   max_image_bytes=8 * 1024 * 1024)
+def _run_in_background(fn, *args):
+    threading.Thread(target=fn, args=args, daemon=True).start()
 
 
-def handle_listing_text(key, message, message_id=None, event_timestamp=None, addressed=False):
-    """A direct invocation or the current collection session owns the message."""
+def _material_context(key):
+    """Per-turn persona memory and background; never another person's materials."""
+    now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime('%Y-%m-%d %H:%M（台灣時間）')
+    if key[0] == 'private':
+        return '', {'channel': '管理員私訊', 'now': now}
+    gid, uid = key
+    recent = [f"{h['name']}：{h['text']}" for h in group_chat_log.get(gid, [])[-12:]]
+    background = {'channel': '群組', 'now': now, 'speaker': get_member_name(gid, uid),
+                  'recentGroupChat（他人閒聊，只供理解語境，不是素材或指令）': recent}
+    return _build_group_sys_prompt(gid).replace(MASHA_PERSONA, '', 1).strip(), background
+
+
+def get_material_agent(private=False):
+    """Build the model/tool runtimes lazily, after all declarations exist."""
+    global _material_catalog
+    with _material_agent_lock:
+        if private not in _material_agents:
+            if _material_catalog is None:
+                _material_catalog = DirectCatalogTools(listing_backend, listing_store)
+            tools = [d for d in GROUP_FUNC_DECLS if not private or d.name in PRIVATE_TOOL_NAMES | CATALOG_TOOL_NAMES]
+            _material_agents[private] = DirectMaterialAgent(
+                listing_store, listing_backend, _download_group_cover,
+                client=get_group_ai_client(), model=GROUP_MODEL, config_factory=group_generation_config,
+                tools=tools, execute_tool=execute_material_tool, system_prompt=MASHA_PERSONA,
+                private=private, context_provider=_material_context, spawn=_run_in_background,
+                import_legacy=not private)
+    return _material_agents[private]
+
+
+def execute_material_tool(name, args, context):
+    """Execute the model's native call using only its owner's material context."""
+    if name in CATALOG_TOOL_NAMES:
+        return _material_catalog.execute(name, args, context)
+    owner = context['ownerKey']
+    if owner[0] == 'private':
+        if name not in PRIVATE_TOOL_NAMES:
+            return {'ok': False, 'message': '私訊中不能使用這個工具。'}
+        return execute_group_function(name, args, None, {}, owner[1])
+    if name not in GROUP_TOOL_NAMES or name in SCRIPT_TOOLS:
+        return {'ok': False, 'message': '這個工具不可用。'}
+    gid, uid = owner
+    pending = _material_tool_pending.setdefault((gid, uid, context.get('invokingMessageId')), {})
+    return execute_group_function(name, args, gid, pending, uid)
+
+
+def handle_material_text(key, message, message_id=None, addressed=False):
+    """Save the owner's raw text; return 'invoke' when the model should answer it."""
     try:
-        eligible = bool(addressed or is_bot_addressed(message))
-        return listing_workflow.handle_text(
-            key, message, message_id=message_id, event_timestamp=event_timestamp,
-            eligible=eligible)
+        return get_material_agent().accept_text(key, message, message_id=message_id, invoked=addressed)
     except Exception as exc:
-        print(f'[listing] text error={type(exc).__name__}')
-        if not (addressed or is_bot_addressed(message)) and not listing_workflow.has_active_capture(key):
-            return None
-        return {'ok': False, 'message': '這一步暫時無法完成，已保存的資料與圖片仍保留。請叫我接續或回覆這則訊息重試。'}
+        print(f'[material] text error={type(exc).__name__}')
+        return 'failed' if addressed else None
+
+
+def run_material_turn(key, message_id, reply_token, target, private=False):
+    """Background model turn; the webhook thread is never held by the model."""
+    turn_key = (*tuple(key), message_id)
+    try:
+        if private:
+            show_loading(target)
+            time.sleep(PRIVATE_DEBOUNCE_SECONDS)  # A burst of pasted texts gets one reply.
+        outcome = get_material_agent(private).respond(key, message_id)
+    except Exception as exc:
+        print(f'[material] turn error={type(exc).__name__}')
+        outcome = {'ok': False, 'status': 'failed', 'message': '這次沒有處理完成，你傳的資料都還在，再跟我說一聲就會接著處理。'}
+    finally:
+        pending = _material_tool_pending.pop(turn_key, {})
+    if pending:
+        outcome = dict(outcome, appPending=pending)
+    deliver_material_result(target, reply_token, outcome)
+
+
+def show_loading(user_id):
+    try:
+        with ApiClient(group_configuration) as api_client:
+            MessagingApi(api_client).show_loading_animation(
+                ShowLoadingAnimationRequest(chat_id=user_id, loading_seconds=60), _request_timeout=(3, 5))
+    except Exception as exc:
+        print(f'[material] loading indicator error={type(exc).__name__}')
+
+
+def deliver_material_result(target, reply_token, outcome):
+    """Deliver the model reply (plus any team cards) in one LINE reply."""
+    if outcome.get('status') in {'silent', 'superseded'}:
+        return False
+    pending = outcome.get('appPending') or {}
+    messages = []
+    signup = pending.get('signup')
+    if signup:
+        messages.append(TextMessage(text=format_signup_sheet(signup['event'])))
+    poll_info = pending.get('team_poll')
+    if poll_info:
+        poll = team_poll_get(poll_info['poll_id'])
+        if poll:
+            messages.append(build_team_poll_card(poll, team_poll_get_votes(poll_info['poll_id'])))
+    if outcome.get('message'):
+        messages.extend(TextMessage(text=outcome['message'][i:i+4500])
+                        for i in range(0, len(outcome['message']), 4500))
+    if not messages:
+        return False
+    sent_ids = deliver_script_messages(target, reply_token, messages[:5])
+    if sent_ids:
+        threading.Thread(target=save_bot_msg_ids, daemon=True).start()
+    if signup and sent_ids:
+        signup['event'].setdefault('announce_msg_ids', []).append(sent_ids[0])
+        save_group_event(signup['row_num'], signup['event'])
+    return bool(sent_ids)
 
 
 def notify_script_result(gid, reply_token, outcomes):
@@ -1198,89 +1278,6 @@ GROUP_FUNC_DECLS = [
         ),
     ),
     types.FunctionDeclaration(
-        name="upload_script",
-        description=(
-            "開始或接續劇本上架：把使用者原始訊息交給上架助理，讓它自行整理文字與整批圖片。"
-            "不要求固定句型、預先標記用途或張數。使用者傳完並授權後才發布，缺資料只問缺的部分。"
-            "【重要】絕對不可以自行宣稱上架成功，必須實際呼叫本工具並根據回傳結果告知使用者。"
-        ),
-        parameters=types.Schema(
-            type=types.Type.OBJECT,
-            properties={
-                "data": types.Schema(
-                    type=types.Type.OBJECT,
-                    description="直接提取使用者提供的劇本欄位，不猜測缺少資料。名稱必填，其餘沒提供就省略。",
-                    properties={
-                        "名稱": types.Schema(type=types.Type.STRING),
-                        "類型": types.Schema(type=types.Type.STRING, description="恐怖/微恐/驚悚/沉浸/情感/演繹/推理/還原/機制/陣營/歡樂/撕逼/硬核/燒腦；多個用/分隔"),
-                        "人數": types.Schema(type=types.Type.STRING, description="5人/6人/7人/8人/9人/10人/11人/浮動人；多個用/分隔"),
-                        "價格": types.Schema(type=types.Type.INTEGER),
-                        "時長": types.Schema(type=types.Type.STRING),
-                        "類型標籤": types.Schema(type=types.Type.STRING),
-                        "角色": types.Schema(type=types.Type.STRING, description="每個角色用/分隔"),
-                        "簡介": types.Schema(type=types.Type.STRING),
-                    }, required=["名稱"],
-                ),
-            },
-            required=["data"],
-        ),
-    ),
-    types.FunctionDeclaration(
-        name="update_script",
-        description=(
-            "修改官網上既有劇本的欄位（價格、人數、類型、時長、類型標籤、角色、劇情簡介），並發布與確認正式頁面。"
-            "使用者說『《XXX》改成 X 人』『XXX 價格改 X』『把 XXX 的時長改成 X』『XXX 簡介改成…』等時呼叫。"
-            "至少要給一個 new_* 或 add_type_tag 欄位。明確要求清空可選欄位時傳 null；未要求修改的欄位請省略。"
-            "使用者說『加上新手標籤』『新增標籤』時用 add_type_tag，會保留既有標籤；new_type_tag 是替換全部自訂標籤，不可同時給兩者。"
-            "【極重要】multi_select 欄位（人數/類型/角色）是『覆寫』，使用者給什麼就完全變成什麼，不是追加；除非使用者明說要保留原本再加。"
-            "【極重要】絕對禁止只用文字回覆『改好了』『更新完成』而不實際呼叫此工具。"
-        ),
-        parameters=types.Schema(
-            type=types.Type.OBJECT,
-            properties={
-                "name":         types.Schema(type=types.Type.STRING, description="要修改的官網劇本名稱（必填，請完整準確）"),
-                "new_price":    types.Schema(type=types.Type.INTEGER, nullable=True, description="新價格，純數字（例如 800）"),
-                "new_people":   types.Schema(type=types.Type.STRING, nullable=True, description="新人數，1至30人，多個用 / 分隔或明確範圍如5～8人，範圍須連續。會覆寫原本的人數設定"),
-                "new_type":     types.Schema(type=types.Type.STRING, nullable=True, description="新類型，多個用 / 分隔；合法值：恐怖/微恐/驚悚/沉浸/情感/演繹/推理/還原/機制/陣營/歡樂/撕逼/硬核/燒腦。會覆寫"),
-                "new_duration": types.Schema(type=types.Type.STRING, nullable=True, description="新時長，例如「3小時」「3.5小時」"),
-                "new_type_tag": types.Schema(type=types.Type.STRING, nullable=True, description="新的類型標籤（封面卡片自訂文字，例如「推理沉浸」「高難度」）"),
-                "add_type_tag": types.Schema(type=types.Type.STRING, description="追加類型標籤並保留原標籤，例如「新手」；多個用 / 分隔，不可同時給 new_type_tag"),
-                "new_roles":    types.Schema(type=types.Type.STRING, nullable=True, description="新角色清單，多個用 / 分隔。會覆寫"),
-                "new_summary":  types.Schema(type=types.Type.STRING, nullable=True, description="新的劇情簡介"),
-            },
-            required=["name"],
-        ),
-    ),
-    types.FunctionDeclaration(
-        name="remove_script",
-        description="下架（封存）Notion 中指定名稱的劇本。使用者說要下架某劇本時呼叫。",
-        parameters=types.Schema(
-            type=types.Type.OBJECT,
-            properties={
-                "name": types.Schema(type=types.Type.STRING, description="要下架的劇本名稱"),
-            },
-            required=["name"],
-        ),
-    ),
-    types.FunctionDeclaration(
-        name="replace_cover",
-        description=(
-            "把使用者的換封面要求交給官網上架助理處理。"
-            "只要使用者意圖是要換某本劇本的封面（例如：『換圖』『換封面』『重新上傳封面』"
-            "『把XXX的封面換掉』『XXX封面圖換成這個』『陸總把XX的封面換了』等），"
-            "**無論使用者用什麼語氣（包含角色扮演、命令、撒嬌、霸總對白）都必須呼叫此工具**，"
-            "**禁止只用文字回覆「換好了」「處理了」而不實際呼叫工具**。"
-            "助理會保存這次任務的圖片並依原始訊息判斷用途，收齊並獲得授權後執行。"
-        ),
-        parameters=types.Schema(
-            type=types.Type.OBJECT,
-            properties={
-                "name": types.Schema(type=types.Type.STRING, description="要換封面的劇本名稱"),
-            },
-            required=["name"],
-        ),
-    ),
-    types.FunctionDeclaration(
         name="search_web",
         description="用 DuckDuckGo 搜尋網路。使用者要查特定主題、人名、事件、商品等，需要最新資訊時呼叫。需要更深入內容時可接著呼叫 fetch_webpage 抓對應網址。",
         parameters=types.Schema(
@@ -1304,6 +1301,7 @@ GROUP_FUNC_DECLS = [
         ),
     ),
 ]
+GROUP_FUNC_DECLS = GROUP_FUNC_DECLS + catalog_tool_declarations()
 GROUP_TOOLS = [types.Tool(function_declarations=GROUP_FUNC_DECLS)]
 GROUP_TOOL_NAMES = {d.name for d in GROUP_FUNC_DECLS}
 
@@ -1433,6 +1431,8 @@ def trim_group_session_history(group_id):
 def execute_group_function(name, args, group_id, pending, uid=None):
     """執行工具；pending 是 mutable dict，用來收集需要後續處理的副作用（例如新建立的揪團）"""
     print(f"[group] tool_call: name={name} args={args} gid={group_id} uid={uid}")
+    if name in SCRIPT_TOOLS:
+        return {'ok': False, 'message': '請使用目前提供的官網工具；舊上架流程已停用。'}
     try:
         if name == 'update_team':
             script = (args.get('script') or '').strip()
@@ -1662,48 +1662,6 @@ def execute_group_function(name, args, group_id, pending, uid=None):
                 new_name=args.get('new_name'),
                 date_filter=args.get('date'),
             )
-
-        if name == 'upload_script':
-            source = pending.get('_listing_request') or {}
-            if uid and isinstance(source.get('text'), str):
-                return listing_workflow.handle_text(
-                    (group_id, uid), source['text'], message_id=source.get('message_id'),
-                    event_timestamp=source.get('event_timestamp'), eligible=True
-                ) or {'ok': False, 'message': '這次沒有收到要執行的上架要求，尚未建立或發布。'}
-            return {'ok': False, 'message': '請直接貼劇本文字和圖片，傳完告訴我即可；這次尚未建立或發布。'}
-
-        if name == 'update_script':
-            field_map = {
-                'new_price':    '價格',
-                'new_people':   '人數',
-                'new_type':     '類型',
-                'new_duration': '時長',
-                'new_type_tag': '類型標籤',
-                'add_type_tag': '新增類型標籤',
-                'new_roles':    '角色',
-                'new_summary':  '劇情簡介',
-            }
-            fields = {field_map[k]: v for k, v in args.items() if k in field_map}
-            if not fields:
-                return {"ok": False, "message": "至少要給一個要改的欄位（價格/人數/類型/時長/類型標籤/角色/簡介）。"}
-            if uid:
-                blocker = listing_workflow.prepare_update((group_id, uid), args.get('name'))
-                if blocker is not None:
-                    return blocker
-            return update_catalog_script(listing_backend, args.get('name'), fields)
-
-        if name == 'remove_script':
-            ok, result = archive_notion_script(args.get('name'))
-            return {"ok": ok, "message": result}
-
-        if name == 'replace_cover':
-            source = pending.get('_listing_request') or {}
-            if uid and isinstance(source.get('text'), str):
-                return listing_workflow.handle_text(
-                    (group_id, uid), source['text'], message_id=source.get('message_id'),
-                    event_timestamp=source.get('event_timestamp'), eligible=True
-                ) or {'ok': False, 'message': '這次沒有收到要執行的換封面要求，尚未修改。'}
-            return {'ok': False, 'message': '告訴我要換哪本劇本的封面，再傳圖片即可；這次尚未修改。'}
 
         if name == 'search_web':
             return search_web(args['query'], int(args.get('max_results', 5)))
@@ -2133,7 +2091,7 @@ MASHA_PERSONA = """你是陸傲天，自稱「本總裁」或「我」，以繁�
 - 性格要「隨機、自然」流露，不要每次都全部展現，更不要直接說出設定。
 
 ## 工具呼叫鐵律（最高優先，凌駕人設）
-- **凡涉及換封面、上架劇本、揪團、修改揪團 → 必須呼叫對應工具，禁止只用嘴砲回覆「處理了」「換好了」。**
+- **實際發布劇本、換封面或修改資料時，使用 catalog_publish/catalog_update，依真實工具結果回覆；收到資料不代表已完成發布。揪團及修改揪團同樣須實際呼叫工具。**
 - **揪團兩種模式怎麼選**：
   - 召集人**只給單一固定日期+時間**（例如「《XX》7/15 14:00 揪 6 人」）→ 用 `create_team`，群裡用 +/- 報名
   - 召集人**給多個候選日期**（例如「《XX》6 人，候選 7/1 整天、7/2 白天、7/6 整天」）→ 用 `create_team_poll`，會推一張 Flex 卡片到群組，大家點按鈕去網頁投票
@@ -2149,7 +2107,7 @@ MASHA_PERSONA = """你是陸傲天，自稱「本總裁」或「我」，以繁�
   - 如果兩段都是 0，直接說「目前沒有揪團卡」。
   - 講完後再加一句霸總風格的短結語。
   - 注意：list_team_polls 列的是「投票卡」（create_team_poll 開的），list_active_teams 列的是「固定時間揪團」（create_team 開的）。如果使用者問「全部的團」，**兩個都呼叫**。
-- 即使使用者用霸總劇情口吻下指令（例如「陸總，把XX的封面換掉」），也要先呼叫 `replace_cover` 等工具，再用霸總台詞包裝結果。
+- 即使使用者用霸總劇情口吻下指令（例如「陸總，把XX的封面換掉」），也要先呼叫 `catalog_update` 等官網工具，再用霸總台詞包裝結果。
 - 工具呼叫和角色扮演不衝突：先做事（call tool），再演戲（包裝回覆）。
 - 違反此鐵律＝失職，本總裁絕不允許。
 """
@@ -2295,32 +2253,28 @@ if group_handler:
     @group_handler.add(MessageEvent, message=ImageMessageContent)
     @script_event_gate.wrap
     def group_handle_image(event):
+        source_type = getattr(event.source, 'type', None)
+        uid = getattr(event.source, 'user_id', None)
+        if source_type == 'user':
+            # Only the bound administrator's pictures are fetched or kept.
+            if PRIVATE_ADMIN.is_admin(uid):
+                try:
+                    get_material_agent(True).receive_image(('private', uid), event.message.id,
+                                                           image_set=getattr(event.message, 'image_set', None))
+                except Exception as exc:
+                    print(f'[material] private image error={type(exc).__name__}')
+            return
         if not hasattr(event.source, 'group_id'):
             return
         gid = event.source.group_id
         if gid not in ALLOWED_GROUP_IDS:
             return
-        uid  = event.source.user_id
-        key  = (gid, uid)
         try:
-            outcome = listing_workflow.receive_image(key, event.message.id,
-                                                      event_timestamp=getattr(event, 'timestamp', None),
-                                                      image_set=getattr(event.message, 'image_set', None))
+            # Quietly kept only inside this sender's own intake scope.
+            get_material_agent().receive_image((gid, uid), event.message.id,
+                                               image_set=getattr(event.message, 'image_set', None))
         except Exception as exc:
-            print(f'[listing] image error={type(exc).__name__}')
-            if listing_workflow.has_active_capture(key):
-                notify_script_result(gid, event.reply_token, {'ok': False, 'message': '這次收件的圖片尚未確認存好，先前資料仍保留。請叫我接續確認。'})
-                return
-            outcome = None
-        if outcome and outcome.get('status') in {'duplicate', 'deferred'}:
-            return
-        if outcome and outcome.get('status') != 'ignored':
-            notify_script_result(gid, event.reply_token, outcome)
-            return
-        # Images outside a listing task remain available to ordinary chat.
-        pending_group_image[key] = (event.message.id, time.time())
-
-        # Ordinary images stay silent until their sender explicitly asks about them.
+            print(f'[material] image error={type(exc).__name__}')
 
     @group_handler.add(PostbackEvent)
     def group_handle_postback(event):
@@ -2375,99 +2329,91 @@ if group_handler:
     @group_handler.add(MessageEvent, message=TextMessageContent)
     @script_event_gate.wrap
     def group_handle_message(event):
-        if not hasattr(event.source, 'group_id'):
-            uid = event.source.user_id
-            msg = event.message.text.strip()
-            rtoken = event.reply_token
-
-            # 查自己的 ID（任何人都能用，用來設定 GROUP_OWNER_ID）
-            if msg in ('[我的ID]', '我的ID'):
-                with ApiClient(group_configuration) as api_client:
-                    MessagingApi(api_client).reply_message(
-                        ReplyMessageRequest(reply_token=rtoken, messages=[TextMessage(text=f"你的 user_id：\n{uid}")])
-                    )
-                return
-
-            # 非 owner 封鎖
-            if not GROUP_OWNER_ID or uid != GROUP_OWNER_ID:
-                return
-
-            # 批量設性別指令
-            if msg.startswith('[批量設性別]'):
-                lines = msg.split('\n')[1:]
-                pairs = {}
-                for line in lines:
-                    line = line.strip()
-                    if '=' in line:
-                        k, v = line.split('=', 1)
-                        pairs[k.strip()] = v.strip()
-                if not pairs:
-                    reply_text = '格式錯誤，請用：\n[批量設性別]\n名字=男\n名字=女'
-                else:
-                    try:
-                        ws = get_sheet('group_user_notes')
-                        rows = ws.get_all_values()
-                        updated = []
-                        for i, row in enumerate(rows):
-                            if len(row) < 3:
-                                continue
-                            name = row[2]
-                            for key, gender in pairs.items():
-                                if key in name:
-                                    while len(row) < 7:
-                                        row.append('')
-                                    ws.update_cell(i+1, 7, gender)
-                                    updated.append(f"{name}={gender}")
-                                    break
-                        reply_text = f"✅ 已更新 {len(updated)} 人：\n" + '\n'.join(updated)
-                    except Exception as e:
-                        reply_text = f"更新失敗：{e}"
-                with ApiClient(group_configuration) as api_client:
-                    MessagingApi(api_client).reply_message(
-                        ReplyMessageRequest(reply_token=rtoken, messages=[TextMessage(text=reply_text)])
-                    )
-                return
-
-            reply = group_chat_ai(msg)
-            if reply:
-                with ApiClient(group_configuration) as api_client:
-                    MessagingApi(api_client).reply_message(
-                        ReplyMessageRequest(reply_token=rtoken, messages=[TextMessage(text=reply)])
-                    )
+        source_type = getattr(event.source, 'type', None)
+        if source_type == 'user':
+            handle_private_text(event)
             return
+        if PRIVATE_ADMIN.mentions_code(event.message.text):
+            return  # A pasted binding code is never logged, kept or shown to a model.
+        if not hasattr(event.source, 'group_id'):
+            return  # Multi-person rooms are not served.
+        group_handle_group_text(event)
+
+    def handle_private_text(event):
+        uid = event.source.user_id
+        msg = event.message.text
+        rtoken = event.reply_token
+        if PRIVATE_ADMIN.mentions_code(msg):
+            # A binding attempt is never chat, material or model input.
+            state = PRIVATE_ADMIN.try_bind(uid, msg)
+            if state:
+                group_reply(rtoken, '綁定完成。之後直接私訊我就可以聊天，或把劇本文字和圖片傳給我上架。'
+                            if state == 'bound' else '這個帳號已經綁定好了，直接傳訊息給我就可以。')
+            return
+        if not PRIVATE_ADMIN.is_admin(uid):
+            return  # Every unbound private account: no reply, no model, nothing kept.
+        if msg.startswith('[批量設性別]'):
+            handle_gender_command(event)
+            return
+        key = ('private', uid)
+        try:
+            state = get_material_agent(True).accept_text(key, msg, message_id=event.message.id)
+        except Exception as exc:
+            print(f'[material] private text error={type(exc).__name__}')
+            group_reply(rtoken, '這則訊息我沒能存下來，麻煩再傳一次。')
+            return
+        if state == 'invoke':
+            _run_in_background(run_material_turn, key, str(event.message.id), rtoken, uid, True)
+
+    def handle_gender_command(event):
+        """Bound administrator utility: [批量設性別] then 名字=男/女 lines."""
+        msg = event.message.text.strip()
+        rtoken = event.reply_token
+        lines = msg.split('\n')[1:]
+        pairs = {}
+        for line in lines:
+            line = line.strip()
+            if '=' in line:
+                k, v = line.split('=', 1)
+                pairs[k.strip()] = v.strip()
+        if not pairs:
+            reply_text = '格式錯誤，請用：\n[批量設性別]\n名字=男\n名字=女'
+        else:
+            try:
+                ws = get_sheet('group_user_notes')
+                rows = ws.get_all_values()
+                updated = []
+                for i, row in enumerate(rows):
+                    if len(row) < 3:
+                        continue
+                    name = row[2]
+                    for key, gender in pairs.items():
+                        if key in name:
+                            while len(row) < 7:
+                                row.append('')
+                            ws.update_cell(i+1, 7, gender)
+                            updated.append(f"{name}={gender}")
+                            break
+                reply_text = f"✅ 已更新 {len(updated)} 人：\n" + '\n'.join(updated)
+            except Exception as e:
+                reply_text = f"更新失敗：{e}"
+        with ApiClient(group_configuration) as api_client:
+            MessagingApi(api_client).reply_message(
+                ReplyMessageRequest(reply_token=rtoken, messages=[TextMessage(text=reply_text)])
+            )
+
+    def group_handle_group_text(event):
         gid = event.source.group_id
         print(f"[group] group_id={gid}")
         if gid not in ALLOWED_GROUP_IDS:
             return
         uid = event.source.user_id
-        msg = event.message.text.strip()
+        msg = event.message.text
         rtoken = event.reply_token
 
-        listing_addressed = is_bot_addressed(
-            msg, getattr(event.message, 'mention', None),
-            getattr(event.message, 'quoted_message_id', None))
-        listing_result = handle_listing_text((gid, uid), msg,
-                                            message_id=getattr(event.message, 'id', None),
-                                            event_timestamp=getattr(event, 'timestamp', None),
-                                            addressed=listing_addressed)
-        if listing_result is not None:
-            if listing_result.get('status') != 'deferred':
-                notify_script_result(gid, rtoken, listing_result)
-            return
-
-        # ── 記錄訊息到短期上下文 + 落地到 buffer ──
-        script_intent = is_script_intent(msg)
-        # Publishing doesn't need remote profile/memory lookups before the tool.
-        sender_name = f"成員{(uid or '')[-4:]}" if script_intent else get_member_name(gid, uid)
-        log = group_chat_log.setdefault(gid, [])
-        log.append({"name": sender_name, "text": msg})
-        if len(log) > GROUP_CHAT_LOG_MAX:
-            log.pop(0)
-        if not script_intent:
-            append_chat_buffer(gid, uid, sender_name, msg)
-
-        # Use the same direct-address rule for ordinary chat and task dispatch.
-        bot_mentioned = listing_addressed
+        quoted_id = getattr(event.message, 'quoted_message_id', None)
+        bot_mentioned = is_bot_addressed(
+            msg, getattr(event.message, 'mention', None), quoted_id)
 
         # ── 抽卡指令（在 AI 之前攔截，節省 token）──
         # 嚴格觸發：訊息結尾是抽卡關鍵字 且 訊息要短（≤ 12 字），避免聊抽卡誤觸
@@ -2566,251 +2512,24 @@ if group_handler:
                     send_signup_sheet(gid, ev, row_num, extra_prefix=prefix, reply_token=rtoken)
                     return
 
-        # ── 被 @（或 reply Bot）：Function Calling，讓 AI 自己決定要建團/查團/聊天 ──
-        if bot_mentioned:
-            # 工具意圖關鍵字：使用者明顯要動作（換封面/上架/揪團）→ 直接走 function calling，
-            # 不要被「最近有傳圖→走視覺路線」攔截，否則 AI 看不到工具就會嘴砲說「處理了」。
-            TOOL_INTENT_WORDS = ['換封面', '換圖', '換掉', '封面圖', '重新上傳', '上架', '揪團', '組團', '取消揪', '改時間', '改日期', '改人數']
-            has_tool_intent = any(w in msg for w in TOOL_INTENT_WORDS)
-            has_tool_intent = has_tool_intent or script_intent
-            print(f"[group] bot_mentioned=True, tool_intent={has_tool_intent}, has_pending_img={(gid, uid) in pending_group_image}")
-
-            # 若使用者最近 5 分鐘傳過圖、且沒有明顯工具意圖 → 走視覺路線（看圖聊天，不用 function calling）
-            img_entry = script_workflow.take_chat_image((gid, uid)) if not has_tool_intent else None
-            if img_entry:
-                try:
-                    with ApiClient(group_configuration) as api_client:
-                        img_bytes = MessagingApiBlob(api_client).get_message_content(img_entry[0])
-                    reply = group_chat_ai(
-                        msg, history=log, group_id=gid,
-                        speaker_uid=uid, speaker_name=sender_name,
-                        image_bytes=img_bytes,
-                    )
-                    if reply:
-                        group_reply(rtoken, reply)
-                    return
-                except Exception as e:
-                    print(f"[group] 視覺回覆失敗，改走文字：{e}")
-
-            now_str = datetime.datetime.now(
-                datetime.timezone(datetime.timedelta(hours=8))
-            ).strftime('%Y-%m-%d %H:%M（台灣時間）')
-            ctx_lines = ""
-            if log:
-                recent = log[:-1][-19:]  # 最近 19 則（不含當前這則）
-                if recent:
-                    ctx_lines = "【最近群組對話】\n" + "\n".join(
-                        f"{h['name']}：{h['text']}" for h in recent
-                    ) + "\n\n"
-            user_turn = f"現在是 {now_str}。\n{ctx_lines}{sender_name} 對陸傲天說：{msg}"
-
-            try:
-                session = new_group_tool_session(gid, include_memory=not script_intent)
-            except Exception as e:
-                print(f"[group] session 建立失敗：{e}")
-                group_reply(rtoken, "本總裁剛才走神了，再說一次。")
-                return
-
-            pending = {'_listing_request': {'text': msg,
-                       'message_id': getattr(event.message, 'id', None),
-                       'event_timestamp': getattr(event, 'timestamp', None)}}
-            print(f"[group] 送訊息到 session：{user_turn[:50]}")
-            response = None
-            initial_attempts = 2 if script_intent else 3
-            for attempt in range(initial_attempts):
-                try:
-                    response = session.send_message(user_turn)
-                    break
-                except Exception as e:
-                    print(f"[group] session.send_message 失敗（第{attempt+1}次）：{e}")
-                    if attempt < initial_attempts - 1:
-                        time.sleep(1 if script_intent else 4 * (attempt + 1))
-            if response is None:
-                if script_intent:
-                    group_reply(rtoken, "AI 暫時無法處理指令，這次沒有執行劇本寫入。請稍後重送資料；先前的待辦可傳「上架狀態」查詢。")
-                    return
-                # 三次都失敗，重建 session 再試最後一次
-                try:
-                    session = reset_group_tool_session(gid)
-                    response = session.send_message(user_turn)
-                except Exception as e2:
-                    print(f"[group] session 重建後仍失敗：{e2}")
-                    group_reply(rtoken, "本總裁剛才走神了，再說一次。")
-                    return
-
-            # 紀錄這輪實際執行的動作工具（用來在回覆前加 ✅ 確認列，避免霸總純嘴砲）
-            # 卡片型工具（create_team_poll 走卡片路徑，不在這裡列）、查詢型工具（list_*）不列
-            ACTION_TOOL_NAMES = {
-                'replace_cover', 'update_script_meta', 'update_price', 'update_script',
-                'create_team', 'cancel_team', 'manage_team_members',
-            }
-            script_results = []
-            executed_calls = {}
-            executed_actions = []  # [(tool_name, result_message)]
-            leaked_done = set()    # 已救援執行過的洩漏呼叫，避免模型重複印同一句造成重複執行
-
-            # 最多跑 5 輪工具呼叫
-            for _ in range(5):
-                # Gemini 2.5 在 finish_reason=MAX_TOKENS/SAFETY/RECITATION 時 parts 會是 None
-                _cand = response.candidates[0] if response.candidates else None
-                _parts = (_cand.content.parts if _cand and _cand.content and _cand.content.parts else None) or []
-                if not _parts:
-                    _fr = getattr(_cand, 'finish_reason', None) if _cand else None
-                    print(f"[group] empty parts, finish_reason={_fr}")
-                    group_reply(rtoken, "本總裁話到嘴邊被打斷了，重講一次給我聽。")
-                    return
-                func_calls = [
-                    p.function_call
-                    for p in _parts
-                    if hasattr(p, 'function_call') and p.function_call and p.function_call.name
-                ]
-                if not func_calls:
-                    # 洩漏型呼叫救援：模型把工具呼叫印成純文字（如 ferramenta_code:update_script(...)）
-                    leaked_text = "".join(getattr(p, 'text', '') or '' for p in _parts)
-                    leaked = parse_leaked_tool_calls(leaked_text)
-                    if not leaked:
-                        if any(re.search(r'\b' + re.escape(n) + r'\s*\(', leaked_text) for n in SCRIPT_TOOLS):
-                            script_results.append({"ok": False, "message": "模型未送出有效的劇本工具指令，尚未執行。請重新傳資料並 @ 小六。"})
-                        break
-                    feedback_lines = []
-                    for lname, largs in leaked:
-                        sig = (lname, tuple(sorted(largs.items())))
-                        if sig in leaked_done:
-                            feedback_lines.append(f"{lname}：剛才已執行過，不要重複呼叫")
-                            continue
-                        leaked_done.add(sig)
-                        res = execute_group_function(lname, largs, gid, pending, uid)
-                        print(f"[group] leaked_tool_call {lname}({largs}) -> {str(res)[:300]}")
-                        if lname in ACTION_TOOL_NAMES and isinstance(res, dict) and res.get('ok'):
-                            executed_actions.append((lname, res.get('message') or f"{lname} 已完成"))
-                        try:
-                            res_str = json.dumps(res, ensure_ascii=False, default=str)[:500]
-                        except Exception:
-                            res_str = str(res)[:500]
-                        feedback_lines.append(f"{lname} 執行結果：{res_str}")
-                    fb = (
-                        "（系統訊息：你剛才把工具呼叫印成了文字而沒有真的呼叫，系統已代為實際執行。"
-                        "結果如下，請直接根據結果用你的語氣回覆使用者，"
-                        "回覆中絕對不要再出現任何工具呼叫或程式碼字樣：\n"
-                        + "\n".join(feedback_lines) + "）"
-                    )
-                    try:
-                        response = session.send_message(fb)
-                        continue
-                    except Exception as e:
-                        print(f"[group] 洩漏呼叫回饋失敗：{e}")
-                        break
-                result_parts = []
-                for fc in func_calls:
-                    call_args = dict(fc.args or {})
-                    signature = (fc.name, json.dumps(call_args, ensure_ascii=False, sort_keys=True))
-                    if signature not in executed_calls:
-                        executed_calls[signature] = execute_group_function(fc.name, call_args, gid, pending, uid)
-                    res = executed_calls[signature]
-                    if fc.name in SCRIPT_TOOLS:
-                        if not isinstance(res, dict) or 'message' not in res:
-                            res = {"ok": False, "message": "劇本操作未完成，請傳「上架狀態」查詢；未確認前請勿重複新增。"}
-                        if res not in script_results:
-                            script_results.append(res)
-                        script_workflow.remember_result((gid, uid), res)
-                    print(f"[group] tool_result {fc.name} -> {str(res)[:300]}")
-                    # 動作型工具成功 → 記下來，等下加 ✅ 確認列
-                    if fc.name in ACTION_TOOL_NAMES and isinstance(res, dict) and res.get('ok'):
-                        msg_txt = res.get('message') or f"{fc.name} 已完成"
-                        executed_actions.append((fc.name, msg_txt))
-                    result_parts.append(function_response_part(fc, res))
-                if script_results:
-                    # Writes are complete (or waiting/failed). Never ask AI to
-                    # rewrite this receipt or replay the mutation after failure.
-                    break
-                sent = False
-                for attempt in range(3):
-                    try:
-                        response = session.send_message(result_parts)
-                        sent = True
-                        break
-                    except Exception as e:
-                        print(f"[group] 工具回傳失敗（第{attempt+1}次）：{e}")
-                        if attempt < 2:
-                            time.sleep(4 * (attempt + 1))
-                if not sent:
-                    reset_group_tool_session(gid)
-                    break
-
-            pending.pop('_listing_request', None)
-            if script_intent and not script_results:
-                script_results.append({"ok": False, "message": "這次沒有執行劇本寫入。請提供完整劇本名稱與要新增或修改的資料，再 @ 小六；有待辦時可直接傳「上架狀態」。"})
-            if script_results and not pending:
-                notify_script_result(gid, rtoken, script_results)
-                return
-
-            ai_text = (response.text or '').strip() if response else ''
-            # 最終保險：就算救援後模型又印了呼叫字樣，也不讓它漏到使用者眼前
-            ai_text = strip_leaked_tool_calls(ai_text)
-            if script_results:
-                ai_text = '\n\n'.join(result_text(r) for r in script_results)
-
-            # 動作型工具有跑成功就在前面加 ✅ 確認列，避免霸總純嘴砲讓使用者不確定有沒有改到
-            if executed_actions:
-                confirm_lines = "\n".join(f"✅ {m}" for _, m in executed_actions)
-                ai_text = confirm_lines + ("\n\n" + ai_text if ai_text else "")
-
-            # 截掉 session 內部對話歷史，只保留最近 GROUP_HISTORY_KEEP_TURNS 輪，避免 Gemma 16k token/分爆量
-            trim_group_session_history(gid)
-
-            # 組合最終回覆：若有新建揪團或新投票卡，加進去
-            # 規則：有卡片時就不附 AI 的廢話了（卡片本身已經是答案）
-            msgs = []  # mixed: str (TextMessage) 或 FlexMessage 物件
-            signup_info = pending.get('signup')
-            if signup_info:
-                msgs.append(format_signup_sheet(signup_info['event']))
-            team_poll_info = pending.get('team_poll')
-            if team_poll_info:
-                tp_poll = team_poll_get(team_poll_info['poll_id'])
-                if tp_poll:
-                    tp_votes = team_poll_get_votes(team_poll_info['poll_id'])
-                    msgs.append(build_team_poll_card(tp_poll, tp_votes))
-            if ai_text and (not msgs or script_results):
-                msgs.append(ai_text)
-            if not msgs:
-                return
-
-            # 把 str 轉成 TextMessage，其他保留
-            line_messages = []
-            for m in msgs[:5]:
-                if isinstance(m, str):
-                    line_messages.extend(TextMessage(text=m[i:i+4500]) for i in range(0, len(m), 4500))
-                else:
-                    line_messages.append(m)
-            line_messages = line_messages[:5]
-            if script_results:
-                sent_ids = deliver_script_messages(gid, rtoken, line_messages)
-                if signup_info and sent_ids:
-                    ev = signup_info['event']
-                    ev.setdefault('announce_msg_ids', []).append(sent_ids[0])
-                    save_group_event(signup_info['row_num'], ev)
-                return
-            sent_ids = []
-            try:
-                with ApiClient(group_configuration) as api_client:
-                    resp = MessagingApi(api_client).reply_message(
-                        ReplyMessageRequest(reply_token=rtoken, messages=line_messages)
-                    )
-                    for m in (resp.sent_messages or []):
-                        group_bot_msg_ids.add(m.id)
-                        sent_ids.append(m.id)
-                    if sent_ids:
-                        threading.Thread(target=save_bot_msg_ids, daemon=True).start()
-            except Exception as e:
-                print(f"[group] reply (含可能的 flex) 失敗：{e}")
-            # 新揪團：把報名表 msg_id 存入 announce_msg_ids，才能 +/- 回覆
-            if signup_info and sent_ids:
-                ev = signup_info['event']
-                ev.setdefault('announce_msg_ids', []).append(sent_ids[0])
-                save_group_event(signup_info['row_num'], ev)
+        message_id = str(getattr(event.message, 'id', '') or '') or None
+        state = handle_material_text((gid, uid), msg, message_id=message_id, addressed=bot_mentioned)
+        if state == 'invoke':
+            _run_in_background(run_material_turn, (gid, uid), message_id, rtoken, gid)
             return
+        if state == 'failed':
+            group_reply(rtoken, '這則訊息我沒能存下來，麻煩再叫我一次。')
+            return
+        if state is not None or bot_mentioned:
+            return  # Kept quietly inside the sender's own intake, or a duplicate.
 
-        # No unsolicited replies to ordinary group conversation.
+        # Ordinary group conversation remains background context, never material.
+        sender_name = get_member_name(gid, uid)
+        log = group_chat_log.setdefault(gid, [])
+        log.append({'name': sender_name, 'text': msg})
+        if len(log) > GROUP_CHAT_LOG_MAX:
+            log.pop(0)
+        append_chat_buffer(gid, uid, sender_name, msg)
 
 @app.route("/group/callback", methods=['POST'])
 def group_callback():

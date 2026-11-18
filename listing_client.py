@@ -11,14 +11,51 @@ import requests
 
 
 class ListingServiceError(RuntimeError):
-    def __init__(self, message, status=0):
+    def __init__(self, message, status=0, *, phase='catalog_api', code='service_error', retryable=False):
         super().__init__(message)
-        self.status = status
+        # These small fields are safe to log. Never retain a request, signed
+        # URL, transport exception, response body, or authentication headers.
+        self.status = status if type(status) is int and 100 <= status <= 599 else 0
+        self.phase = phase if isinstance(phase, str) and re.fullmatch(r'[a-z_]{1,40}', phase) else 'catalog_api'
+        self.code = code if isinstance(code, str) and re.fullmatch(r'[a-z_]{1,40}', code) else 'service_error'
+        self.retryable = bool(retryable and (self.status == 0 or self.status >= 500))
         self.public_message = message
 
 
 def _digest(value):
     return hashlib.sha256(value).hexdigest()
+
+
+MEDIA_BUDGET_SECONDS = 25
+MEDIA_RETRY_DELAY = 0.2
+
+
+def _transport_error(error, phase):
+    if isinstance(error, requests.exceptions.SSLError):
+        code, retryable = 'tls_error', False
+    elif isinstance(error, requests.Timeout):
+        code, retryable = 'timeout', True
+    elif isinstance(error, (requests.ConnectionError, requests.exceptions.ChunkedEncodingError)):
+        code, retryable = 'connection_error', True
+    else:
+        code, retryable = 'transport_error', False
+    return ListingServiceError('圖片連線暫時失敗，已保留資料，可以請我重試。',
+                               phase=phase, code=code, retryable=retryable)
+
+
+def _media_timeout(deadline, phase, read_seconds=6):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0.1:
+        raise ListingServiceError('這次圖片處理已達等待上限，已保留資料，可以請我重試。',
+                                   phase=phase, code='budget_exhausted')
+    return (min(2, remaining / 4), min(read_seconds, remaining * 3 / 4))
+
+
+def _media_retry_pause(deadline):
+    if deadline - time.monotonic() <= MEDIA_RETRY_DELAY + 0.1:
+        return False
+    time.sleep(MEDIA_RETRY_DELAY)
+    return True
 
 
 def _parts(value):
@@ -111,8 +148,12 @@ class BotCatalogClient:
         self.session = session or requests.Session()
 
     def _api(self, method, path, *, body=None, request_id='lookup', operation=None, params=None, timeout=(5, 65)):
+        phase = ('media_grant' if path == '/media' else
+                 'job_read' if path.startswith('/jobs/') and method == 'GET' else
+                 'job_save' if path.startswith('/jobs/') else 'catalog_api')
         if not self.token:
-            raise ListingServiceError('官網上架連線尚未設定，請管理員檢查；這次沒有發布。')
+            raise ListingServiceError('官網上架連線尚未設定，請管理員檢查；這次沒有發布。',
+                                       phase=phase, code='missing_credentials')
         headers = {'Authorization': f'Bearer {self.token}', 'Accept': 'application/json',
                    'X-BGLARP-Request-Id': request_id}
         if operation:
@@ -121,14 +162,20 @@ class BotCatalogClient:
             response = self.session.request(method, self.base_url + '/api/admin/scripts/bot' + path,
                                             json=body, params=params, headers=headers,
                                             timeout=timeout, allow_redirects=False)
-        except requests.RequestException:
-            raise ListingServiceError('官網連線逾時，資料已保留。請傳「重試上架」接續，勿重新建立同名劇本。') from None
+        except requests.RequestException as error:
+            details = _transport_error(error, phase)
+            raise ListingServiceError('官網連線暫時失敗，資料已保留。可以請我重試，勿重新建立同名劇本。',
+                                       phase=phase, code=details.code, retryable=details.retryable) from None
         try:
-            payload = response.json()
-        except (ValueError, TypeError):
-            payload = {}
+            try:
+                payload = response.json()
+            except (ValueError, TypeError):
+                payload = None
+        finally:
+            response.close()
         if not 200 <= response.status_code < 300:
-            message = payload.get('error', {}).get('message') if isinstance(payload.get('error'), dict) else payload.get('error')
+            body_error = payload.get('error') if isinstance(payload, dict) else None
+            message = body_error.get('message') if isinstance(body_error, dict) else body_error
             if not isinstance(message, str):
                 message = None
             # Server errors never include authentication headers or upstream bodies.
@@ -136,7 +183,14 @@ class BotCatalogClient:
                 message = '官網上架連線驗證未通過，請管理員檢查；資料已保留。'
             elif response.status_code == 409:
                 message = message or '同名劇本或資料版本有衝突，請先查「上架狀態」，不要重複建立。'
-            raise ListingServiceError(message or '官網未完成這次操作，資料已保留，請稍後重試。', response.status_code)
+            if phase == 'media_grant':
+                message = ('圖片上傳連線驗證未通過，請管理員檢查。' if response.status_code in (401, 403)
+                           else '圖片上傳準備尚未完成，資料已保留，可以請我重試。')
+            raise ListingServiceError(message or '官網未完成這次操作，資料已保留，請稍後重試。', response.status_code,
+                                       phase=phase, code='http_error', retryable=response.status_code >= 500)
+        if not isinstance(payload, dict):
+            raise ListingServiceError('官網回應格式不完整，資料已保留，可以請我重試。',
+                                       phase=phase, code='invalid_response')
         return payload
 
     def lookup(self, name):
@@ -160,57 +214,132 @@ class BotCatalogClient:
 
     def upload_media(self, data, filename, operation_key, *, kind='cover'):
         if not isinstance(data, bytes) or not 0 < len(data) <= 8 * 1024 * 1024:
-            raise ListingServiceError('圖片需小於 8 MB，請改傳 JPG、PNG 或 WebP。')
+            raise ListingServiceError('圖片需小於 8 MB，請改傳 JPG、PNG 或 WebP。',
+                                       phase='media_input', code='invalid_media')
         mime = ('image/png' if data.startswith(b'\x89PNG\r\n\x1a\n') else
                 'image/jpeg' if data.startswith(b'\xff\xd8\xff') else
                 'image/webp' if data.startswith(b'RIFF') and data[8:12] == b'WEBP' else None)
         if not mime:
-            raise ListingServiceError('只接受 JPG、PNG 或 WebP 圖片。')
+            raise ListingServiceError('只接受 JPG、PNG 或 WebP 圖片。',
+                                       phase='media_input', code='invalid_media')
+        if kind not in {'cover', 'character'} or not isinstance(operation_key, str) or not operation_key:
+            raise ListingServiceError('圖片儲存資訊不完整，資料已保留。',
+                                       phase='media_input', code='invalid_request')
+        deadline = time.monotonic() + MEDIA_BUDGET_SECONDS
         sha = _digest(data)
         request_id = operation_key.split(':')[0]
-        grant = self._api('POST', '/media', request_id=request_id,
-                          operation='media-' + _digest(operation_key.encode())[:64],
-                          body={'contentType': mime, 'size': len(data), 'sha256': sha, 'kind': kind})
+        for attempt in range(2):
+            try:
+                # Replaying this grant addresses the same immutable hash/path.
+                grant = self._api('POST', '/media', request_id=request_id,
+                                  operation='media-' + _digest(operation_key.encode())[:64],
+                                  body={'contentType': mime, 'size': len(data), 'sha256': sha, 'kind': kind},
+                                  timeout=_media_timeout(deadline, 'media_grant'))
+                break
+            except ListingServiceError as error:
+                if attempt or not error.retryable or not _media_retry_pause(deadline):
+                    raise
         grant = grant.get('upload', grant)
+        if (not isinstance(grant, dict) or not isinstance(grant.get('path'), str)
+                or not grant['path'] or not isinstance(grant.get('publicUrl'), str)):
+            raise ListingServiceError('圖片儲存回應不完整，資料已保留。',
+                                       phase='media_grant', code='invalid_response')
         public = grant['publicUrl']
-        self._check_asset_url(public, '/storage/v1/object/public/script-covers/')
-        try:
-            if not grant.get('alreadyUploaded'):
-                signed = grant['signedUrl']
-                self._check_asset_url(signed, '/storage/v1/object/upload/sign/script-covers/')
-                response = self.session.put(signed, data=data, headers={'Content-Type': mime}, timeout=(5, 30), allow_redirects=False)
-            # A prior upload may have succeeded despite a timeout. Verify bytes,
-            # never overwrite a supposedly immutable path with different data.
-                if response.status_code not in (200, 201, 400, 409):
-                    raise ListingServiceError('圖片保存尚未完成，請傳「重試上架」。')
-            saved = self.read_media({'url': public})
+        self._check_asset_url(public, phase='media_grant')
+
+        def verify(attempts=2):
+            saved = self.read_media({'url': public}, _deadline=deadline, _attempts=attempts)
             if _digest(saved) != sha:
-                raise ListingServiceError('圖片檢查不一致，這張尚未採用，請重試。')
-        except requests.RequestException:
-            raise ListingServiceError('圖片保存連線中斷，請傳「重試上架」。') from None
+                raise ListingServiceError('圖片檢查不一致，這張尚未採用，可以請我重試。',
+                                           phase='hash_check', code='hash_mismatch')
+
+        if grant.get('alreadyUploaded'):
+            verify()
+        else:
+            signed = grant.get('signedUrl')
+            self._check_asset_url(signed, '/storage/v1/object/upload/sign/script-covers/', phase='media_grant')
+            for attempt in range(2):
+                put_error = None
+                response = None
+                try:
+                    response = self.session.put(
+                        signed, data=data, headers={'Content-Type': mime},
+                        timeout=_media_timeout(deadline, 'storage_put', 8), allow_redirects=False)
+                    status = response.status_code
+                    if status not in (200, 201):
+                        put_error = ListingServiceError('圖片尚未確認存好，資料已保留，可以請我重試。',
+                                                        status, phase='storage_put', code='http_error',
+                                                        retryable=status >= 500)
+                        # 400/409 can be an immutable object already present;
+                        # inspect bytes, but never repeat a rejected PUT.
+                        if status not in (400, 409) and not put_error.retryable:
+                            raise put_error
+                except requests.RequestException as error:
+                    put_error = _transport_error(error, 'storage_put')
+                    if not put_error.retryable:
+                        raise put_error from None
+                finally:
+                    if response is not None:
+                        response.close()
+                try:
+                    # A timeout/5xx can follow a committed upload. Check that
+                    # immutable object BEFORE considering one more PUT. The
+                    # entire upload uses no more than two readback requests.
+                    verify(attempts=1 if put_error or attempt else 2)
+                    break
+                except ListingServiceError as read_error:
+                    retry_put = (put_error and put_error.retryable and not attempt
+                                 and (read_error.status == 404 or read_error.retryable))
+                    if retry_put and _media_retry_pause(deadline):
+                        continue
+                    if put_error and read_error.status == 404:
+                        raise put_error from None
+                    raise
         return {'url': public, 'path': grant['path'], 'sha256': sha, 'size': len(data)}
 
     @staticmethod
-    def _check_asset_url(url, prefix='/storage/v1/object/public/script-covers/'):
-        parsed = urlsplit(url)
-        if parsed.scheme != 'https' or parsed.netloc != 'rnipzotldpbdlzxjnoip.supabase.co' or not parsed.path.startswith(prefix):
-            raise ListingServiceError('圖片位置不符合官網儲存設定。')
-
-    def read_media(self, asset):
-        url = asset['url']
-        self._check_asset_url(url)
+    def _check_asset_url(url, prefix='/storage/v1/object/public/script-covers/', *, phase='storage_readback'):
         try:
-            response = self.session.get(url, timeout=(5, 20), allow_redirects=False, stream=True)
-            if response.status_code != 200:
-                raise ListingServiceError('已保存的圖片暫時無法讀取，請稍後重試。')
-            output = bytearray()
-            for chunk in response.iter_content(65536):
-                output.extend(chunk)
-                if len(output) > 8 * 1024 * 1024:
-                    raise ListingServiceError('圖片超過 8 MB。')
-            return bytes(output)
-        except requests.RequestException:
-            raise ListingServiceError('圖片讀取暫時失敗，請稍後重試。') from None
+            parsed = urlsplit(url) if isinstance(url, str) else None
+        except ValueError:
+            parsed = None
+        if (parsed is None or parsed.scheme != 'https' or parsed.netloc != 'rnipzotldpbdlzxjnoip.supabase.co'
+                or not parsed.path.startswith(prefix)):
+            raise ListingServiceError('圖片位置不符合官網儲存設定。', phase=phase, code='invalid_url')
+
+    def read_media(self, asset, *, _deadline=None, _attempts=2):
+        url = asset.get('url') if isinstance(asset, dict) else None
+        self._check_asset_url(url)
+        deadline = _deadline if _deadline is not None else time.monotonic() + 16.2
+        for attempt in range(min(2, max(1, _attempts))):
+            response = None
+            failure = None
+            try:
+                response = self.session.get(url, timeout=_media_timeout(deadline, 'storage_readback'),
+                                            allow_redirects=False, stream=True)
+                if response.status_code != 200:
+                    raise ListingServiceError('已保存的圖片暫時無法讀取，可以請我重試。', response.status_code,
+                                               phase='storage_readback', code='http_error',
+                                               retryable=response.status_code >= 500)
+                output = bytearray()
+                for chunk in response.iter_content(16384):
+                    _media_timeout(deadline, 'storage_readback')
+                    output.extend(chunk)
+                    if len(output) > 8 * 1024 * 1024:
+                        raise ListingServiceError('圖片超過 8 MB。', phase='storage_readback', code='invalid_media')
+                if not output:
+                    raise ListingServiceError('儲存圖片內容為空，這張尚未採用。',
+                                               phase='storage_readback', code='invalid_media')
+                return bytes(output)
+            except requests.RequestException as error:
+                failure = _transport_error(error, 'storage_readback')
+            except ListingServiceError as error:
+                failure = error
+            finally:
+                if response is not None:
+                    response.close()
+            if attempt + 1 >= min(2, max(1, _attempts)) or not failure.retryable or not _media_retry_pause(deadline):
+                raise failure from None
 
     def verify_publication(self, job, *, timeout=None):
         """Read back this job's immutable operation version without publishing."""
