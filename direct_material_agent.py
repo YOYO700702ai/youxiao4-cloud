@@ -47,6 +47,7 @@ MAX_EVENTS = 160
 MAX_IMAGES_SHOWN = 30
 MAX_JOURNAL_BYTES = 380000
 MAX_MEDIA_ATTEMPTS = 5
+PRIVATE_CONTEXT = 72 * 3600  # private chat: the model only sees the last 3 days
 TZ = datetime.timezone(datetime.timedelta(hours=8))
 
 
@@ -70,6 +71,13 @@ def _stamp(seconds):
     try:
         return datetime.datetime.fromtimestamp(seconds, TZ).strftime('%Y-%m-%d %H:%M:%S')
     except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def _seconds(stamp):
+    try:
+        return datetime.datetime.strptime(stamp, '%Y-%m-%d %H:%M:%S').replace(tzinfo=TZ).timestamp()
+    except (TypeError, ValueError):
         return None
 
 
@@ -152,6 +160,17 @@ class DirectMaterialAgent:
             del events[0]
         self.store.put(self._storage_key(key), journal)
         self._cache[tuple(key)] = journal.get('receivingUntil', 0)
+
+    def _recent(self, journal):
+        """Private turns only see the last PRIVATE_CONTEXT seconds. Older items stay
+        stored (group keeps its 30 days) but never reach the model or its tools."""
+        if self.private:
+            cutoff = self.clock() - PRIVATE_CONTEXT
+            journal['events'] = [e for e in journal['events'] if type(e.get('receivedAt')) in (int, float)
+                                 and e['receivedAt'] >= cutoff]
+            journal['toolReceipts'] = [r for r in journal['toolReceipts']
+                                       if (_seconds(r.get('time')) or 0) >= cutoff]
+        return journal
 
     def _receiving(self, key, journal=None):
         until = journal.get('receivingUntil', 0) if journal else self._cache.get(tuple(key), 0)
@@ -384,7 +403,7 @@ class DirectMaterialAgent:
     def _turn(self, key, invoking_id, deadline):
         self._settle_images(key, deadline)
         with self._lock(key):
-            snapshot = deepcopy(self._load(key, create=True))
+            snapshot = self._recent(deepcopy(self._load(key, create=True)))
         system_extra, background = '', None
         if self.context_provider:
             try:
@@ -434,7 +453,7 @@ class DirectMaterialAgent:
                 results.append(types.Part(function_response=types.FunctionResponse(
                     id=call_id, name=name, response={'result': result})))
             with self._lock(key):
-                latest = deepcopy(self._load(key))
+                latest = self._recent(deepcopy(self._load(key)))
             fresh = [e for e in latest['events'] if e['messageId'] not in seen and e['kind'] != 'assistant']
             seen.update(e['messageId'] for e in fresh)
             snapshot = latest

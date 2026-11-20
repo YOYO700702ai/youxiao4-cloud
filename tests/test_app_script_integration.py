@@ -379,7 +379,7 @@ class OfflineStartupTests(unittest.TestCase):
                 self.assertEqual(response.data, b'OK')
                 self.assertEqual(response.headers['X-Group-Model'], model)
                 self.assertEqual(response.headers['X-Group-Provider'], provider)
-                self.assertEqual(response.headers['X-Bot-Release'], '2026-11-20-multi-admin')
+                self.assertEqual(response.headers['X-Bot-Release'], '2026-11-20-private-history-3d')
                 self.assertEqual(response.headers['X-Script-Workflow'], 'direct-agent-v1')
                 if module.group_gemini_client is not None:
                     module.group_gemini_client.close()

@@ -3,6 +3,7 @@
 Only the HTTP layers are fake (Anthropic and the website bot API). The journal
 store is the real RemoteJobStore (CAS revisions) over the fake website.
 """
+import datetime
 import json
 import threading
 import time
@@ -328,7 +329,95 @@ class PrivateConversationTests(AgentCase):
         self.assertEqual(len(self.journal(agent)['events']), 6)
 
 
+HOURS_72 = 72 * 3600
+
+
+def taipei(seconds):
+    return datetime.datetime.fromtimestamp(seconds, datetime.timezone(datetime.timedelta(hours=8))).strftime(
+        '%Y-%m-%d %H:%M:%S')
+
+
+class PrivateRecentWindowTests(AgentCase):
+    def test_only_the_last_72_hours_reach_the_model_but_older_history_stays_stored(self):
+        agent = self.agent([text('舊回覆-貓咪'), text('新回覆')])
+        agent.accept_text(KEY, '舊話題-狗狗', message_id='o1')
+        agent.receive_image(KEY, 'oi1')
+        agent.respond(KEY, 'o1')
+        self.assertEqual(len(self.images(self.http.payloads[0])), 1)
+        self.clock.now += 1
+        agent.accept_text(KEY, '邊界訊息', message_id='e1')
+        self.clock.now += HOURS_72  # e1 is exactly 72h old; o1, oi1 and the reply are 1 second older
+        agent.accept_text(KEY, '現在的問題', message_id='n1')
+        agent.respond(KEY, 'n1')
+
+        payload = self.http.payloads[1]
+        self.assertEqual([e['id'] for e in first_json(payload)['events']], ['e1', 'n1'])
+        self.assertEqual(self.images(payload), [])
+        dump = json.dumps(payload, ensure_ascii=False)
+        for old in ('狗狗', '貓咪', 'oi1'):
+            self.assertNotIn(old, dump)
+        stored = [e['messageId'] for e in self.journal(agent)['events']]
+        self.assertIn('o1', stored)
+        self.assertIn('oi1', stored)
+
+    def test_restarted_read_only_turn_drops_expired_images_receipts_and_tool_access(self):
+        now = self.clock.now
+        old, fresh = now - HOURS_72 - 60, now - 3600
+        new_url = ASSET_URL.replace('y.jpg', 'z.jpg')
+        seen = {}
+
+        def decide(payload):
+            seen['payload'] = payload
+            return [tool('catalog_publish', self.publish_args(
+                ['n0'], selectedCoverMediaId='old-i', characterMediaIds=[{'name': '春', 'mediaId': 'new-i'}]))]
+
+        def answer(payload):
+            seen['results'] = self.tool_results(payload)
+            return [{'type': 'text', 'text': '那張舊封面我看不到了'}]
+
+        agent = self.agent([decide, answer])  # a fresh process reading state saved before the restart
+        self.store.put(agent._storage_key(KEY), {
+            'schemaVersion': 1, 'journalId': 'j-old', 'userRevision': 4, 'receivingUntil': 0,
+            'events': [
+                {'kind': 'text', 'messageId': 'old-t', 'text': '舊書-冬眠', 'receivedAt': old, 'calledYou': True},
+                {'kind': 'image', 'messageId': 'old-i', 'mediaId': 'old-i', 'receivedAt': old,
+                 'asset': {'url': ASSET_URL, 'path': 'bot/a/cover/y.jpg'}, 'mimeType': 'image/jpeg'},
+                {'kind': 'assistant', 'messageId': 'a-old', 'text': '舊回覆-冬眠已上架', 'receivedAt': old},
+                {'kind': 'image', 'messageId': 'new-i', 'mediaId': 'new-i', 'receivedAt': fresh,
+                 'asset': {'url': new_url, 'path': 'bot/a/cover/z.jpg'}, 'mimeType': 'image/jpeg'},
+                {'kind': 'text', 'messageId': 'n0', 'text': '用之前那張封面上架', 'receivedAt': fresh, 'calledYou': True}],
+            'toolReceipts': [{'tool': 'catalog_publish', 'time': taipei(old), 'operationId': 'op-old', 'name': '冬眠'},
+                             {'tool': 'catalog_status', 'time': taipei(fresh), 'operationId': 'op-new'}]})
+        result = agent.respond(KEY, 'n0')
+
+        payload = seen['payload']
+        self.assertEqual([e['id'] for e in first_json(payload)['events']], ['new-i', 'n0'])
+        self.assertEqual([b['source']['url'] for b in self.images(payload)], [new_url])
+        dump = json.dumps(payload, ensure_ascii=False)
+        self.assertIn('op-new', dump)
+        for old_part in ('op-old', '冬眠', 'old-t', 'old-i', ASSET_URL):
+            self.assertNotIn(old_part, dump)
+        self.assertFalse(seen['results'][0]['ok'])
+        self.assertIn('old-i', seen['results'][0]['message'])
+        self.assertEqual(self.site.writes, [])
+        self.assertEqual(result['status'], 'replied')
+        stored = self.journal(agent)
+        self.assertEqual([e['messageId'] for e in stored['events']][:3], ['old-t', 'old-i', 'a-old'])
+        self.assertEqual([r['operationId'] for r in stored['toolReceipts']], ['op-old', 'op-new'])
+
+
 class GroupScopeTests(AgentCase):
+    def test_group_still_sees_history_older_than_three_days(self):
+        agent = self.agent([text('收到第一本'), text('記得')], private=False)
+        agent.accept_text(GKEY, '小六 第一本叫冬眠', message_id='g1', invoked=True)
+        agent.respond(GKEY, 'g1')
+        self.clock.now += 4 * 86400
+        agent.accept_text(GKEY, '小六 還記得第一本嗎', message_id='g2', invoked=True)
+        agent.respond(GKEY, 'g2')
+        events = first_json(self.http.payloads[1])['events']
+        self.assertEqual([e['id'] for e in events if e['kind'] != 'assistant'], ['g1', 'g2'])
+        self.assertIn('收到第一本', json.dumps(self.http.payloads[1], ensure_ascii=False))
+
     def test_unaddressed_group_chat_is_not_stored(self):
         agent = self.agent([], private=False)
         self.assertIsNone(agent.accept_text(GKEY, '大家晚餐吃什麼', message_id='x1'))
