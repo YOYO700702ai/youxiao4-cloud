@@ -109,11 +109,45 @@ class EndToEndTests(unittest.TestCase):
         everything = json.dumps([http.payloads, self.site.jobs], ensure_ascii=False)
         self.assertNotIn(CODE, everything)
         self.assertNotIn('boss', json.dumps(self.site.jobs))
-        # A second private account still gets nothing, even after the code was used.
-        self.dm('intruder', CODE, 'x1')
+        # An account that never sent the code still gets nothing.
         self.dm('intruder', '幫我上架', 'x2')
+        self.dm('intruder', CODE[:-1], 'x3')
         self.assertEqual(self.env['group_reply'].call_count, 1)
         self.assertEqual(self.sent[-1][0], 'boss')
+
+    def test_two_bound_colleagues_keep_separate_conversations_and_materials(self):
+        seen = []
+
+        def record(answer):
+            def step(payload):
+                seen.append({e['id'] for e in first_json(payload)['events'] if not e['id'].startswith('a-')})
+                return [{'type': 'text', 'text': answer}]
+            return step
+        http = self.use([record('收到A'), record('收到B'), record('A好了'), record('B好了')])
+        self.dm('boss', CODE, 'b0')
+        self.dm('colleague', CODE, 'c0')  # Same code, a second administrator.
+        self.dm('colleague', CODE, 'c1')
+        replies = [call.args[1] for call in self.env['group_reply'].call_args_list]
+        self.assertEqual(len(replies), 3)
+        self.assertTrue(replies[0].startswith('綁定完成') and replies[1].startswith('綁定完成'))
+        self.assertIn('已經綁定', replies[2])
+
+        self.dm('stranger', '幫我上架', 's1')
+        self.dm('stranger', None, 's2', kind='image')
+        self.dm('boss', None, 'pa', kind='image')
+        self.dm('colleague', None, 'pb', kind='image')
+        self.dm('boss', '劇本A的資料', 'ma')
+        self.dm('colleague', '劇本B的資料', 'mb')
+        self.dm('boss', '好了', 'ma2')
+        self.dm('colleague', '好了', 'mb2')
+        self.assertEqual(seen, [{'pa', 'ma'}, {'pb', 'mb'}, {'pa', 'ma', 'ma2'}, {'pb', 'mb', 'mb2'}])
+        self.assertEqual(self.sent, [('boss', ['收到A']), ('colleague', ['收到B']),
+                                     ('boss', ['A好了']), ('colleague', ['B好了'])])
+        everything = json.dumps([http.payloads, self.site.jobs], ensure_ascii=False)
+        for secret in (CODE, 's1', '幫我上架'):
+            self.assertNotIn(secret, everything)
+        self.assertNotIn('colleague', json.dumps(self.site.jobs))
+        self.assertNotIn('boss', json.dumps(self.site.jobs))
 
     def test_group_quoted_instruction_without_call_is_never_material(self):
         http = self.use([], private=False)
